@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 load_dotenv(REPO_ROOT / ".env")
-load_dotenv(BASE_DIR / ".env", override=True)
+load_dotenv(BASE_DIR / ".env", override=False)
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse
@@ -1875,13 +1875,37 @@ def build_allowed_origins(frontend_url: str) -> list[str]:
 
 
 frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=build_allowed_origins(frontend_url),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins_env = os.environ.get("CORS_ORIGINS", "").strip()
+
+if cors_origins_env == "*":
+    # Allow all origins (use regex because allow_credentials=True is incompatible with allow_origins=["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+elif cors_origins_env:
+    # Explicit comma-separated allowlist from env
+    explicit_origins = [o.strip().rstrip("/") for o in cors_origins_env.split(",") if o.strip()]
+    combined = sorted(set(explicit_origins) | set(build_allowed_origins(frontend_url)))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=combined,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Fallback to FRONTEND_URL-derived allowlist
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=build_allowed_origins(frontend_url),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Mount static files for uploads
 from pathlib import Path as PathLib
