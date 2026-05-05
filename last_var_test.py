@@ -6,7 +6,7 @@ Test last variation blocking functionality
 import requests
 import json
 
-BASE_URL = "https://pdcrm-sync.preview.emergentagent.com/api"
+BASE_URL = "https://deploy-repo-9.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 
