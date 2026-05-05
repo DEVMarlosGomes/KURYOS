@@ -1,0 +1,549 @@
+{
+  "summary": {
+    "tests_run": 24,
+    "tests_passed": 24,
+    "success_rate": 100.0
+  },
+  "results": [
+    {
+      "test": "Admin Login",
+      "success": true,
+      "details": "",
+      "response_data": {
+        "id": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "email": "admin@kuryos.com",
+        "name": "Admin Kuryos",
+        "role": "admin",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968"
+      },
+      "timestamp": "2026-04-11T17:23:51.221421"
+    },
+    {
+      "test": "CRM Client Search",
+      "success": true,
+      "details": "Found 0 clients",
+      "response_data": [],
+      "timestamp": "2026-04-11T17:23:51.268188"
+    },
+    {
+      "test": "Create PD Request",
+      "success": true,
+      "details": "Created request ID: 27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+      "response_data": {
+        "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+        "client_card_id": null,
+        "client_name": "",
+        "project_name": "Test Product",
+        "request_type": "Produto Novo",
+        "category": "",
+        "description": "Test description",
+        "references": "",
+        "restrictions": "",
+        "volume": "",
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": null,
+        "status": "OPEN",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.295822+00:00",
+        "updated_at": "2026-04-11T17:23:51.295831+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.312507"
+    },
+    {
+      "test": "List PD Requests",
+      "success": true,
+      "details": "Found 2 requests",
+      "response_data": [
+        {
+          "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+          "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+          "client_card_id": null,
+          "client_name": "",
+          "project_name": "Test Product",
+          "request_type": "Produto Novo",
+          "category": "",
+          "description": "Test description",
+          "references": "",
+          "restrictions": "",
+          "volume": "",
+          "packaging": "",
+          "priority": "Normal",
+          "deadline": null,
+          "status": "OPEN",
+          "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "created_by_name": "Admin Kuryos",
+          "created_at": "2026-04-11T17:23:51.295822+00:00",
+          "updated_at": "2026-04-11T17:23:51.295831+00:00"
+        },
+        {
+          "id": "d33da75e-1650-4d07-b116-093f84f692d3",
+          "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+          "client_card_id": null,
+          "client_name": "",
+          "project_name": "S\u00e9rum Vitamina C Clareador",
+          "request_type": "Produto Novo",
+          "category": "",
+          "description": "S\u00e9rum facial com Vitamina C para clareamento de manchas, p\u00fablico feminino 30+",
+          "references": "",
+          "restrictions": "",
+          "volume": "3.000 unidades/m\u00eas",
+          "packaging": "Frasco conta-gotas 30ml",
+          "priority": "Normal",
+          "deadline": "",
+          "status": "IN_PROGRESS",
+          "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "created_by_name": "Admin Kuryos",
+          "created_at": "2026-04-11T17:20:15.058379+00:00",
+          "updated_at": "2026-04-11T17:20:57.770832+00:00"
+        }
+      ],
+      "timestamp": "2026-04-11T17:23:51.371597"
+    },
+    {
+      "test": "Get PD Request",
+      "success": true,
+      "details": "Retrieved request: Test Product",
+      "response_data": {
+        "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+        "client_card_id": null,
+        "client_name": "",
+        "project_name": "Test Product",
+        "request_type": "Produto Novo",
+        "category": "",
+        "description": "Test description",
+        "references": "",
+        "restrictions": "",
+        "volume": "",
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": null,
+        "status": "OPEN",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.295822+00:00",
+        "updated_at": "2026-04-11T17:23:51.295831+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.416292"
+    },
+    {
+      "test": "Update PD Request",
+      "success": true,
+      "details": "Updated to: Updated Test Product",
+      "response_data": {
+        "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+        "client_card_id": null,
+        "client_name": "",
+        "project_name": "Updated Test Product",
+        "request_type": "Produto Novo",
+        "category": "",
+        "description": "Test description",
+        "references": "",
+        "restrictions": "",
+        "volume": "",
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": null,
+        "status": "OPEN",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.295822+00:00",
+        "updated_at": "2026-04-11T17:23:51.445791+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.461782"
+    },
+    {
+      "test": "Status Transition to IN_PROGRESS",
+      "success": true,
+      "details": "Status: IN_PROGRESS",
+      "response_data": {
+        "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+        "client_card_id": null,
+        "client_name": "",
+        "project_name": "Updated Test Product",
+        "request_type": "Produto Novo",
+        "category": "",
+        "description": "Test description",
+        "references": "",
+        "restrictions": "",
+        "volume": "",
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": null,
+        "status": "IN_PROGRESS",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.295822+00:00",
+        "updated_at": "2026-04-11T17:23:51.492847+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.510165"
+    },
+    {
+      "test": "Get Status History",
+      "success": true,
+      "details": "Found 2 history entries",
+      "response_data": [
+        {
+          "id": "b3e796a1-1df2-4fa1-97d4-b102347c910c",
+          "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+          "from_status": "OPEN",
+          "to_status": "IN_PROGRESS",
+          "changed_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "changed_by_name": "Admin Kuryos",
+          "comment": "Status alterado de Aberto para Em Desenvolvimento",
+          "created_at": "2026-04-11T17:23:51.493364+00:00"
+        },
+        {
+          "id": "cc80286b-6581-4008-9be3-66432251c6c5",
+          "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+          "from_status": null,
+          "to_status": "OPEN",
+          "changed_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "changed_by_name": "Admin Kuryos",
+          "comment": "Solicita\u00e7\u00e3o criada",
+          "created_at": "2026-04-11T17:23:51.296454+00:00"
+        }
+      ],
+      "timestamp": "2026-04-11T17:23:51.555962"
+    },
+    {
+      "test": "Get Development",
+      "success": true,
+      "details": "Development ID: ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+      "response_data": {
+        "id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+        "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+        "assigned_to": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "assigned_to_name": "Admin Kuryos",
+        "lab_responsible": null,
+        "current_version": 0,
+        "status": "active",
+        "started_at": "2026-04-11T17:23:51.494172+00:00",
+        "completed_at": null
+      },
+      "timestamp": "2026-04-11T17:23:51.609165"
+    },
+    {
+      "test": "Create Formula",
+      "success": true,
+      "details": "Formula ID: 50aace81-7cdc-4bdf-83ab-c7effbe589fa, Version: 1",
+      "response_data": {
+        "id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "version": 1,
+        "name": "Formula v1",
+        "notes": "",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.642300+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.658135"
+    },
+    {
+      "test": "Add Formula Item",
+      "success": true,
+      "details": "Added Vitamin C at 15.0%",
+      "response_data": {
+        "id": "5ff9079c-085a-4859-b738-6c7649bb7390",
+        "formula_id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+        "ingredient_name": "Vitamin C",
+        "percentage": 15.0,
+        "phase": "A",
+        "function": "Antioxidant"
+      },
+      "timestamp": "2026-04-11T17:23:51.706339"
+    },
+    {
+      "test": "List Formulas",
+      "success": true,
+      "details": "Found 1 formulas",
+      "response_data": [
+        {
+          "id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+          "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+          "version": 1,
+          "name": "Formula v1",
+          "notes": "",
+          "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "created_by_name": "Admin Kuryos",
+          "created_at": "2026-04-11T17:23:51.642300+00:00",
+          "items": [
+            {
+              "id": "5ff9079c-085a-4859-b738-6c7649bb7390",
+              "formula_id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+              "ingredient_name": "Vitamin C",
+              "percentage": 15.0,
+              "phase": "A",
+              "function": "Antioxidant"
+            }
+          ]
+        }
+      ],
+      "timestamp": "2026-04-11T17:23:51.750641"
+    },
+    {
+      "test": "Create Test",
+      "success": true,
+      "details": "Test ID: 92094106-3b65-4fa0-b81f-64f1df21b438, Type: Estabilidade",
+      "response_data": {
+        "id": "92094106-3b65-4fa0-b81f-64f1df21b438",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "test_type": "Estabilidade",
+        "result": "",
+        "status": "PENDING",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.779951+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.797838"
+    },
+    {
+      "test": "Update Test",
+      "success": true,
+      "details": "Status: APPROVED, Result: Stable at 40\u00b0C",
+      "response_data": {
+        "id": "92094106-3b65-4fa0-b81f-64f1df21b438",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "test_type": "Estabilidade",
+        "result": "Stable at 40\u00b0C",
+        "status": "APPROVED",
+        "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "created_by_name": "Admin Kuryos",
+        "created_at": "2026-04-11T17:23:51.779951+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.845847"
+    },
+    {
+      "test": "Create Sample",
+      "success": true,
+      "details": "Sample ID: 4afc001c-ba37-4f60-a0da-1fd07012b9b0, Formula Version: 1",
+      "response_data": {
+        "id": "4afc001c-ba37-4f60-a0da-1fd07012b9b0",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "formula_version": 1,
+        "sent_to_client": false,
+        "sent_at": null,
+        "feedback": "",
+        "created_at": "2026-04-11T17:23:51.874501+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.891088"
+    },
+    {
+      "test": "Save Costs",
+      "success": true,
+      "details": "Total Cost: 100.0",
+      "response_data": {
+        "id": "6e7f76b8-69fd-49cf-9c40-7633dd4adfde",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "ingredient_cost": 50.0,
+        "packaging_cost": 20.0,
+        "labor_cost": 30.0,
+        "total_cost": 100.0,
+        "updated_at": "2026-04-11T17:23:51.920193+00:00"
+      },
+      "timestamp": "2026-04-11T17:23:51.937298"
+    },
+    {
+      "test": "Get Full Detail",
+      "success": true,
+      "details": "Complete data with 1 formulas, 1 tests",
+      "response_data": {
+        "request": {
+          "id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+          "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+          "client_card_id": null,
+          "client_name": "",
+          "project_name": "Updated Test Product",
+          "request_type": "Produto Novo",
+          "category": "",
+          "description": "Test description",
+          "references": "",
+          "restrictions": "",
+          "volume": "",
+          "packaging": "",
+          "priority": "Normal",
+          "deadline": null,
+          "status": "IN_PROGRESS",
+          "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "created_by_name": "Admin Kuryos",
+          "created_at": "2026-04-11T17:23:51.295822+00:00",
+          "updated_at": "2026-04-11T17:23:51.492847+00:00"
+        },
+        "history": [
+          {
+            "id": "b3e796a1-1df2-4fa1-97d4-b102347c910c",
+            "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+            "from_status": "OPEN",
+            "to_status": "IN_PROGRESS",
+            "changed_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+            "changed_by_name": "Admin Kuryos",
+            "comment": "Status alterado de Aberto para Em Desenvolvimento",
+            "created_at": "2026-04-11T17:23:51.493364+00:00"
+          },
+          {
+            "id": "cc80286b-6581-4008-9be3-66432251c6c5",
+            "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+            "from_status": null,
+            "to_status": "OPEN",
+            "changed_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+            "changed_by_name": "Admin Kuryos",
+            "comment": "Solicita\u00e7\u00e3o criada",
+            "created_at": "2026-04-11T17:23:51.296454+00:00"
+          }
+        ],
+        "development": {
+          "id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+          "pd_request_id": "27fea389-098f-4fcf-a02b-f2fdd3e26e41",
+          "tenant_id": "54995b86-2b79-4fd3-9e4b-e0b0cbd60968",
+          "assigned_to": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+          "assigned_to_name": "Admin Kuryos",
+          "lab_responsible": null,
+          "current_version": 1,
+          "status": "active",
+          "started_at": "2026-04-11T17:23:51.494172+00:00",
+          "completed_at": null
+        },
+        "formulas": [
+          {
+            "id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+            "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+            "version": 1,
+            "name": "Formula v1",
+            "notes": "",
+            "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+            "created_by_name": "Admin Kuryos",
+            "created_at": "2026-04-11T17:23:51.642300+00:00",
+            "items": [
+              {
+                "id": "5ff9079c-085a-4859-b738-6c7649bb7390",
+                "formula_id": "50aace81-7cdc-4bdf-83ab-c7effbe589fa",
+                "ingredient_name": "Vitamin C",
+                "percentage": 15.0,
+                "phase": "A",
+                "function": "Antioxidant"
+              }
+            ]
+          }
+        ],
+        "tests": [
+          {
+            "id": "92094106-3b65-4fa0-b81f-64f1df21b438",
+            "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+            "test_type": "Estabilidade",
+            "result": "Stable at 40\u00b0C",
+            "status": "APPROVED",
+            "created_by": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+            "created_by_name": "Admin Kuryos",
+            "created_at": "2026-04-11T17:23:51.779951+00:00"
+          }
+        ],
+        "samples": [
+          {
+            "id": "4afc001c-ba37-4f60-a0da-1fd07012b9b0",
+            "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+            "formula_version": 1,
+            "sent_to_client": false,
+            "sent_at": null,
+            "feedback": "",
+            "created_at": "2026-04-11T17:23:51.874501+00:00"
+          }
+        ],
+        "approval": null,
+        "costs": {
+          "id": "6e7f76b8-69fd-49cf-9c40-7633dd4adfde",
+          "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+          "ingredient_cost": 50.0,
+          "packaging_cost": 20.0,
+          "labor_cost": 30.0,
+          "total_cost": 100.0,
+          "updated_at": "2026-04-11T17:23:51.920193+00:00"
+        },
+        "documents": [],
+        "client_info": null
+      },
+      "timestamp": "2026-04-11T17:23:51.985522"
+    },
+    {
+      "test": "Create Approval",
+      "success": true,
+      "details": "Client: True, Internal: True",
+      "response_data": {
+        "id": "d0381b52-ae15-4c0b-9a7e-9824c7ddde52",
+        "development_id": "ad9ac769-7c76-4ebd-a06a-2ae023205fe9",
+        "approved_by_client": true,
+        "approved_by_internal": true,
+        "approval_date": "2026-04-11T17:23:52.014132+00:00",
+        "notes": "",
+        "approved_by_user": "e1e3a8c2-d458-4073-bc8d-af6df56156ae",
+        "approved_by_user_name": "Admin Kuryos"
+      },
+      "timestamp": "2026-04-11T17:23:52.031361"
+    },
+    {
+      "test": "Status Transition to IN_TESTS",
+      "success": true,
+      "details": "Moving to tests: IN_TESTS",
+      "response_data": null,
+      "timestamp": "2026-04-11T17:23:52.076278"
+    },
+    {
+      "test": "Status Transition to WAITING_APPROVAL",
+      "success": true,
+      "details": "Moving to approval: WAITING_APPROVAL",
+      "response_data": null,
+      "timestamp": "2026-04-11T17:23:52.121995"
+    },
+    {
+      "test": "Status Transition to APPROVED",
+      "success": true,
+      "details": "Approving: APPROVED",
+      "response_data": null,
+      "timestamp": "2026-04-11T17:23:52.167150"
+    },
+    {
+      "test": "Status Transition to COMPLETED",
+      "success": true,
+      "details": "Completing: COMPLETED",
+      "response_data": null,
+      "timestamp": "2026-04-11T17:23:52.215199"
+    },
+    {
+      "test": "Invalid Transition OPEN \u2192 APPROVED",
+      "success": true,
+      "details": "Correctly rejected invalid transition",
+      "response_data": null,
+      "timestamp": "2026-04-11T17:23:52.303471"
+    },
+    {
+      "test": "PD Metrics",
+      "success": true,
+      "details": "Total: 3, By Status: {'OPEN': 1, 'IN_PROGRESS': 1, 'IN_TESTS': 0, 'WAITING_APPROVAL': 0, 'APPROVED': 0, 'COMPLETED': 1, 'REJECTED': 0}",
+      "response_data": {
+        "total": 3,
+        "by_status": {
+          "OPEN": 1,
+          "IN_PROGRESS": 1,
+          "IN_TESTS": 0,
+          "WAITING_APPROVAL": 0,
+          "APPROVED": 0,
+          "COMPLETED": 1,
+          "REJECTED": 0
+        },
+        "by_priority": {
+          "Baixa": 0,
+          "Normal": 3,
+          "Alta": 0,
+          "Urgente": 0
+        }
+      },
+      "timestamp": "2026-04-11T17:23:52.359088"
+    }
+  ],
+  "timestamp": "2026-04-11T17:23:52.359213"
+}
