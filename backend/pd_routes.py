@@ -16,6 +16,20 @@ import logging
 import asyncio
 from validation_utils import clean_text, normalize_cnpj, normalize_email, normalize_phone, is_valid_cnpj, is_valid_email, is_valid_phone
 from workflow_engine import create_workflow_task, audit_log
+from rbac import (
+    require_roles,
+    has_role,
+    can_view_formula_composition,
+    can_view_live_document_revisions,
+    PD_READ,
+    PD_FULL,
+    PD_WRITE,
+    HOMOLOGACAO_WRITE,
+    HOMOLOGACAO_APPROVE,
+    DOC_REVIEWERS,
+    QA_APPROVERS,
+    ADMIN_ONLY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +216,11 @@ class LiveDocumentGenerate(BaseModel):
 
 
 LIVE_DOCUMENT_TYPES = {"ficha_tecnica", "epa"}
-LIVE_DOCUMENT_REVIEW_ROLES = {"admin", "gestor"}
+LIVE_DOCUMENT_REVIEW_ROLES = {"admin", "gestor", "lider_pd", "qa", "formulador", "engenharia_produto"}
+
+# Status liberados: homologada (aprovada), pendente, rejeitada, suspensa (bloqueio temporario por nao conformidade)
+MP_BLOCKED_STATUSES = {"rejeitada", "suspensa"}
+MP_OK_STATUSES = {"homologada"}
 
 STABILITY_CONDITIONS = [
     {"code": "ambient", "label": "Ambiente", "temperature": "25C", "humidity": "60% UR", "protected_from_light": False},
@@ -721,7 +739,7 @@ async def _build_live_document_snapshot(req_id: str, doc_type: str, tenant_id: s
     }
 
 
-async def _create_document_approval_tasks(doc_version: Dict[str, Any], user: dict, reason: str, changed_fields: List[str]) -> List[str]:
+async def _create_document_approval_tasks(doc_version: Dict[str, Any], user: dict, reason: str, changed_fields: List[str], source_changes: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     task_ids: List[str] = []
     base_metadata = {
         "module_origin": "documentos_internos",
@@ -827,7 +845,7 @@ async def _generate_live_document_version(
         "approval_task_ids": [],
     }
     await db.pd_document_versions.insert_one(doc_version)
-    approval_task_ids = await _create_document_approval_tasks(doc_version, user, reason, changed_fields)
+    approval_task_ids = await _create_document_approval_tasks(doc_version, user, reason, changed_fields, source_changes)
     await db.pd_document_versions.update_one(
         {"id": doc_version["id"]},
         {"$set": {"approval_task_ids": approval_task_ids}}
@@ -860,7 +878,7 @@ async def _try_auto_generate_document(
 
 
 def _user_can_review_live_documents(user: dict) -> bool:
-    return user.get("role") in LIVE_DOCUMENT_REVIEW_ROLES
+    return can_view_live_document_revisions(user)
 
 
 def _build_source_changes(
@@ -1411,8 +1429,15 @@ async def formula_bank(
     origem: Optional[str] = None,
     somente_registradas: bool = False,
 ):
-    """Banco global de formulas do P&D com contexto de projeto e aprovacoes."""
+    """Banco global de formulas do P&D com contexto de projeto e aprovacoes.
+
+    Visibilidade RBAC:
+      - Perfis P&D/CQ/Eng/Doc Reviewers: composicao completa.
+      - Comercial (vendedor/sales_ops/sucesso_cliente): apenas metadados (sem composicao nem custos).
+    """
     user = await get_current_user(request)
+    require_roles(user, PD_READ | {"vendedor", "sales_ops", "sucesso_cliente"})
+    show_full = can_view_formula_composition(user)
     tenant_id = user["tenant_id"]
 
     developments = await db.pd_developments.find(
@@ -1506,7 +1531,7 @@ async def formula_bank(
             "name": formula.get("name"),
             "version": formula.get("version", 1),
             "is_latest_version": formula.get("id") == latest_by_dev.get(dev_id, {}).get("id"),
-            "notes": formula.get("notes", ""),
+            "notes": formula.get("notes", "") if show_full else "",
             "created_at": formula.get("created_at"),
             "created_by_name": formula.get("created_by_name", ""),
             "project_name": req.get("project_name", ""),
@@ -1518,18 +1543,19 @@ async def formula_bank(
             "approved_by_internal": approved_by_internal,
             "is_registered": is_registered,
             "item_count": len(formula_items),
-            "total_percentage": total_percentage,
-            "total_cost_per_kg": total_cost_per_kg,
+            "total_percentage": total_percentage if show_full else None,
+            "total_cost_per_kg": total_cost_per_kg if show_full else None,
             "volume": formula.get("volume", 0),
             "volume_unit": formula.get("volume_unit", "mL"),
-            "items": sorted(
+            "items": (sorted(
                 formula_items,
                 key=lambda item: (
                     str(item.get("phase", "")),
                     -(item.get("percentage") or 0),
                     str(item.get("ingredient_name", "")),
                 )
-            ),
+            ) if show_full else []),
+            "restricted_view": not show_full,
         }
 
         if q:
@@ -1539,7 +1565,7 @@ async def formula_bank(
                 str(row.get("client_name", "")),
                 str(row.get("origin_label", "")),
                 str(row.get("created_by_name", "")),
-                " ".join(str(it.get("ingredient_name", "")) for it in row["items"]),
+                " ".join(str(it.get("ingredient_name", "")) for it in (row.get("items") or [])),
             ]).lower()
             if q.lower() not in search_blob:
                 continue
@@ -2389,6 +2415,126 @@ async def get_current_live_document(req_id: str, doc_type: str, request: Request
 async def get_live_document_version(version_id: str, request: Request):
     user = await get_current_user(request)
     return await _get_live_document_version(version_id, user)
+
+
+@pd_router.get("/document-versions/{version_id}/pdf")
+async def export_live_document_pdf(version_id: str, request: Request):
+    """Exporta PDF da versao do documento vivo (FT/EPA). Aplica watermark 'EM REVISAO' quando ainda nao aprovado."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    user = await get_current_user(request)
+    doc_version = await _get_live_document_version(version_id, user)
+    snapshot = doc_version.get("snapshot") or {}
+    tenant = await db.tenants.find_one({"id": user["tenant_id"]}, {"_id": 0})
+    org_name = tenant["name"] if tenant else "Kuryos"
+    is_approved = doc_version.get("status") == "aprovado" and doc_version.get("active_for_operation")
+    label = _document_label(doc_version["doc_type"])
+
+    buffer = io.BytesIO()
+    pdf = SimpleDocTemplate(buffer, pagesize=A4, topMargin=22*mm, bottomMargin=18*mm, leftMargin=18*mm, rightMargin=18*mm, title=f"{label} {doc_version.get('version_code', '')}")
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("LDTitle", parent=styles["Title"], fontSize=22, textColor=rl_colors.HexColor("#0A0A0B"), spaceAfter=4)
+    sub_style = ParagraphStyle("LDSub", parent=styles["Normal"], fontSize=11, textColor=rl_colors.HexColor("#737373"), spaceAfter=10)
+    h_style = ParagraphStyle("LDHead", parent=styles["Heading2"], fontSize=13, textColor=rl_colors.HexColor("#0A0A0B"), spaceBefore=12, spaceAfter=6)
+    n_style = ParagraphStyle("LDNorm", parent=styles["Normal"], fontSize=9.5, leading=13)
+    s_style = ParagraphStyle("LDSm", parent=styles["Normal"], fontSize=8, textColor=rl_colors.HexColor("#737373"))
+
+    elements: List[Any] = []
+    elements.append(Paragraph(label.upper(), title_style))
+    elements.append(Paragraph(f"{org_name} - Documento Vivo (versionado)", sub_style))
+    elements.append(HRFlowable(width="100%", thickness=1, color=rl_colors.HexColor("#E5E5E5")))
+
+    meta_rows = [
+        ["Codigo:", doc_version.get("version_code", "")],
+        ["Versao:", str(doc_version.get("version_number", ""))],
+        ["Status:", "APROVADO E VIGENTE" if is_approved else "EM REVISAO (NAO LIBERADO PARA PRODUCAO)"],
+        ["Gerado em:", doc_version.get("created_at", "")],
+        ["Por:", doc_version.get("created_by_name", "")],
+        ["Motivo:", doc_version.get("reason", "")],
+    ]
+    meta_table = Table(meta_rows, colWidths=[35*mm, 140*mm])
+    meta_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+        ("TEXTCOLOR", (0, 0), (0, -1), rl_colors.HexColor("#737373")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    elements.append(Spacer(1, 4*mm))
+    elements.append(meta_table)
+
+    def render_section(title: str, data: Any):
+        elements.append(Paragraph(title, h_style))
+        if isinstance(data, dict):
+            rows = []
+            for k, v in data.items():
+                if isinstance(v, (list, dict)):
+                    continue
+                rows.append([str(k).replace("_", " ").capitalize() + ":", str(v) if v not in (None, "") else "-"])
+            if rows:
+                t = Table(rows, colWidths=[55*mm, 120*mm])
+                t.setStyle(TableStyle([
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("TEXTCOLOR", (0, 0), (0, -1), rl_colors.HexColor("#737373")),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]))
+                elements.append(t)
+            for k, v in data.items():
+                if isinstance(v, list) and v:
+                    if all(isinstance(it, dict) for it in v):
+                        keys = list({key for it in v for key in it.keys()})
+                        keys = [k for k in keys if k in ("ingredient_name", "nome_tecnico", "nome_comercial", "inci", "fornecedor", "phase", "function", "percentage", "price_per_kg", "cost_brl", "quantidade_lote_padrao", "unidade_lote")]
+                        if keys:
+                            header = [k.replace("_", " ").capitalize() for k in keys]
+                            rows = [header]
+                            for it in v[:200]:
+                                rows.append([str(it.get(k, "") or "") for k in keys])
+                            tab = Table(rows, repeatRows=1)
+                            tab.setStyle(TableStyle([
+                                ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#0A0A0B")),
+                                ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+                                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                                ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#E5E5E5")),
+                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                            ]))
+                            elements.append(Paragraph(k.replace("_", " ").capitalize(), s_style))
+                            elements.append(tab)
+                    else:
+                        elements.append(Paragraph(", ".join(str(it) for it in v), n_style))
+
+    for section_key, section_value in snapshot.items():
+        render_section(section_key.replace("_", " ").upper(), section_value)
+
+    elements.append(Spacer(1, 14*mm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=rl_colors.HexColor("#E5E5E5"), spaceAfter=4))
+    elements.append(Paragraph(
+        f"Documento gerado automaticamente em {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC - {org_name}",
+        s_style,
+    ))
+
+    def watermark(canvas: rl_canvas.Canvas, _doc):
+        if not is_approved:
+            canvas.saveState()
+            canvas.setFillColorRGB(0.85, 0.0, 0.0, alpha=0.18)
+            canvas.setFont("Helvetica-Bold", 80)
+            canvas.translate(297, 421)
+            canvas.rotate(35)
+            canvas.drawCentredString(0, 0, "EM REVISAO")
+            canvas.restoreState()
+
+    pdf.build(elements, onFirstPage=watermark, onLaterPages=watermark)
+    buffer.seek(0)
+    safe_code = (doc_version.get("version_code") or "doc").replace("/", "_")
+    filename = f"{label.replace(' ', '_').lower()}_{safe_code}.pdf"
+    return StreamingResponse(buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 # ============ FULL DETAIL VIEW ============
 
@@ -3472,6 +3618,138 @@ async def list_internal_research(request: Request):
 #  HOMOLOGAÇÕES — MPs e FORNECEDORES
 # =========================================================================
 
+
+# ----- HELPERS: Bloqueio de formulas com insumos nao homologados/suspensos ----
+
+async def _evaluate_formula_homologacao(formula_id: str, tenant_id: str) -> Dict[str, Any]:
+    """
+    Inspeciona todos os itens de uma formula e classifica o status de homologacao
+    de cada MP usada (via catalog -> homologacao_mps por nome+inci).
+    Retorna estrutura: {ok: bool, blocked: [..], pending: [..], total_items: int, summary: str}
+    """
+    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(2000)
+    if not items:
+        return {"ok": True, "blocked": [], "pending": [], "total_items": 0, "summary": "Formula sem itens"}
+
+    catalog_ids = [it["catalog_id"] for it in items if it.get("catalog_id")]
+    catalogs: Dict[str, Dict[str, Any]] = {}
+    if catalog_ids:
+        docs = await db.pd_catalog.find(
+            {"tenant_id": tenant_id, "id": {"$in": catalog_ids}}, {"_id": 0}
+        ).to_list(2000)
+        catalogs = {d["id"]: d for d in docs if d.get("id")}
+
+    mp_index: Dict[str, Dict[str, Any]] = {}
+    mps = await db.homologacao_mps.find({"tenant_id": tenant_id}, {"_id": 0}).to_list(5000)
+    for mp in mps:
+        for key in (mp.get("nome", ""), mp.get("inci", ""), mp.get("codigo_interno", "")):
+            normalized = (key or "").strip().lower()
+            if normalized:
+                mp_index.setdefault(normalized, mp)
+
+    blocked: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+
+    for item in items:
+        ingredient = (item.get("ingredient_name") or "").strip()
+        catalog = catalogs.get(item.get("catalog_id")) or {}
+        candidate_keys = [
+            (catalog.get("nome") or "").strip().lower(),
+            (catalog.get("inci") or "").strip().lower(),
+            ingredient.lower(),
+        ]
+        mp_doc = next((mp_index[k] for k in candidate_keys if k and k in mp_index), None)
+        if not mp_doc:
+            pending.append({
+                "ingredient_name": ingredient or catalog.get("nome", ""),
+                "reason": "MP nao cadastrada em Homologacoes",
+                "status": "ausente",
+            })
+            continue
+        status = mp_doc.get("status", "pendente")
+        if status in MP_BLOCKED_STATUSES:
+            blocked.append({
+                "ingredient_name": ingredient or mp_doc.get("nome", ""),
+                "mp_id": mp_doc.get("id"),
+                "fornecedor_nome": mp_doc.get("fornecedor_nome", ""),
+                "status": status,
+                "parecer": mp_doc.get("parecer_homologacao", ""),
+            })
+        elif status not in MP_OK_STATUSES:
+            pending.append({
+                "ingredient_name": ingredient or mp_doc.get("nome", ""),
+                "mp_id": mp_doc.get("id"),
+                "fornecedor_nome": mp_doc.get("fornecedor_nome", ""),
+                "status": status,
+                "reason": "MP em avaliacao",
+            })
+
+    summary = f"{len(blocked)} bloqueadas, {len(pending)} pendentes, {len(items)} itens"
+    return {
+        "ok": len(blocked) == 0,
+        "blocked": blocked,
+        "pending": pending,
+        "total_items": len(items),
+        "summary": summary,
+    }
+
+
+async def assert_formula_homologacao_ok(formula_id: str, tenant_id: str, *, allow_pending: bool = True):
+    """Raises 409 if formula has insumos reprovados/suspensos. Pending only blocks if allow_pending=False."""
+    result = await _evaluate_formula_homologacao(formula_id, tenant_id)
+    if result["blocked"]:
+        names = ", ".join(item["ingredient_name"] for item in result["blocked"][:5])
+        raise HTTPException(
+            status_code=409,
+            detail=f"Formula bloqueada: {len(result['blocked'])} insumo(s) reprovado(s)/suspenso(s) na Homologacao: {names}",
+        )
+    if not allow_pending and result["pending"]:
+        names = ", ".join(item["ingredient_name"] for item in result["pending"][:5])
+        raise HTTPException(
+            status_code=409,
+            detail=f"Formula bloqueada: {len(result['pending'])} insumo(s) sem homologacao concluida: {names}",
+        )
+
+
+async def assert_pd_card_ready_for_approval(card_id: str, tenant_id: str):
+    """Antes de mover para aguardando_aprovacao/aprovado, validar todas as formulas ativas vinculadas."""
+    card = await db.pd_cards.find_one({"id": card_id, "tenant_id": tenant_id}, {"_id": 0, "amostra_variacao_id": 1, "amostra_id": 1})
+    if not card:
+        return
+    pd_request = await db.pd_requests.find_one(
+        {"tenant_id": tenant_id, "amostra_id": card.get("amostra_id")},
+        {"_id": 0, "id": 1},
+    )
+    if not pd_request:
+        return
+    dev = await db.pd_developments.find_one(
+        {"tenant_id": tenant_id, "pd_request_id": pd_request["id"]},
+        {"_id": 0, "id": 1},
+    )
+    if not dev:
+        return
+    latest = await db.pd_formulas.find_one(
+        {"development_id": dev["id"]},
+        {"_id": 0, "id": 1},
+        sort=[("version", -1)],
+    )
+    if not latest:
+        return
+    await assert_formula_homologacao_ok(latest["id"], tenant_id, allow_pending=True)
+
+
+@pd_router.get("/formulas/{formula_id}/homologacao-status")
+async def formula_homologacao_status(formula_id: str, request: Request):
+    """Retorna o status de homologacao agregado para uma formula (bloqueada/pending/ok)."""
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    return await _evaluate_formula_homologacao(formula_id, user["tenant_id"])
+
+
+# =========================================================================
+#  HOMOLOGAÇÕES — MPs e FORNECEDORES (continued)
+# =========================================================================
+
 class FornecedorHomologacao(BaseModel):
     razao_social: str
     cnpj: str = ""
@@ -3535,6 +3813,10 @@ class HomologarRequest(BaseModel):
     parecer: str = ""
 
 
+class SuspenderRequest(BaseModel):
+    parecer: str = ""
+
+
 def _serialize_doc(doc):
     if doc:
         doc.pop("_id", None)
@@ -3546,6 +3828,7 @@ def _serialize_doc(doc):
 @pd_router.post("/homologacao/fornecedores")
 async def create_fornecedor(data: FornecedorHomologacao, request: Request):
     user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_WRITE)
     now = now_iso()
     f_id = new_id()
     payload = _validate_supplier_payload(data.model_dump())
@@ -3625,6 +3908,7 @@ async def update_fornecedor(f_id: str, data: FornecedorUpdate, request: Request)
 @pd_router.post("/homologacao/fornecedores/{f_id}/homologar")
 async def homologar_fornecedor(f_id: str, data: HomologarRequest, request: Request):
     user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_APPROVE)
     now = now_iso()
     novo_status = "homologado" if data.aprovado else "rejeitado"
     update = {
@@ -3667,6 +3951,7 @@ async def delete_fornecedor(f_id: str, request: Request):
 @pd_router.post("/homologacao/mps")
 async def create_mp(data: MPHomologacao, request: Request):
     user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_WRITE)
     if data.tipo_mp not in ["FORMULACAO", "ROTULO", "EMBALAGEM"]:
         raise HTTPException(status_code=400, detail="tipo_mp inválido (FORMULACAO|ROTULO|EMBALAGEM)")
     now = now_iso()
@@ -3787,6 +4072,7 @@ async def update_mp(mp_id: str, data: MPUpdate, request: Request):
 @pd_router.post("/homologacao/mps/{mp_id}/homologar")
 async def homologar_mp(mp_id: str, data: HomologarRequest, request: Request):
     user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_APPROVE)
     now = now_iso()
 
     # Validar: MP só pode ser homologada se fornecedor vinculado está homologado
@@ -3827,6 +4113,78 @@ async def homologar_mp(mp_id: str, data: HomologarRequest, request: Request):
     return await db.homologacao_mps.find_one({"id": mp_id}, {"_id": 0})
 
 
+@pd_router.post("/homologacao/mps/{mp_id}/suspender")
+async def suspender_mp(mp_id: str, data: SuspenderRequest, request: Request):
+    """Suspende uma MP (status `suspensa`). Bloqueia formulas que a usam ate revisao."""
+    user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_APPROVE)
+    now = now_iso()
+    mp = await db.homologacao_mps.find_one({"id": mp_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not mp:
+        raise HTTPException(status_code=404, detail="MP nao encontrada")
+    update = {
+        "status": "suspensa",
+        "parecer_homologacao": data.parecer,
+        "homologado_por": user["name"],
+        "homologado_por_id": user["id"],
+        "data_homologacao": now,
+        "updated_at": now,
+    }
+    evento = {
+        "evento": "suspensa",
+        "por": user["name"],
+        "por_id": user["id"],
+        "data": now,
+        "parecer": data.parecer,
+    }
+    await db.homologacao_mps.update_one(
+        {"id": mp_id, "tenant_id": user["tenant_id"]},
+        {"$set": update, "$push": {"historico": evento}}
+    )
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user["name"],
+        action="mp_suspensa",
+        entity_type="homologacao_mp",
+        entity_id=mp_id,
+        before={"status": mp.get("status")},
+        after={"status": "suspensa", "parecer": data.parecer},
+    )
+    return await db.homologacao_mps.find_one({"id": mp_id}, {"_id": 0})
+
+
+@pd_router.post("/homologacao/mps/{mp_id}/reativar")
+async def reativar_mp(mp_id: str, data: SuspenderRequest, request: Request):
+    """Reativa uma MP suspensa, retornando para 'pendente' (precisa nova homologacao)."""
+    user = await get_current_user(request)
+    require_roles(user, HOMOLOGACAO_APPROVE)
+    now = now_iso()
+    mp = await db.homologacao_mps.find_one({"id": mp_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not mp:
+        raise HTTPException(status_code=404, detail="MP nao encontrada")
+    if mp.get("status") != "suspensa":
+        raise HTTPException(status_code=400, detail="MP nao esta suspensa")
+    update = {
+        "status": "pendente",
+        "parecer_homologacao": data.parecer,
+        "data_homologacao": None,
+        "updated_at": now,
+    }
+    evento = {
+        "evento": "reativada",
+        "por": user["name"],
+        "por_id": user["id"],
+        "data": now,
+        "parecer": data.parecer,
+    }
+    await db.homologacao_mps.update_one(
+        {"id": mp_id, "tenant_id": user["tenant_id"]},
+        {"$set": update, "$push": {"historico": evento}}
+    )
+    return await db.homologacao_mps.find_one({"id": mp_id}, {"_id": 0})
+
+
 @pd_router.delete("/homologacao/mps/{mp_id}")
 async def delete_mp(mp_id: str, request: Request):
     user = await get_current_user(request)
@@ -3841,6 +4199,7 @@ async def delete_mp(mp_id: str, request: Request):
 @pd_router.get("/homologacao/dashboard")
 async def homologacao_dashboard(request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     t_id = user["tenant_id"]
     mps_all = await db.homologacao_mps.find({"tenant_id": t_id}, {"_id": 0}).to_list(10000)
     forn_all = await db.homologacao_fornecedores.find({"tenant_id": t_id}, {"_id": 0}).to_list(10000)
@@ -3852,15 +4211,59 @@ async def homologacao_dashboard(request: Request):
             r[v] = r.get(v, 0) + 1
         return r
 
+    # Agrupa MPs homologadas por nome para detectar fornecedor unico
+    mps_homologadas_por_nome: Dict[str, set] = {}
+    for mp in mps_all:
+        if mp.get("status") != "homologada":
+            continue
+        key = (mp.get("nome") or "").strip().lower()
+        if not key:
+            continue
+        mps_homologadas_por_nome.setdefault(key, set()).add(
+            mp.get("fornecedor_id") or mp.get("fornecedor_nome") or mp.get("id")
+        )
+
+    fornecedor_unico_alerts: List[Dict[str, Any]] = []
+    risco_baixo_alerts: List[Dict[str, Any]] = []
+    for nome_key, fornecedores in mps_homologadas_por_nome.items():
+        nome_display = next(
+            (mp.get("nome") for mp in mps_all if (mp.get("nome") or "").strip().lower() == nome_key),
+            nome_key,
+        )
+        if len(fornecedores) <= 1:
+            fornecedor_unico_alerts.append({
+                "nome": nome_display,
+                "fornecedores": list(fornecedores),
+                "total_fornecedores": len(fornecedores),
+            })
+        elif len(fornecedores) < 3:
+            risco_baixo_alerts.append({
+                "nome": nome_display,
+                "fornecedores": list(fornecedores),
+                "total_fornecedores": len(fornecedores),
+            })
+
+    # MPs com status que bloqueiam producao
+    mps_bloqueadas = [mp for mp in mps_all if mp.get("status") in MP_BLOCKED_STATUSES]
+
     return {
         "mps": {
             "total": len(mps_all),
             "por_status": count_by(mps_all, "status"),
             "por_tipo": count_by(mps_all, "tipo_mp"),
+            "bloqueadas_total": len(mps_bloqueadas),
         },
         "fornecedores": {
             "total": len(forn_all),
             "por_status": count_by(forn_all, "status"),
             "por_categoria": count_by(forn_all, "categoria"),
+        },
+        "alertas": {
+            "fornecedor_unico": fornecedor_unico_alerts,
+            "risco_fornecimento": risco_baixo_alerts,
+            "mps_bloqueadas": [
+                {"id": mp.get("id"), "nome": mp.get("nome"), "status": mp.get("status"), "fornecedor_nome": mp.get("fornecedor_nome", "")}
+                for mp in mps_bloqueadas[:50]
+            ],
         },
     }

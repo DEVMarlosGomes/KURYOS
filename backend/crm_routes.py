@@ -3124,6 +3124,11 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
         target_stage=new_status,
     )
 
+    # Bloqueio por insumos nao homologados / suspensos antes de aprovacao
+    if new_status in ("aguardando_aprovacao",):
+        from pd_routes import assert_pd_card_ready_for_approval
+        await assert_pd_card_ready_for_approval(card_id, user["tenant_id"])
+
     now = _now_iso()
     
     # Atualizar card P&D
