@@ -22,7 +22,7 @@ export default function LoginPage() {
             <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full" />
         </div>
     );
-    if (user) return <Navigate to="/dashboard" replace />;
+    if (user) return <Navigate to="/tasks" replace />;
 
     const handleLogin = async (e) => {
         e.preventDefault();
@@ -87,6 +87,35 @@ export default function LoginPage() {
                                     {submitting ? "Entrando..." : "Entrar"}
                                 </Button>
                             </form>
+
+                            <div className="mt-6 pt-6 border-t border-border" data-testid="demo-users-section">
+                                <p className="text-xs uppercase tracking-wider text-muted-foreground mb-3 font-medium">
+                                    Acesso rapido — 8 perfis demo
+                                </p>
+                                <div className="grid grid-cols-2 gap-2">
+                                    {[
+                                        { email: "admin@kuryos.com", pwd: "admin123", label: "Admin" },
+                                        { email: "vendedor@kuryos.com", pwd: "kuryos123", label: "Vendedor" },
+                                        { email: "salesops@kuryos.com", pwd: "kuryos123", label: "Sales Ops" },
+                                        { email: "formulador@kuryos.com", pwd: "kuryos123", label: "Formulador" },
+                                        { email: "qa@kuryos.com", pwd: "kuryos123", label: "Qualidade" },
+                                        { email: "liderpd@kuryos.com", pwd: "kuryos123", label: "Lider P&D" },
+                                        { email: "engenharia@kuryos.com", pwd: "kuryos123", label: "Eng. Produto" },
+                                        { email: "sucesso@kuryos.com", pwd: "kuryos123", label: "Sucesso Cliente" },
+                                    ].map((u) => (
+                                        <button
+                                            key={u.email}
+                                            type="button"
+                                            data-testid={`demo-login-${u.label.toLowerCase().replace(/[^a-z]/g, "-")}`}
+                                            onClick={() => setLoginForm({ email: u.email, password: u.pwd })}
+                                            className="text-xs rounded-md border border-border px-2 py-1.5 hover:bg-accent text-left transition-colors"
+                                        >
+                                            <span className="block font-medium truncate">{u.label}</span>
+                                            <span className="block text-[10px] text-muted-foreground truncate">{u.email}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
                         </TabsContent>
 
                         <TabsContent value="register">

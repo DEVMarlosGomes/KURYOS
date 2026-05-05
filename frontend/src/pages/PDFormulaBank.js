@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { Search, FlaskConical, ShieldCheck, BookOpen, Building2 } from "lucide-react";
+import { Search, FlaskConical, ShieldCheck, BookOpen, Building2, Lock } from "lucide-react";
 import { toast } from "sonner";
 
 function ApprovalBadge({ ok, label }) {
@@ -54,9 +54,24 @@ export default function PDFormulaBank() {
     client: items.filter(item => item.origin_type === "cliente").length,
   }), [items]);
 
+  const restrictedView = items.some((item) => item.restricted_view);
+
   return (
-    <div className="p-6 page-enter">
+    <div className="p-4 sm:p-6 page-enter">
       <PDSubNav active="formulaBank" />
+
+      {restrictedView && (
+        <div
+          className="mb-4 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+          data-testid="formula-bank-restricted-banner"
+        >
+          <Lock className="h-4 w-4 mt-0.5 shrink-0" />
+          <div>
+            <p className="font-medium">Visao restrita do banco de formulas</p>
+            <p className="text-xs mt-0.5">Seu perfil ({restrictedView ? "comercial" : "—"}) ve apenas metadados das formulas — composicao, percentuais e custos sao restritos a P&D, CQ e Engenharia.</p>
+          </div>
+        </div>
+      )}
 
       <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>

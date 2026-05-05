@@ -1073,8 +1073,9 @@ async def invite_user(data: InviteInput, request: Request):
     if existing:
         raise HTTPException(status_code=400, detail="Email ja registrado")
 
-    if data.role not in ("admin", "gestor", "vendedor"):
-        raise HTTPException(status_code=400, detail="Role invalida")
+    valid_roles = ("admin", "vendedor", "sales_ops", "formulador", "qa", "lider_pd", "engenharia_produto", "sucesso_cliente", "gestor")
+    if data.role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Role invalida. Use: {', '.join(valid_roles)}")
 
     temp_password = f"Kuryos{uuid.uuid4().hex[:6]}!"
     new_user = {
@@ -1108,8 +1109,9 @@ async def update_user_role(user_id: str, data: RoleUpdate, request: Request):
     user = await get_current_user(request)
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Somente admins podem alterar roles")
-    if data.role not in ("admin", "gestor", "vendedor"):
-        raise HTTPException(status_code=400, detail="Role invalida")
+    valid_roles = ("admin", "vendedor", "sales_ops", "formulador", "qa", "lider_pd", "engenharia_produto", "sucesso_cliente", "gestor")
+    if data.role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Role invalida. Use: {', '.join(valid_roles)}")
     if user_id == user["id"]:
         raise HTTPException(status_code=400, detail="Nao pode alterar sua propria role")
 
@@ -1635,14 +1637,65 @@ async def seed_admin():
         await seed_default_pipeline(tenant_id)
         logger.info(f"Seeded admin user: {admin_email}")
     else:
+        tenant_id = existing["tenant_id"]
         if not verify_password(admin_password, existing["password_hash"]):
             await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
             logger.info("Updated admin password")
 
+    # Seed 8 RBAC profile users (Section 10 PRD) — one per role
+    role_users = [
+        ("vendedor@kuryos.com",            "Vendedor SDR",           "vendedor"),
+        ("salesops@kuryos.com",            "Sales Ops",              "sales_ops"),
+        ("formulador@kuryos.com",          "Formulador P&D",         "formulador"),
+        ("qa@kuryos.com",                  "Controle de Qualidade",  "qa"),
+        ("liderpd@kuryos.com",             "Lider P&D",              "lider_pd"),
+        ("engenharia@kuryos.com",          "Engenharia de Produto",  "engenharia_produto"),
+        ("sucesso@kuryos.com",             "Sucesso do Cliente",     "sucesso_cliente"),
+    ]
+    role_password = os.environ.get("ROLE_USERS_PASSWORD", "kuryos123")
+    seeded_credentials = [(admin_email, admin_password, "admin", "Admin Kuryos")]
+    for email, name, role in role_users:
+        existing_user = await db.users.find_one({"email": email})
+        if not existing_user:
+            await db.users.insert_one({
+                "id": new_id(),
+                "email": email,
+                "password_hash": hash_password(role_password),
+                "name": name,
+                "role": role,
+                "tenant_id": tenant_id,
+                "created_at": now_iso(),
+            })
+            logger.info(f"Seeded role user: {email} ({role})")
+        else:
+            updates = {}
+            if existing_user.get("role") != role:
+                updates["role"] = role
+            if not verify_password(role_password, existing_user["password_hash"]):
+                updates["password_hash"] = hash_password(role_password)
+            if updates:
+                await db.users.update_one({"email": email}, {"$set": updates})
+        seeded_credentials.append((email, role_password, role, name))
+
     # Write credentials
     Path("/app/memory").mkdir(exist_ok=True)
+    creds_md = ["# Test Credentials\n", "All users belong to the same tenant (Kuryos Demo).\n"]
+    creds_md.append("## Login Endpoint\nPOST /api/auth/login  →  body: { email, password }\n")
+    creds_md.append("## Users (one per RBAC profile, Section 10 PRD)\n")
+    creds_md.append("| Email | Senha | Perfil | Nome |")
+    creds_md.append("| --- | --- | --- | --- |")
+    for email, pwd, role, name in seeded_credentials:
+        creds_md.append(f"| {email} | {pwd} | {role} | {name} |")
+    creds_md.append("")
+    creds_md.append("## Auth Endpoints")
+    creds_md.append("- POST /api/auth/login")
+    creds_md.append("- POST /api/auth/register")
+    creds_md.append("- GET /api/auth/me")
+    creds_md.append("- POST /api/auth/logout")
+    creds_md.append("- POST /api/auth/refresh")
+    creds_md.append("")
     with open("/app/memory/test_credentials.md", "w") as f:
-        f.write(f"# Test Credentials\n\n## Admin\n- Email: {admin_email}\n- Password: {admin_password}\n- Role: admin\n\n## Auth Endpoints\n- POST /api/auth/login\n- POST /api/auth/register\n- GET /api/auth/me\n- POST /api/auth/logout\n- POST /api/auth/refresh\n")
+        f.write("\n".join(creds_md))
 
 # ============ STARTUP ============
 

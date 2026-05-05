@@ -37,6 +37,18 @@ from workflow_engine import (
     INHERITED_FROM_PROJECT,
     INHERITED_FROM_SAMPLE,
 )
+from rbac import (
+    require_roles,
+    has_role,
+    COMERCIAL_FULL,
+    COMERCIAL_LEAD,
+    PD_READ,
+    PD_WRITE,
+    PD_FULL,
+    QA_APPROVERS,
+    DOC_REVIEWERS,
+    ADMIN_ONLY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -988,6 +1000,7 @@ def _validate_project_transition_requirements(project: dict, target_stage: str):
 @crm_router.post("/clients")
 async def create_client(data: ClientCreate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
     client_id = _new_id()
 
     now = _now_iso()
@@ -1138,6 +1151,7 @@ async def get_client(client_id: str, request: Request):
 @crm_router.put("/clients/{client_id}")
 async def update_client(client_id: str, data: ClientUpdate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
     existing = await db.crm_clients.find_one(
         {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -1216,6 +1230,7 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
 @crm_router.put("/clients/{client_id}/move")
 async def move_client(client_id: str, data: ClientMove, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
     client = await db.crm_clients.find_one(
         {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -1359,6 +1374,7 @@ async def get_client_full(client_id: str, request: Request):
 @crm_router.post("/projects/batch")
 async def batch_create_projects(data: ProjectBatchCreate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
 
     # ERP v3.0: hierarchy lock — child cannot exist without parent
     client = await assert_client_exists(user["tenant_id"], data.cliente_id)
@@ -1490,6 +1506,7 @@ async def get_project(project_id: str, request: Request):
 @crm_router.put("/projects/{project_id}")
 async def update_project(project_id: str, data: ProjectUpdate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
     update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
 
     if not update_fields:
@@ -1515,6 +1532,7 @@ async def update_project(project_id: str, data: ProjectUpdate, request: Request)
 @crm_router.put("/projects/{project_id}/move")
 async def move_project(project_id: str, data: ProjectMove, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
     project = await db.crm_projects.find_one(
         {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -1641,6 +1659,7 @@ async def delete_project(project_id: str, request: Request):
     """Deleta um projeto em cascata (samples + variações + pd_cards).
     Bloqueia se houver SKU já gerado a partir deste projeto."""
     user = await _get_current_user(request)
+    require_roles(user, ADMIN_ONLY | {"sales_ops"})
     project = await db.crm_projects.find_one(
         {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -1699,6 +1718,7 @@ async def delete_project(project_id: str, request: Request):
 @crm_router.post("/samples/batch")
 async def batch_create_samples(data: SampleBatchCreate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
 
     # Verify project exists
     project = await db.crm_projects.find_one(
@@ -1796,6 +1816,7 @@ async def upload_sample_image(request: Request, file: UploadFile = File(...)):
 async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
     """Criar amostras em lote com suporte a variações (ERP v3.0: numeração GLOBAL)."""
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
 
     # ERP v3.0: hierarchy lock
     project = await assert_project_exists(user["tenant_id"], data.projeto_id)
@@ -2094,6 +2115,7 @@ async def get_sample(sample_id: str, request: Request):
 @crm_router.put("/samples/{sample_id}")
 async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
     update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
 
     if not update_fields:
@@ -2117,6 +2139,7 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
 @crm_router.put("/samples/{sample_id}/move")
 async def move_sample(sample_id: str, data: SampleMove, request: Request):
     user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
     sample = await db.crm_samples.find_one(
         {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -3055,6 +3078,7 @@ async def list_pd_cards(
 ):
     """Listar cards do Pipeline P&D"""
     user = await _get_current_user(request)
+    require_roles(user, PD_READ | COMERCIAL_FULL)
     query = {"tenant_id": user["tenant_id"]}
     
     if status:
@@ -3074,6 +3098,7 @@ async def list_pd_cards(
 async def get_pd_card(card_id: str, request: Request):
     """Obter detalhes de um card P&D"""
     user = await _get_current_user(request)
+    require_roles(user, PD_READ | COMERCIAL_FULL)
     card = await db.pd_cards.find_one(
         {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -3103,6 +3128,7 @@ class PDCardMove(BaseModel):
 async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     """Mover card no Pipeline P&D e sincronizar com CRM (ERP v3.0: gera tasks de CQ)."""
     user = await _get_current_user(request)
+    require_roles(user, PD_WRITE | QA_APPROVERS)
     
     card = await db.pd_cards.find_one(
         {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
@@ -3261,6 +3287,7 @@ class PDCardUpdate(BaseModel):
 async def update_pd_card(card_id: str, data: PDCardUpdate, request: Request):
     """Atualizar informações de um card P&D"""
     user = await _get_current_user(request)
+    require_roles(user, PD_WRITE)
     
     update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not update_fields:

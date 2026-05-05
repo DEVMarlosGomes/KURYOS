@@ -54,11 +54,11 @@ function ProtectedRoute({ children }) {
 
 function AppLayout() {
     return (
-        <div className="flex h-screen overflow-hidden bg-background">
+        <div className="flex min-h-screen md:h-screen overflow-hidden bg-background">
             <Sidebar />
-            <main className="flex-1 overflow-auto">
+            <main className="flex-1 overflow-auto pt-14 md:pt-0">
                 <Routes>
-                    <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                    <Route path="/" element={<Navigate to="/tasks" replace />} />
                     <Route path="/dashboard" element={<DashboardPage />} />
                     <Route path="/pipeline" element={<PipelinePage />} />
                     <Route path="/crm/clients" element={<CRM1Page />} />

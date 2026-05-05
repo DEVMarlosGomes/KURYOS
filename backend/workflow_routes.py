@@ -265,8 +265,8 @@ async def decide_workflow_task(task_id: str, data: TaskDecisionInput, request: R
 @workflow_router.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, request: Request):
     user = await _get_current_user(request)
-    if user.get("role") not in ("admin", "gestor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/gestor podem excluir tarefas")
+    if user.get("role") not in ("admin", "gestor", "lider_pd", "sales_ops"):
+        raise HTTPException(status_code=403, detail="Apenas admin/lider_pd/sales_ops podem excluir tarefas")
     existing = await db.workflow_tasks.find_one(
         {"id": task_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -299,8 +299,8 @@ async def get_audit_logs(
     limit: int = Query(200, ge=1, le=1000),
 ):
     user = await _get_current_user(request)
-    if user.get("role") not in ("admin", "gestor"):
-        raise HTTPException(status_code=403, detail="Apenas admin/gestor podem visualizar audit log")
+    if user.get("role") not in ("admin", "gestor", "lider_pd", "sales_ops", "qa"):
+        raise HTTPException(status_code=403, detail="Apenas admin/gestor/lider_pd/sales_ops/qa podem visualizar audit log")
     return await list_audit_logs(
         user["tenant_id"],
         entity_type=entity_type,

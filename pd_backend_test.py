@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 
 # Configuration
-BASE_URL = "https://task-dashboard-480.preview.emergentagent.com/api"
+BASE_URL = "https://pdcrm-sync.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 

@@ -81,7 +81,7 @@ const VIEW_LABELS = {
 
 export default function TasksPage() {
   const { user } = useAuth();
-  const isLeader = user?.role === "admin" || user?.role === "gestor";
+  const isLeader = ["admin", "gestor", "lider_pd", "sales_ops"].includes(user?.role);
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useState("mine");
@@ -90,10 +90,19 @@ export default function TasksPage() {
   const [activeTask, setActiveTask] = useState(null);
   const [actionMode, setActionMode] = useState("complete");
   const [comment, setComment] = useState("");
+  const [allOpenTasks, setAllOpenTasks] = useState([]);
 
   useEffect(() => {
     loadTasks();
   }, [viewMode, isLeader]);
+
+  useEffect(() => {
+    // Always fetch the user's open tasks for the KPI summary, regardless of viewMode
+    api
+      .get("/workflow/tasks", { params: { mine: true } })
+      .then(({ data }) => setAllOpenTasks(data || []))
+      .catch(() => setAllOpenTasks([]));
+  }, []);
 
   const loadTasks = async () => {
     setLoading(true);
@@ -126,6 +135,20 @@ export default function TasksPage() {
   }, [tasks]);
 
   const blockingCount = tasks.filter((task) => task.blocking && task.status !== "concluida").length;
+
+  // KPI counts based on the user's open tasks (always loaded, independent of view filter)
+  const kpiCounts = useMemo(() => {
+    const now = Date.now();
+    const open = allOpenTasks.filter((t) => t.status !== "concluida");
+    const overdue = open.filter((t) => t.due_date && new Date(t.due_date).getTime() < now);
+    const week = open.filter((t) => {
+      if (!t.due_date) return false;
+      const diff = new Date(t.due_date).getTime() - now;
+      return diff >= 0 && diff <= 7 * 24 * 3600 * 1000;
+    });
+    const blocking = open.filter((t) => t.blocking);
+    return { mine: open.length, overdue: overdue.length, week: week.length, blocking: blocking.length };
+  }, [allOpenTasks]);
 
   const openActionDialog = (task, mode) => {
     setActiveTask(task);
@@ -163,7 +186,7 @@ export default function TasksPage() {
 
   if (loading) {
     return (
-      <div className="p-8" data-testid="tasks-loading">
+      <div className="p-4 sm:p-6 lg:p-8" data-testid="tasks-loading">
         <div className="animate-pulse space-y-4">
           <div className="h-8 w-40 rounded bg-muted" />
           {[1, 2, 3].map((item) => (
@@ -175,15 +198,15 @@ export default function TasksPage() {
   }
 
   return (
-    <div className="p-8 space-y-6 page-enter" data-testid="tasks-page">
-      <div className="flex items-center justify-between gap-4 flex-wrap">
+    <div className="p-4 sm:p-6 lg:p-8 space-y-6 page-enter" data-testid="tasks-page">
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-3xl font-heading font-semibold tracking-tight">Tarefas de Workflow</h1>
+          <h1 className="text-2xl sm:text-3xl font-heading font-semibold tracking-tight">Tarefas</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            {VIEW_LABELS[viewMode]} com controle de bloqueios, aprovacoes e prazos.
+            Painel inicial de <span className="font-medium text-foreground">{user?.role}</span> · {VIEW_LABELS[viewMode]}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           {blockingCount > 0 && (
             <Badge variant="destructive" className="text-xs px-3 py-1.5" data-testid="blocking-count">
               <AlertTriangle className="h-3 w-3 mr-1" />
@@ -197,7 +220,34 @@ export default function TasksPage() {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-3">
+      {/* KPI cards — Minhas / Em Atraso / Esta Semana / Bloqueantes */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3" data-testid="task-kpis">
+        {[
+          { key: "mine", label: "Minha Fila", value: kpiCounts.mine, icon: Clock, color: "text-primary" },
+          { key: "overdue", label: "Em Atraso", value: kpiCounts.overdue, icon: AlertTriangle, color: "text-red-500" },
+          { key: "week", label: "Esta Semana", value: kpiCounts.week, icon: Calendar, color: "text-amber-500" },
+          { key: "blocking", label: "Bloqueantes", value: kpiCounts.blocking, icon: ShieldX, color: "text-fuchsia-500" },
+        ].map((card) => {
+          const ICon = card.icon;
+          const active = viewMode === card.key;
+          return (
+            <button
+              key={card.key}
+              onClick={() => setViewMode(card.key)}
+              data-testid={`kpi-${card.key}`}
+              className={`text-left rounded-lg border p-4 transition-colors ${active ? "bg-accent border-primary" : "bg-card border-border hover:bg-accent"}`}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">{card.label}</span>
+                <ICon className={`h-4 w-4 ${card.color}`} />
+              </div>
+              <p className="text-2xl font-heading font-semibold mono-num mt-2">{card.value}</p>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3" data-testid="task-filters">
         <div className="flex gap-2 flex-wrap">
           {[
             { value: "mine", label: "Minhas" },
@@ -221,7 +271,7 @@ export default function TasksPage() {
         <div className="flex items-center gap-2">
           <Filter className="h-4 w-4 text-muted-foreground" />
           <Select value={entityFilter} onValueChange={setEntityFilter}>
-            <SelectTrigger className="w-52" data-testid="entity-filter">
+            <SelectTrigger className="w-44 sm:w-52" data-testid="entity-filter">
               <SelectValue placeholder="Tipo de entidade" />
             </SelectTrigger>
             <SelectContent>

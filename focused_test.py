@@ -6,7 +6,7 @@ Focused test for the key CRM delete/add endpoints
 import requests
 import json
 
-BASE_URL = "https://task-dashboard-480.preview.emergentagent.com/api"
+BASE_URL = "https://pdcrm-sync.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 
