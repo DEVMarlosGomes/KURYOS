@@ -241,6 +241,9 @@ export default function PDDetail() {
             </TabsTrigger>
             <TabsTrigger value="costs" className="gap-1.5"><DollarSign className="h-3.5 w-3.5" />Custos</TabsTrigger>
             <TabsTrigger value="documents" className="gap-1.5"><FileText className="h-3.5 w-3.5" />Documentos</TabsTrigger>
+            <TabsTrigger value="live_docs" className="gap-1.5" data-testid="tab-live-docs">
+              <ShieldCheck className="h-3.5 w-3.5" />Documentos Vivos
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview">
@@ -297,6 +300,10 @@ export default function PDDetail() {
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
+          </TabsContent>
+
+          <TabsContent value="live_docs">
+            <LiveDocumentsTab reqId={req.id} req={req} />
           </TabsContent>
         </Tabs>
       </div>
@@ -2737,3 +2744,399 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
   );
 }
 
+
+/* ============ LIVE DOCUMENTS TAB (FT/EPA versionados) ============ */
+
+const LIVE_DOC_STATUS_CONFIG = {
+  em_revisao: { label: "Em revisão", className: "bg-amber-500/10 text-amber-700 border-amber-300" },
+  aprovado: { label: "Aprovado · vigente", className: "bg-emerald-500/10 text-emerald-700 border-emerald-300" },
+  reprovado: { label: "Reprovado", className: "bg-red-500/10 text-red-600 border-red-300" },
+  substituido: { label: "Substituído", className: "bg-muted text-muted-foreground border-border" },
+};
+
+const FIELD_LABELS = {
+  briefing: "Briefing",
+  ficha_tecnica: "Ficha técnica",
+  bom_bulk_formula: "BOM bulk / fórmula",
+  bom_embalagem_primaria: "BOM embalagem primária",
+  especificacoes_produto_acabado: "Especificações do produto acabado",
+  especificacoes_embalagem: "Especificações de embalagem",
+  ordem_adicao: "Ordem de adição",
+  parametros_in_process: "Parâmetros in-process",
+  modo_preparo: "Modo de preparo",
+  identificacao: "Identificação",
+  identificacao_produto: "Identificação do produto",
+  composicao_completa: "Composição completa",
+  rendimento_teorico: "Rendimento teórico",
+  observacoes_tecnicas: "Observações técnicas",
+  informacoes_rotulo: "Informações de rótulo",
+  kickoff: "Kickoff",
+  aprovacao_cliente: "Aprovação do cliente",
+  criterios_liberacao_lote: "Critérios de liberação de lote",
+};
+
+function fieldLabel(key) {
+  if (!key) return "";
+  return FIELD_LABELS[key] || key.replace(/_/g, " ");
+}
+
+function LiveDocumentsTab({ reqId, req }) {
+  const { user } = useAuth();
+  const role = (user?.role || "").toLowerCase();
+  const isReviewer = ["admin", "lider_pd", "qa", "engenharia_produto", "formulador", "gestor"].includes(role);
+
+  const [docType, setDocType] = useState("ficha_tecnica");
+  const [versions, setVersions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [diffData, setDiffData] = useState(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [actingTaskId, setActingTaskId] = useState(null);
+  const [generating, setGenerating] = useState(false);
+
+  const fetchVersions = useCallback(async () => {
+    if (!reqId) return;
+    setLoading(true);
+    try {
+      const { data } = await api.get(`/pd/requests/${reqId}/live-documents/${docType}/versions`);
+      setVersions(Array.isArray(data) ? data : []);
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Erro ao carregar versões";
+      if (err?.response?.status !== 404) toast.error(detail);
+      setVersions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [reqId, docType]);
+
+  useEffect(() => { fetchVersions(); }, [fetchVersions]);
+
+  const openDiff = async (versionId) => {
+    setDiffOpen(true);
+    setDiffData(null);
+    setDiffLoading(true);
+    try {
+      const { data } = await api.get(`/pd/document-versions/${versionId}/diff`);
+      setDiffData(data);
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Erro ao carregar diff");
+    } finally {
+      setDiffLoading(false);
+    }
+  };
+
+  const decideTask = async (taskId, decision) => {
+    let comment = "";
+    if (decision === "rejected") {
+      comment = window.prompt("Justifique a reprovação (obrigatório):", "");
+      if (!comment || !comment.trim()) {
+        toast.error("Justificativa obrigatória para reprovação.");
+        return;
+      }
+    } else {
+      comment = window.prompt("Comentário (opcional):", "") || "";
+    }
+    setActingTaskId(taskId);
+    try {
+      await api.put(`/workflow/tasks/${taskId}/decision`, { decision, comment });
+      toast.success(decision === "approved" ? "Tarefa aprovada" : "Tarefa reprovada");
+      await fetchVersions();
+      if (diffData?.current?.id) {
+        const { data } = await api.get(`/pd/document-versions/${diffData.current.id}/diff`);
+        setDiffData(data);
+      }
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Erro ao registrar decisão");
+    } finally {
+      setActingTaskId(null);
+    }
+  };
+
+  const generateNow = async () => {
+    const reason = window.prompt("Motivo da nova versão (curto):", "Geração manual");
+    if (!reason) return;
+    setGenerating(true);
+    try {
+      await api.post(`/pd/requests/${reqId}/live-documents/${docType}/generate`, {
+        reason,
+        changed_fields: [docType],
+      });
+      toast.success("Nova versão gerada");
+      await fetchVersions();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Não foi possível gerar a versão");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const docLabel = docType === "ficha_tecnica" ? "Ficha Técnica" : "EPA";
+
+  return (
+    <div className="space-y-5" data-testid="live-docs-tab">
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <CardTitle className="text-base flex items-center gap-2">
+                <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                Documentos Vivos — versionamento + aprovação
+              </CardTitle>
+              <p className="text-xs text-muted-foreground mt-1">
+                Cada alteração em dado-fonte gera uma nova versão e cria tarefas de aprovação.
+                Apenas a versão <span className="font-medium text-emerald-700">aprovada</span> é vigente para produção.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="inline-flex rounded-md border border-border bg-card overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setDocType("ficha_tecnica")}
+                  data-testid="live-docs-toggle-ft"
+                  className={`px-3 py-1.5 text-xs font-medium ${docType === "ficha_tecnica" ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground"}`}
+                >
+                  Ficha Técnica
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDocType("epa")}
+                  data-testid="live-docs-toggle-epa"
+                  className={`px-3 py-1.5 text-xs font-medium border-l border-border ${docType === "epa" ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground"}`}
+                >
+                  EPA
+                </button>
+              </div>
+              {isReviewer && (
+                <Button size="sm" variant="outline" onClick={generateNow} disabled={generating} data-testid="live-docs-generate-btn" className="gap-1.5">
+                  {generating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                  Gerar versão
+                </Button>
+              )}
+              <Button size="sm" variant="ghost" onClick={fetchVersions} disabled={loading} data-testid="live-docs-refresh-btn">
+                <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="pt-0">
+          {loading ? (
+            <div className="py-10 flex items-center justify-center text-muted-foreground">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          ) : versions.length === 0 ? (
+            <div className="py-12 text-center text-sm text-muted-foreground" data-testid="live-docs-empty">
+              <FileText className="h-10 w-10 mx-auto mb-3 text-muted-foreground/30" />
+              Nenhuma versão de {docLabel} disponível ainda.<br />
+              {docType === "ficha_tecnica"
+                ? "Disponível após aprovação do cliente e fórmula registrada."
+                : "Disponível após kickoff, aprovação do cliente e fórmula registrada."}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {versions.map((v) => {
+                const cfg = LIVE_DOC_STATUS_CONFIG[v.status] || LIVE_DOC_STATUS_CONFIG.em_revisao;
+                const isActive = v.active_for_operation && v.status === "aprovado";
+                return (
+                  <div
+                    key={v.id}
+                    data-testid={`live-doc-version-${v.version_code}`}
+                    className={`rounded-lg border ${isActive ? "border-emerald-300 bg-emerald-500/5" : "border-border bg-card"} p-3 flex items-start gap-3`}
+                  >
+                    <div className="shrink-0 mt-0.5">
+                      <div className={`h-9 w-9 rounded-md flex items-center justify-center ${isActive ? "bg-emerald-600 text-white" : "bg-muted text-foreground"}`}>
+                        <FileText className="h-4 w-4" />
+                      </div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-sm">{v.version_code || `v${v.version_number}`}</span>
+                        <Badge variant="outline" className={`text-[10px] ${cfg.className}`}>{cfg.label}</Badge>
+                        {isActive && <Badge variant="outline" className="text-[10px] bg-emerald-500/10 text-emerald-700 border-emerald-300">VIGENTE</Badge>}
+                        {v.source_trigger && v.source_trigger !== "manual" && (
+                          <Badge variant="outline" className="text-[10px]">auto · {v.source_trigger}</Badge>
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1 truncate">
+                        {v.reason || "(sem motivo)"} · por {v.created_by_name || "—"} · {v.created_at?.replace("T", " ").slice(0, 16)}
+                      </p>
+                      {Array.isArray(v.changed_fields) && v.changed_fields.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {v.changed_fields.slice(0, 6).map((f) => (
+                            <Badge key={f} variant="outline" className="text-[10px] bg-amber-500/5 text-amber-700 border-amber-200">
+                              {fieldLabel(f)}
+                            </Badge>
+                          ))}
+                          {v.changed_fields.length > 6 && (
+                            <Badge variant="outline" className="text-[10px]">+{v.changed_fields.length - 6}</Badge>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <div className="shrink-0 flex flex-col items-end gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="gap-1.5 h-7 text-xs"
+                        onClick={() => openDiff(v.id)}
+                        data-testid={`live-doc-view-${v.version_code}`}
+                      >
+                        <Eye className="h-3 w-3" /> Ver diff
+                      </Button>
+                      <a
+                        href={`${BACKEND_URL}/api/pd/document-versions/${v.id}/pdf`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[11px] text-muted-foreground hover:text-foreground flex items-center gap-1"
+                        data-testid={`live-doc-pdf-${v.version_code}`}
+                      >
+                        <Download className="h-3 w-3" /> PDF
+                      </a>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog open={diffOpen} onOpenChange={setDiffOpen}>
+        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto" data-testid="live-doc-diff-dialog">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-emerald-600" />
+              Diff & aprovação — {diffData?.current?.version_code || "..."}
+            </DialogTitle>
+            <DialogDescription>
+              {diffData?.previous
+                ? `Comparando com ${diffData.previous.version_code}`
+                : "Primeira versão (sem versão anterior)"}
+            </DialogDescription>
+          </DialogHeader>
+
+          {diffLoading || !diffData ? (
+            <div className="py-12 flex items-center justify-center">
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {Array.isArray(diffData.current?.source_changes) && diffData.current.source_changes.length > 0 && (
+                <div className="rounded-md border border-border bg-amber-500/5 p-3">
+                  <div className="text-xs font-semibold text-amber-700 mb-2 flex items-center gap-1.5">
+                    <AlertTriangle className="h-3.5 w-3.5" /> Mudanças no dado-fonte que dispararam esta versão
+                  </div>
+                  <div className="space-y-1 text-xs">
+                    {diffData.current.source_changes.map((c, i) => (
+                      <div key={i} className="flex items-start gap-2">
+                        <span className="font-medium min-w-[140px]">{c.label || c.field}:</span>
+                        <span className="text-muted-foreground line-through">{String(c.before ?? "—")}</span>
+                        <ArrowRight className="h-3 w-3 mt-0.5 text-muted-foreground" />
+                        <span className="text-foreground font-medium">{String(c.after ?? "—")}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                  Diferenças campo a campo ({diffData.differences?.length || 0})
+                </h4>
+                {(!diffData.differences || diffData.differences.length === 0) ? (
+                  <p className="text-xs text-muted-foreground italic">Sem diferenças detectadas no snapshot.</p>
+                ) : (
+                  <div className="space-y-1.5 max-h-[260px] overflow-y-auto pr-1">
+                    {diffData.differences.map((d, i) => (
+                      <div key={i} className="rounded border border-border p-2 text-xs">
+                        <div className="font-medium mb-1">{d.label || d.path}</div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="rounded bg-red-500/5 border border-red-200 px-2 py-1 break-all">
+                            <div className="text-[10px] uppercase text-red-600/70 mb-0.5">Antes</div>
+                            <div className="text-foreground">{String(d.before ?? "—")}</div>
+                          </div>
+                          <div className="rounded bg-emerald-500/5 border border-emerald-200 px-2 py-1 break-all">
+                            <div className="text-[10px] uppercase text-emerald-700/70 mb-0.5">Depois</div>
+                            <div className="text-foreground">{String(d.after ?? "—")}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                  Tarefas de aprovação
+                </h4>
+                {(!diffData.approval_tasks || diffData.approval_tasks.length === 0) ? (
+                  <p className="text-xs text-muted-foreground italic">Nenhuma tarefa de aprovação vinculada.</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {diffData.approval_tasks.map((t) => {
+                      const isClosed = t.status === "concluida" || t.status === "cancelada";
+                      const decisionBadge =
+                        t.decision === "approved"
+                          ? "bg-emerald-500/10 text-emerald-700 border-emerald-300"
+                          : t.decision === "rejected"
+                            ? "bg-red-500/10 text-red-600 border-red-300"
+                            : "bg-amber-500/10 text-amber-700 border-amber-300";
+                      const isMine = t.responsible_id === user?.id;
+                      const canDecide = !isClosed && (isMine || role === "admin" || role === "gestor" || role === "lider_pd");
+                      return (
+                        <div key={t.id} className="rounded border border-border p-2 text-xs flex items-start gap-2" data-testid={`approval-task-${t.id}`}>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium">{t.title}</span>
+                              <Badge variant="outline" className={`text-[10px] ${decisionBadge}`}>
+                                {t.decision === "approved" ? "Aprovada" : t.decision === "rejected" ? "Reprovada" : t.status}
+                              </Badge>
+                            </div>
+                            <div className="text-muted-foreground mt-0.5">
+                              Resp.: {t.responsible_name || "—"} · prazo {t.due_date?.slice(0, 10) || "—"}
+                              {t.decision_comment && (
+                                <span className="block mt-0.5 italic">"{t.decision_comment}"</span>
+                              )}
+                            </div>
+                          </div>
+                          {canDecide && (
+                            <div className="flex flex-col gap-1 shrink-0">
+                              <Button
+                                size="sm"
+                                variant="default"
+                                className="h-7 px-2 gap-1 text-xs bg-emerald-600 hover:bg-emerald-700"
+                                onClick={() => decideTask(t.id, "approved")}
+                                disabled={actingTaskId === t.id}
+                                data-testid={`approval-task-${t.id}-approve`}
+                              >
+                                <ThumbsUp className="h-3 w-3" /> Aprovar
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                className="h-7 px-2 gap-1 text-xs"
+                                onClick={() => decideTask(t.id, "rejected")}
+                                disabled={actingTaskId === t.id}
+                                data-testid={`approval-task-${t.id}-reject`}
+                              >
+                                <ThumbsDown className="h-3 w-3" /> Reprovar
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDiffOpen(false)} data-testid="live-doc-diff-close">Fechar</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

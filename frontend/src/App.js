@@ -20,6 +20,7 @@ import SKUsPage from "@/pages/SKUsPage";
 import TasksPage from "@/pages/TasksPage";
 import AuditLogPage from "@/pages/AuditLogPage";
 import Sidebar from "@/components/Sidebar";
+import RoleGuard, { ROLE_GROUPS } from "@/components/RoleGuard";
 import { Toaster } from "@/components/ui/sonner";
 
 function ThemeProvider({ children }) {
@@ -53,6 +54,12 @@ function ProtectedRoute({ children }) {
 }
 
 function AppLayout() {
+    const COMERCIAL = ROLE_GROUPS.COMERCIAL_FULL;
+    const PD_READ = ROLE_GROUPS.PD_READ;
+    const PD_FULL = ROLE_GROUPS.PD_FULL;
+    const ADMIN_ONLY = ROLE_GROUPS.ADMIN_ONLY;
+    const AUDIT_ROLES = [...ROLE_GROUPS.DOC_REVIEWERS, "sales_ops"];
+
     return (
         <div className="flex min-h-screen md:h-screen overflow-hidden bg-background">
             <Sidebar />
@@ -60,21 +67,21 @@ function AppLayout() {
                 <Routes>
                     <Route path="/" element={<Navigate to="/tasks" replace />} />
                     <Route path="/dashboard" element={<DashboardPage />} />
-                    <Route path="/pipeline" element={<PipelinePage />} />
-                    <Route path="/crm/clients" element={<CRM1Page />} />
-                    <Route path="/crm/projects" element={<CRM2Page />} />
-                    <Route path="/crm/samples" element={<CRM3Page />} />
-                    <Route path="/crm/skus" element={<SKUsPage />} />
-                    <Route path="/pd" element={<PDPage />} />
-                    <Route path="/pd/formulas" element={<PDFormulaBank />} />
-                    <Route path="/pd/homologacao" element={<PDHomologacao />} />
-                    <Route path="/pd/catalog" element={<PDCatalog />} />
-                    <Route path="/pd/estoque" element={<PDStock />} />
-                    <Route path="/pd/relatorios" element={<PDReports />} />
-                    <Route path="/pd/:id" element={<PDDetail />} />
+                    <Route path="/pipeline" element={<RoleGuard allowed={COMERCIAL}><PipelinePage /></RoleGuard>} />
+                    <Route path="/crm/clients" element={<RoleGuard allowed={COMERCIAL}><CRM1Page /></RoleGuard>} />
+                    <Route path="/crm/projects" element={<RoleGuard allowed={COMERCIAL}><CRM2Page /></RoleGuard>} />
+                    <Route path="/crm/samples" element={<RoleGuard allowed={COMERCIAL}><CRM3Page /></RoleGuard>} />
+                    <Route path="/crm/skus" element={<RoleGuard allowed={[...PD_READ, ...COMERCIAL]}><SKUsPage /></RoleGuard>} />
+                    <Route path="/pd" element={<RoleGuard allowed={PD_READ}><PDPage /></RoleGuard>} />
+                    <Route path="/pd/formulas" element={<RoleGuard allowed={PD_READ}><PDFormulaBank /></RoleGuard>} />
+                    <Route path="/pd/homologacao" element={<RoleGuard allowed={PD_FULL}><PDHomologacao /></RoleGuard>} />
+                    <Route path="/pd/catalog" element={<RoleGuard allowed={PD_FULL}><PDCatalog /></RoleGuard>} />
+                    <Route path="/pd/estoque" element={<RoleGuard allowed={PD_FULL}><PDStock /></RoleGuard>} />
+                    <Route path="/pd/relatorios" element={<RoleGuard allowed={PD_READ}><PDReports /></RoleGuard>} />
+                    <Route path="/pd/:id" element={<RoleGuard allowed={PD_READ}><PDDetail /></RoleGuard>} />
                     <Route path="/tasks" element={<TasksPage />} />
-                    <Route path="/audit" element={<AuditLogPage />} />
-                    <Route path="/team" element={<TeamPage />} />
+                    <Route path="/audit" element={<RoleGuard allowed={AUDIT_ROLES}><AuditLogPage /></RoleGuard>} />
+                    <Route path="/team" element={<RoleGuard allowed={ADMIN_ONLY}><TeamPage /></RoleGuard>} />
                 </Routes>
             </main>
         </div>

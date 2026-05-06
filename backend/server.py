@@ -37,11 +37,25 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from openpyxl import Workbook
 from openpyxl.styles import Font as XlFont, Alignment, PatternFill
-from pd_routes import pd_router, init_pd, run_stability_scheduler
+from pd_routes import pd_router, init_pd, run_stability_scheduler, check_stability_alerts_for_tenant
 from crm_routes import crm_router, init_crm, run_alert_scheduler
 from estoque_routes import estoque_router, init_estoque
 from workflow_engine import init_workflow, run_workflow_notification_scheduler
 from workflow_routes import workflow_router, init_workflow_routes
+from rbac import (
+    require_roles,
+    has_role,
+    COMERCIAL_FULL,
+    PD_FULL,
+    PD_READ,
+    ADMIN_ONLY,
+    DOC_REVIEWERS,
+)
+
+# Roles allowed to use the legacy commercial pipeline (cards, stages, fields, amostras, products, messages, AI helpers, proposal)
+COMMERCIAL_PIPELINE_ROLES = COMERCIAL_FULL | {"admin"}
+# Roles allowed to read the commercial board (vendedor, sales_ops, sucesso_cliente, admin). Sales ops/manager can also read; PD roles are blocked.
+COMMERCIAL_PIPELINE_READ_ROLES = COMMERCIAL_PIPELINE_ROLES
 
 # ============ SETUP ============
 missing_env_defaults = []
@@ -130,6 +144,13 @@ async def get_current_user(request: Request) -> dict:
 def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
     response.set_cookie(key="refresh_token", value=refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+
+
+async def get_commercial_user(request: Request) -> dict:
+    """Auth + ensure user belongs to commercial pipeline roles."""
+    user = await get_current_user(request)
+    require_roles(user, COMMERCIAL_PIPELINE_ROLES)
+    return user
 
 # ============ WEBSOCKET MANAGER ============
 
@@ -373,13 +394,13 @@ async def refresh_token(request: Request, response: Response):
 
 @router.get("/pipelines")
 async def list_pipelines(request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     pipelines = await db.pipelines.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).to_list(100)
     return pipelines
 
 @router.get("/pipelines/{pipeline_id}/board")
 async def get_board(pipeline_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     pipeline = await db.pipelines.find_one({"id": pipeline_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
@@ -439,7 +460,7 @@ class FieldUpdate(BaseModel):
 
 @router.post("/stages")
 async def create_stage(data: StageCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     pipeline = await db.pipelines.find_one({"id": data.pipeline_id, "tenant_id": user["tenant_id"]})
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline não encontrado")
@@ -459,7 +480,7 @@ async def create_stage(data: StageCreate, request: Request):
 
 @router.put("/stages/{stage_id}")
 async def update_stage(stage_id: str, data: StageUpdate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     stage = await db.stages.find_one({"id": stage_id}, {"_id": 0})
     if not stage:
         raise HTTPException(status_code=404, detail="Estágio não encontrado")
@@ -477,7 +498,7 @@ async def update_stage(stage_id: str, data: StageUpdate, request: Request):
 
 @router.delete("/stages/{stage_id}")
 async def delete_stage(stage_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     stage = await db.stages.find_one({"id": stage_id}, {"_id": 0})
     if not stage:
         raise HTTPException(status_code=404, detail="Estágio não encontrado")
@@ -495,14 +516,14 @@ async def delete_stage(stage_id: str, request: Request):
 
 @router.put("/stages/reorder")
 async def reorder_stages(data: StageReorder, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     for i, sid in enumerate(data.stage_ids):
         await db.stages.update_one({"id": sid}, {"$set": {"order": i}})
     return {"message": "Estágios reordenados"}
 
 @router.post("/fields")
 async def create_field(data: FieldCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     stage = await db.stages.find_one({"id": data.stage_id}, {"_id": 0})
     if not stage:
         raise HTTPException(status_code=404, detail="Estágio não encontrado")
@@ -520,7 +541,7 @@ async def create_field(data: FieldCreate, request: Request):
 
 @router.put("/fields/{field_id}")
 async def update_field(field_id: str, data: FieldUpdate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="Nada para atualizar")
@@ -533,7 +554,7 @@ async def update_field(field_id: str, data: FieldUpdate, request: Request):
 
 @router.delete("/fields/{field_id}")
 async def delete_field(field_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     field = await db.fields.find_one({"id": field_id})
     if not field:
         raise HTTPException(status_code=404, detail="Campo não encontrado")
@@ -546,7 +567,7 @@ async def delete_field(field_id: str, request: Request):
 
 @router.post("/cards")
 async def create_card(data: CardCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card_id = new_id()
     card = {
         "id": card_id, "tenant_id": user["tenant_id"], "pipeline_id": data.pipeline_id,
@@ -572,7 +593,7 @@ async def create_card(data: CardCreate, request: Request):
 
 @router.get("/cards/{card_id}")
 async def get_card(card_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -580,7 +601,7 @@ async def get_card(card_id: str, request: Request):
 
 @router.put("/cards/{card_id}")
 async def update_card(card_id: str, data: CardUpdate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -623,7 +644,7 @@ async def update_card(card_id: str, data: CardUpdate, request: Request):
 
 @router.put("/cards/{card_id}/move")
 async def move_card(card_id: str, data: CardMove, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -820,7 +841,7 @@ async def move_card(card_id: str, data: CardMove, request: Request):
 
 @router.delete("/cards/{card_id}")
 async def delete_card(card_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     result = await db.cards.delete_one({"id": card_id, "tenant_id": user["tenant_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -835,7 +856,7 @@ async def delete_card(card_id: str, request: Request):
 
 @router.get("/cards/{card_id}/details")
 async def get_card_details(card_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -874,7 +895,7 @@ class AmostraUpdate(BaseModel):
 
 @router.post("/cards/{card_id}/amostras")
 async def add_amostra(card_id: str, data: AmostraCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -897,7 +918,7 @@ async def add_amostra(card_id: str, data: AmostraCreate, request: Request):
 
 @router.get("/cards/{card_id}/amostras")
 async def list_amostras(card_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     amostras = await db.card_amostras.find(
         {"card_id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     ).sort("created_at", 1).to_list(100)
@@ -905,7 +926,7 @@ async def list_amostras(card_id: str, request: Request):
 
 @router.put("/cards/{card_id}/amostras/{amostra_id}")
 async def update_amostra(card_id: str, amostra_id: str, data: AmostraUpdate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -920,7 +941,7 @@ async def update_amostra(card_id: str, amostra_id: str, data: AmostraUpdate, req
 
 @router.delete("/cards/{card_id}/amostras/{amostra_id}")
 async def delete_amostra(card_id: str, amostra_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     result = await db.card_amostras.delete_one(
         {"id": amostra_id, "card_id": card_id, "tenant_id": user["tenant_id"]}
     )
@@ -932,7 +953,7 @@ async def delete_amostra(card_id: str, amostra_id: str, request: Request):
 
 @router.post("/cards/{card_id}/field-values")
 async def save_field_values(card_id: str, values: List[FieldValueSave], request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -961,13 +982,13 @@ async def save_field_values(card_id: str, values: List[FieldValueSave], request:
 
 @router.get("/cards/{card_id}/products")
 async def list_products(card_id: str, request: Request):
-    await get_current_user(request)
+    await get_commercial_user(request)
     products = await db.card_products.find({"card_id": card_id}, {"_id": 0}).to_list(100)
     return products
 
 @router.post("/cards/{card_id}/products")
 async def add_product(card_id: str, data: ProductCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     product = {
         "id": new_id(), "card_id": card_id, "nome_produto": data.nome_produto,
         "sku": data.sku, "quantidade": data.quantidade, "valor_unitario": data.valor_unitario,
@@ -986,7 +1007,7 @@ async def add_product(card_id: str, data: ProductCreate, request: Request):
 
 @router.delete("/card-products/{product_id}")
 async def delete_product(product_id: str, request: Request):
-    await get_current_user(request)
+    await get_commercial_user(request)
     result = await db.card_products.delete_one({"id": product_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -1040,13 +1061,13 @@ async def delete_task(task_id: str, request: Request):
 
 @router.get("/cards/{card_id}/messages")
 async def list_messages(card_id: str, request: Request):
-    await get_current_user(request)
+    await get_commercial_user(request)
     messages = await db.messages.find({"card_id": card_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
     return messages
 
 @router.post("/cards/{card_id}/messages")
 async def send_message(card_id: str, data: MessageCreate, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     message = {
         "id": new_id(), "card_id": card_id, "tenant_id": user["tenant_id"],
         "content": data.content, "msg_type": data.msg_type, "sender": "agent",
@@ -1246,7 +1267,7 @@ async def list_email_logs(request: Request):
 @router.post("/ai/lead-summary/{card_id}")
 async def ai_lead_summary(card_id: str, request: Request):
     ensure_ai_available()
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -1296,7 +1317,7 @@ Historico Recente:
 @router.post("/ai/whatsapp-suggestions/{card_id}")
 async def ai_whatsapp_suggestions(card_id: str, request: Request):
     ensure_ai_available()
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -1337,7 +1358,7 @@ async def ai_whatsapp_suggestions(card_id: str, request: Request):
 
 @router.get("/cards/{card_id}/proposal-pdf")
 async def generate_proposal_pdf(card_id: str, request: Request):
-    user = await get_current_user(request)
+    user = await get_commercial_user(request)
     card = await db.cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")

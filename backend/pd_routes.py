@@ -527,7 +527,18 @@ async def run_stability_scheduler():
         try:
             tenants = await db.tenants.find({}, {"_id": 0, "id": 1}).to_list(500)
             for tenant in tenants:
-                await check_stability_alerts_for_tenant(tenant["id"])
+                created = await check_stability_alerts_for_tenant(tenant["id"])
+                # Persist last-run for UI visibility
+                await db.system_status.update_one(
+                    {"id": "stability_scheduler"},
+                    {"$set": {
+                        "id": "stability_scheduler",
+                        "last_run_at": now_iso(),
+                        "last_tenant_id": tenant["id"],
+                        "last_alerts_created": created,
+                    }},
+                    upsert=True,
+                )
         except Exception as exc:  # pragma: no cover
             logger.error(f"Stability scheduler error: {exc}")
         await asyncio.sleep(3600)  # run every 1 hour for better D-2 responsiveness
@@ -2580,6 +2591,184 @@ async def export_live_document_pdf(version_id: str, request: Request):
     filename = f"{label.replace(' ', '_').lower()}_{safe_code}.pdf"
     return StreamingResponse(buffer, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+# ---------- Live document inbox + diff helpers ----------
+
+def _flatten_snapshot(snapshot: Any, prefix: str = "") -> Dict[str, Any]:
+    """Flatten a nested dict snapshot into dot-path -> value pairs (lists kept as-is)."""
+    flat: Dict[str, Any] = {}
+    if isinstance(snapshot, dict):
+        for k, v in snapshot.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(_flatten_snapshot(v, key))
+            else:
+                flat[key] = v
+    return flat
+
+
+@pd_router.get("/live-documents/pending")
+async def list_pending_live_documents(request: Request):
+    """List FT/EPA versions awaiting approval (em_revisao) for the current tenant.
+    Useful as inbox for QA/Lider PD/Engenharia."""
+    user = await get_current_user(request)
+    if not _user_can_review_live_documents(user):
+        raise HTTPException(status_code=403, detail="Sua funcao nao tem acesso ao inbox de documentos vivos.")
+
+    versions = await db.pd_document_versions.find(
+        {"tenant_id": user["tenant_id"], "status": "em_revisao"},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(500)
+
+    pd_request_ids = list({v.get("pd_request_id") for v in versions if v.get("pd_request_id")})
+    pd_requests = []
+    if pd_request_ids:
+        pd_requests = await db.pd_requests.find(
+            {"id": {"$in": pd_request_ids}, "tenant_id": user["tenant_id"]},
+            {"_id": 0, "id": 1, "project_name": 1, "client_name": 1, "sku": 1},
+        ).to_list(1000)
+    pd_map = {p["id"]: p for p in pd_requests}
+
+    result = []
+    for v in versions:
+        approval_tasks = await db.workflow_tasks.find(
+            {"tenant_id": user["tenant_id"], "entity_type": "pd_document", "entity_id": v["id"]},
+            {"_id": 0},
+        ).sort("created_at", 1).to_list(50)
+        pending_tasks = [t for t in approval_tasks if t.get("status") not in ("concluida", "cancelada")]
+        my_role = (user.get("role") or "").lower()
+        my_tasks = [
+            t for t in pending_tasks
+            if (t.get("metadata") or {}).get("approver_role") in {my_role, "qa" if my_role == "qa" else None, "lider_pd" if my_role == "lider_pd" else None}
+            or t.get("responsible_id") == user["id"]
+        ]
+        pd_req = pd_map.get(v.get("pd_request_id")) or {}
+        result.append({
+            "id": v["id"],
+            "doc_type": v["doc_type"],
+            "version_code": v.get("version_code"),
+            "version_number": v.get("version_number"),
+            "status": v.get("status"),
+            "reason": v.get("reason", ""),
+            "changed_fields": v.get("changed_fields", []),
+            "source_trigger": v.get("source_trigger", ""),
+            "created_at": v.get("created_at"),
+            "created_by_name": v.get("created_by_name", ""),
+            "pd_request_id": v.get("pd_request_id"),
+            "project_name": pd_req.get("project_name", ""),
+            "client_name": pd_req.get("client_name", ""),
+            "sku": pd_req.get("sku", ""),
+            "pending_approvals_count": len(pending_tasks),
+            "my_pending_tasks_count": len(my_tasks),
+        })
+    return result
+
+
+@pd_router.get("/document-versions/{version_id}/diff")
+async def diff_live_document_version(version_id: str, request: Request):
+    """Diff a version's snapshot against the previous (non-rejected) version of the same doc.
+    Returns a list of {path, before, after} field-level changes plus the version's source_changes."""
+    user = await get_current_user(request)
+    current = await _get_live_document_version(version_id, user)
+
+    # find previous version (any status except rejeitado/reprovado, lower version_number)
+    previous = await db.pd_document_versions.find_one(
+        {
+            "tenant_id": user["tenant_id"],
+            "pd_request_id": current["pd_request_id"],
+            "doc_type": current["doc_type"],
+            "version_number": {"$lt": current["version_number"]},
+            "status": {"$ne": "reprovado"},
+        },
+        {"_id": 0},
+        sort=[("version_number", -1)],
+    )
+
+    flat_current = _flatten_snapshot(current.get("snapshot") or {})
+    flat_previous = _flatten_snapshot((previous or {}).get("snapshot") or {})
+    keys = sorted(set(flat_current.keys()) | set(flat_previous.keys()))
+    differences: List[Dict[str, Any]] = []
+    for key in keys:
+        before = flat_previous.get(key)
+        after = flat_current.get(key)
+        if before == after:
+            continue
+        differences.append({
+            "path": key,
+            "label": key.replace("_", " ").replace(".", " · "),
+            "before": before,
+            "after": after,
+        })
+
+    approval_tasks = await db.workflow_tasks.find(
+        {"tenant_id": user["tenant_id"], "entity_type": "pd_document", "entity_id": version_id},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(50)
+
+    return {
+        "current": {
+            "id": current["id"],
+            "version_code": current.get("version_code"),
+            "version_number": current.get("version_number"),
+            "status": current.get("status"),
+            "reason": current.get("reason", ""),
+            "changed_fields": current.get("changed_fields", []),
+            "source_changes": current.get("source_changes", []),
+            "source_trigger": current.get("source_trigger", ""),
+            "created_at": current.get("created_at"),
+            "created_by_name": current.get("created_by_name", ""),
+            "snapshot": current.get("snapshot"),
+        },
+        "previous": (
+            {
+                "id": previous["id"],
+                "version_code": previous.get("version_code"),
+                "version_number": previous.get("version_number"),
+                "status": previous.get("status"),
+                "created_at": previous.get("created_at"),
+            }
+            if previous else None
+        ),
+        "differences": differences,
+        "approval_tasks": approval_tasks,
+    }
+
+
+@pd_router.get("/stability/scheduler-status")
+async def stability_scheduler_status(request: Request):
+    """Return last-run info for the stability D-2 scheduler. Visible to PD roles + admin."""
+    user = await get_current_user(request)
+    require_roles(user, PD_READ | DOC_REVIEWERS)
+    status = await db.system_status.find_one({"id": "stability_scheduler"}, {"_id": 0}) or {}
+    return {
+        "scheduler_active": True,
+        "interval_seconds": 3600,
+        "last_run_at": status.get("last_run_at"),
+        "last_alerts_created": status.get("last_alerts_created", 0),
+    }
+
+
+@pd_router.post("/stability/run-scheduler")
+async def run_stability_scheduler_now(request: Request):
+    """Manually trigger the stability D-2 scan for the current tenant. Admin/PD leadership only."""
+    user = await get_current_user(request)
+    require_roles(user, ADMIN_ONLY | {"lider_pd", "qa", "formulador"})
+    created = await check_stability_alerts_for_tenant(user["tenant_id"])
+    await db.system_status.update_one(
+        {"id": "stability_scheduler"},
+        {"$set": {
+            "id": "stability_scheduler",
+            "last_run_at": now_iso(),
+            "last_tenant_id": user["tenant_id"],
+            "last_alerts_created": created,
+            "last_run_kind": "manual",
+            "last_run_by": user.get("name", ""),
+        }},
+        upsert=True,
+    )
+    return {"alerts_created": created, "ran_at": now_iso()}
+
 
 # ============ FULL DETAIL VIEW ============
 

@@ -1,0 +1,51 @@
+{
+  "summary": "Iteration 8 testing: RBAC enforcement on commercial pipeline endpoints, Live Documents inbox/diff endpoints, Stability scheduler endpoints, RoleGuard frontend wrapper, TasksPage 'Rodar scan D-2' button, and PDDetail 'Documentos Vivos' tab. Backend: 29 tests pass + 1 xfail (real RBAC bug found on /api/pd/requests). Frontend: 14/14 RBAC route checks pass; scan D-2 button visible+functional for admin/qa, hidden for vendedor; Live Documents tab renders empty state with FT/EPA toggles and reviewer 'Gerar versão' button.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/pd/requests (and likely /api/pd/requests/{id}, PUT/DELETE /api/pd/requests/{id})",
+        "issue": "RBAC NOT enforced. Vendedor can list PD requests (returns 200) although PD_READ does NOT include vendedor. server.py wraps commercial pipeline routes with get_commercial_user, but the symmetric protection on PD endpoints is missing in pd_routes.py. Code in /app/backend/pd_routes.py:1104 defines list_pd_requests without require_roles call. This is the 'fallback scenario' explicitly called out in the test request.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iter8_rbac_livedocs.py",
+    "/app/test_reports/pytest/iter8_results.xml"
+  ],
+  "action_items": [
+    "Add require_roles(user, PD_READ) to /api/pd/requests GET endpoint (and verify other pd_routes endpoints follow the same pattern). Currently any authenticated user (including vendedor) can list/read PD requests, which violates RBAC matrix where vendedor is not in PD_READ.",
+    "Optional: confirm whether vendedor should see /pd/requests/{id} & PD details via UI — RoleGuard already blocks /pd routes on the frontend, but backend should still enforce."
+  ],
+  "critical_code_review_comments": [
+    "Inconsistent RBAC enforcement: server.py systematically applies get_commercial_user() to commercial pipeline routes (good), but pd_routes.py only uses require_roles() on selected endpoints (homologacao, scheduler, etc). The base /requests CRUD endpoints lack role checks - any authenticated tenant member, including vendedor, can read PD data. Recommend adding a get_pd_user/get_pd_read_user helper and applying consistently.",
+    "Live documents diff endpoint currently lacks explicit role check; relies on _get_live_document_version (need to verify it scopes by tenant + role). Consider adding require_roles(user, DOC_REVIEWERS).",
+    "Stability scheduler endpoints correctly enforce roles (PD_READ|DOC_REVIEWERS for status; ADMIN_ONLY|{liderpd,qa,formulador} for run-scheduler). Both verified."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter8_rbac_livedocs.py"
+  ],
+  "success_rate": {
+    "backend": "97% (29/30 — 1 xfail documenting real RBAC gap)",
+    "frontend": "100% (RBAC route guards, scan D-2 visibility, Live Docs tab elements all verified)"
+  },
+  "test_credentials": {
+    "admin": "admin@kuryos.com / admin123",
+    "vendedor": "vendedor@kuryos.com / kuryos123",
+    "qa": "qa@kuryos.com / kuryos123",
+    "formulador": "formulador@kuryos.com / kuryos123",
+    "liderpd": "liderpd@kuryos.com / kuryos123",
+    "salesops": "salesops@kuryos.com / kuryos123"
+  },
+  "seed_data_creation": "Created 1 PD request 'TEST_ITER8_LiveDocs' (id 0d56dcb1-2937-46ba-9817-00f1c7a2efd4) in admin tenant for testing PDDetail Live Documents tab. Also created 1 commercial card 'TEST_ITER8_RBAC_OK' via vendedor session.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend tests in /app/backend/tests/test_iter8_rbac_livedocs.py - 29 pass + 1 xfail (the xfail will flip to PASS once main agent adds require_roles(PD_READ) to /api/pd/requests). Auth uses HttpOnly cookies. Live Documents tab currently shows empty state since no FT/EPA versions are auto-generated for fresh PD requests; toggles FT<->EPA work, 'Gerar versão' button visible to qa (DOC_REVIEWERS). 'Rodar scan D-2' button confirmed visible+working for admin/qa/formulador/liderpd, hidden for vendedor/salesops. RoleGuard 'Acesso restrito' screen working correctly across all 4 tested roles.",
+  "rca_of_issue": "Bug 1 (RBAC gap on /api/pd/requests): pd_routes.py:1104 list_pd_requests only calls get_current_user, not require_roles. Mitigation: add `require_roles(user, PD_READ)` after get_current_user. Same review needed for other /requests CRUD handlers and any other /pd/* endpoint without explicit role check."
+}

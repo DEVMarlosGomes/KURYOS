@@ -100,6 +100,8 @@ export default function TasksPage() {
   const [createForm, setCreateForm] = useState({ title: "", description: "", entity_type: "pd_card", entity_id: "", due_in_days: 3, blocking: false, priority: "normal" });
   const [creatingTask, setCreatingTask] = useState(false);
   const [checkingReminders, setCheckingReminders] = useState(false);
+  const [runningStability, setRunningStability] = useState(false);
+  const [stabilityStatus, setStabilityStatus] = useState(null);
 
   const checkReminders = async () => {
     setCheckingReminders(true);
@@ -110,6 +112,27 @@ export default function TasksPage() {
     } catch { toast.error("Erro ao verificar lembretes"); }
     finally { setCheckingReminders(false); }
   };
+
+  const runStabilityScan = async () => {
+    setRunningStability(true);
+    try {
+      const { data } = await api.post("/pd/stability/run-scheduler");
+      toast.success(`Scan D-2 rodado: ${data.alerts_created} alerta(s) criado(s)`);
+      loadStabilityStatus();
+      loadTasks();
+    } catch (err) {
+      toast.error(formatApiError(err));
+    } finally { setRunningStability(false); }
+  };
+
+  const loadStabilityStatus = async () => {
+    try {
+      const { data } = await api.get("/pd/stability/scheduler-status");
+      setStabilityStatus(data);
+    } catch { setStabilityStatus(null); }
+  };
+
+  useEffect(() => { loadStabilityStatus(); }, []);
 
   const submitCreateTask = async () => {
     if (!createForm.title.trim()) return toast.error("Título obrigatório");
@@ -251,6 +274,24 @@ export default function TasksPage() {
             {checkingReminders ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Bell className="h-3.5 w-3.5" />}
             Verificar D-1
           </Button>
+          {(user?.role === "admin" || user?.role === "lider_pd" || user?.role === "qa" || user?.role === "formulador") && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1.5"
+              onClick={runStabilityScan}
+              disabled={runningStability}
+              data-testid="run-stability-scan-btn"
+              title={
+                stabilityStatus?.last_run_at
+                  ? `Scheduler ativo · última execução: ${stabilityStatus.last_run_at?.replace("T", " ").slice(0, 16)}`
+                  : "Scheduler ativo · nenhuma execução registrada ainda"
+              }
+            >
+              {runningStability ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+              Rodar scan D-2
+            </Button>
+          )}
           <Button size="sm" className="gap-1.5" onClick={() => setShowCreateTask(true)} data-testid="create-task-btn">
             <Plus className="h-3.5 w-3.5" /> Criar Tarefa
           </Button>
