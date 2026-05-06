@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 
 # Configuration
-BASE_URL = "https://deploy-repo-9.preview.emergentagent.com/api"
+BASE_URL = "https://stability-tracker-6.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 
