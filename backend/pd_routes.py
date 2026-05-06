@@ -15,7 +15,7 @@ import io
 import logging
 import asyncio
 from validation_utils import clean_text, normalize_cnpj, normalize_email, normalize_phone, is_valid_cnpj, is_valid_email, is_valid_phone
-from workflow_engine import create_workflow_task, audit_log
+from workflow_engine import create_workflow_task, audit_log, get_blocking_tasks
 from rbac import (
     require_roles,
     has_role,
@@ -163,6 +163,7 @@ class FormulaItemCreate(BaseModel):
     ingredient_name: str
     percentage: float
     price_per_kg: float = 0.0
+    fornecedor: Optional[str] = ""
     phase: Optional[str] = None
     function: Optional[str] = None
     catalog_id: Optional[str] = None  # Link to cost catalog
@@ -171,6 +172,7 @@ class FormulaItemUpdate(BaseModel):
     ingredient_name: Optional[str] = None
     percentage: Optional[float] = None
     price_per_kg: Optional[float] = None
+    fornecedor: Optional[str] = None
     phase: Optional[str] = None
     function: Optional[str] = None
     catalog_id: Optional[str] = None
@@ -1199,7 +1201,39 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
     allowed = ALLOWED_TRANSITIONS.get(current, [])
     if new_status not in allowed:
         raise HTTPException(status_code=400, detail=f"Transição não permitida: {current} → {new_status}. Permitidas: {allowed}")
-    
+
+    # RN-PD-02: Block IN_TESTS if formula without ingredients
+    if new_status == "IN_TESTS":
+        dev_check = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
+        if not dev_check:
+            raise HTTPException(status_code=400, detail="Inicie o desenvolvimento antes de avançar para Em Testes.")
+        formula_check = await db.pd_formulas.find_one(
+            {"development_id": dev_check["id"]}, {"_id": 0}, sort=[("version", -1)]
+        )
+        if not formula_check:
+            raise HTTPException(status_code=400, detail="Registre a fórmula antes de avançar para Em Testes (RN-PD-02).")
+        items_check = await db.pd_formula_items.find({"formula_id": formula_check["id"]}, {"_id": 0}).to_list(200)
+        if not items_check:
+            raise HTTPException(status_code=400, detail="Adicione ingredientes à fórmula antes de avançar para Em Testes (RN-PD-02).")
+        total_pct = sum(it.get("percentage", 0) for it in items_check)
+        if abs(total_pct - 100.0) > 0.5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"O total da fórmula deve ser 100% (atual: {total_pct:.2f}%). Ajuste os ingredientes antes de avançar (RN-PD-02)."
+            )
+
+    # Check blocking workflow tasks
+    if new_status not in ("IN_PROGRESS", "REJECTED"):
+        blocking = await get_blocking_tasks(
+            tenant_id=user["tenant_id"],
+            entity_type="pd_card",
+            entity_id=req_id,
+            target_stage=new_status,
+        )
+        if blocking:
+            titles = " | ".join(t.get("title", "") for t in blocking[:3])
+            raise HTTPException(status_code=409, detail=f"Existem tarefas bloqueantes pendentes: {titles}")
+
     # Check approval requirements for APPROVED status
     if new_status == "APPROVED":
         dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
@@ -1601,6 +1635,7 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
         "price_per_kg": data.price_per_kg,
         "cost_brl": cost_brl,
         "cost_kg_usd": cost_kg_usd,
+        "fornecedor": data.fornecedor or "",
         "phase": data.phase or "",
         "function": data.function or "",
         "catalog_id": data.catalog_id or None,
@@ -2650,6 +2685,11 @@ async def get_pd_full_detail(req_id: str, request: Request):
         "lab_results": lab_results_doc if dev else None,
         "updates": updates_list,
         "pending": pending_list,
+        "blocking_tasks": await get_blocking_tasks(
+            tenant_id=user["tenant_id"],
+            entity_type="pd_card",
+            entity_id=req_id,
+        ),
     }
 
 # ============ DASHBOARD METRICS ============
@@ -2673,6 +2713,90 @@ async def pd_metrics(request: Request):
         "by_status": by_status,
         "by_priority": by_priority,
     }
+
+# ============ FICHA TÉCNICA - UI DATA (analise laboratorial) ============
+
+class FichaTecnicaParam(BaseModel):
+    especificacao: str = ""
+    resultado: str = ""
+    pa: str = ""  # "Conforme" | "Não Conforme" | ""
+
+class FichaTecnicaAnaliseUpsert(BaseModel):
+    produto: Optional[str] = None
+    lote: Optional[str] = None
+    data_fabricacao: Optional[str] = None
+    validade: Optional[str] = None
+    quantidade: Optional[str] = None
+    aspecto: Optional[FichaTecnicaParam] = None
+    cor: Optional[FichaTecnicaParam] = None
+    densidade: Optional[FichaTecnicaParam] = None
+    odor: Optional[FichaTecnicaParam] = None
+    ph: Optional[FichaTecnicaParam] = None
+    teor_alcool: Optional[FichaTecnicaParam] = None
+    elaboracao: Optional[str] = None
+    resp_tecnico: Optional[str] = None
+    status_aprovacao: Optional[str] = None  # "aprovado" | "reprovado"
+
+@pd_router.get("/requests/{req_id}/ficha-tecnica-ui")
+async def get_ficha_tecnica_ui(req_id: str, request: Request):
+    user = await get_current_user(request)
+    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not pd_req:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    dev = await db.pd_developments.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    formula = None
+    items = []
+    if dev:
+        formula = await db.pd_formulas.find_one({"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)])
+        if formula:
+            items = await db.pd_formula_items.find({"formula_id": formula["id"]}, {"_id": 0}).to_list(200)
+    analise = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}) or {}
+    return {
+        "request": pd_req,
+        "development": dev,
+        "formula": formula,
+        "formula_items": items,
+        "analise": analise,
+    }
+
+@pd_router.put("/requests/{req_id}/ficha-tecnica-ui")
+async def save_ficha_tecnica_ui(req_id: str, data: FichaTecnicaAnaliseUpsert, request: Request):
+    user = await get_current_user(request)
+    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not pd_req:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    dev = await db.pd_developments.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    update_data = {}
+    for field in ["produto", "lote", "data_fabricacao", "validade", "quantidade", "elaboracao", "resp_tecnico", "status_aprovacao"]:
+        val = getattr(data, field, None)
+        if val is not None:
+            update_data[field] = val
+    for param in ["aspecto", "cor", "densidade", "odor", "ph", "teor_alcool"]:
+        val = getattr(data, param, None)
+        if val is not None:
+            update_data[param] = val.model_dump()
+    if not update_data:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+    update_data.update({
+        "updated_at": now_iso(),
+        "updated_by": user["id"],
+        "updated_by_name": user.get("name", ""),
+    })
+    existing = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]})
+    if existing:
+        await db.pd_ficha_tecnica.update_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"$set": update_data})
+    else:
+        update_data.update({
+            "id": new_id(),
+            "pd_request_id": req_id,
+            "development_id": dev["id"] if dev else None,
+            "tenant_id": user["tenant_id"],
+            "created_at": now_iso(),
+        })
+        await db.pd_ficha_tecnica.insert_one(update_data)
+    result = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    return result
+
 
 # ============ FICHA TÉCNICA PDF GENERATION ============
 

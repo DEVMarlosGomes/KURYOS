@@ -18,7 +18,8 @@ import {
   ArrowLeft, FlaskConical, Clock, Plus, Trash2, CheckCircle2, XCircle,
   Loader2, ArrowRight, FileText, DollarSign, Beaker, Package, History,
   Eye, Download, Pencil, Save, X, ShieldCheck, Send, MessageSquare, Settings2,
-  Bell, Hourglass, AlertTriangle, Sparkles
+  Bell, Hourglass, AlertTriangle, Sparkles, ClipboardList, ThumbsUp, ThumbsDown,
+  PrinterIcon, CheckSquare, XSquare
 } from "lucide-react";
 
 const STATUS_CONFIG = {
@@ -111,6 +112,17 @@ export default function PDDetail() {
   useEffect(() => { fetchData(); }, [fetchData]);
 
   const handleStatusChange = async (newStatus) => {
+    // Check blocking tasks before transition
+    const blockingTasks = (data?.blocking_tasks || []).filter(t => 
+      !t.blocks_stages?.length || t.blocks_stages.includes(newStatus)
+    );
+    if (blockingTasks.length > 0) {
+      const titles = blockingTasks.slice(0, 3).map(t => `• ${t.title}`).join("\n");
+      const confirmed = window.confirm(
+        `Existem ${blockingTasks.length} tarefa(s) bloqueante(s):\n${titles}\n\nDeseja avançar mesmo assim?`
+      );
+      if (!confirmed) return;
+    }
     try {
       await api.put(`/pd/requests/${id}/status`, { new_status: newStatus });
       toast.success("Status atualizado!");
@@ -215,6 +227,7 @@ export default function PDDetail() {
             <TabsTrigger value="formula" className="gap-1.5"><Beaker className="h-3.5 w-3.5" />Manipulação</TabsTrigger>
             <TabsTrigger value="tests" className="gap-1.5"><FlaskConical className="h-3.5 w-3.5" />Testes</TabsTrigger>
             <TabsTrigger value="samples" className="gap-1.5"><Package className="h-3.5 w-3.5" />Amostras</TabsTrigger>
+            <TabsTrigger value="ficha_tecnica" className="gap-1.5"><ClipboardList className="h-3.5 w-3.5" />Ficha Técnica</TabsTrigger>
             <TabsTrigger value="updates" className="gap-1.5 relative">
               <Bell className="h-3.5 w-3.5" />Atualizações
               {pendingCount > 0 && (
@@ -253,6 +266,10 @@ export default function PDDetail() {
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
+          </TabsContent>
+
+          <TabsContent value="ficha_tecnica">
+            <FichaTecnicaTab reqId={req.id} formulas={formulas} req={req} dev={dev} canEdit={canEdit} />
           </TabsContent>
 
           <TabsContent value="updates">
@@ -698,7 +715,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
   const [formulaCotacao, setFormulaCotacao] = useState("6.00");
   const [saving, setSaving] = useState(false);
   const [expandedFormula, setExpandedFormula] = useState(formulas[0]?.id || null);
-  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", phase: "", function: "", catalog_id: "" });
+  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", fornecedor: "", phase: "", function: "", catalog_id: "" });
   const [editingConfig, setEditingConfig] = useState(null);
   const [configForm, setConfigForm] = useState({});
   const [catalog, setCatalog] = useState([]);
@@ -720,6 +737,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
       ingredient_name: cat.nome,
       percentage: newItem.percentage,
       price_per_kg: String(cat.preco_rs_kg || 0),
+      fornecedor: cat.fornecedor || "",
       phase: newItem.phase,
       function: newItem.function,
       catalog_id: cat.id,
@@ -754,12 +772,13 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
         ingredient_name: newItem.ingredient_name,
         percentage: parseFloat(newItem.percentage),
         price_per_kg: parseFloat(newItem.price_per_kg) || 0,
+        fornecedor: newItem.fornecedor || "",
         phase: newItem.phase,
         function: newItem.function,
         catalog_id: newItem.catalog_id || null,
       });
       toast.success("Ingrediente adicionado!");
-      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", phase: "", function: "", catalog_id: "" });
+      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", fornecedor: "", phase: "", function: "", catalog_id: "" });
       setShowSuggestions(false);
       onRefresh();
     } catch (err) { toast.error("Erro ao adicionar"); }
@@ -941,7 +960,9 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                     <thead>
                       <tr className="bg-[#0A0A0B] text-white text-xs">
                         <th className="text-left p-2 font-medium">Formulação</th>
+                        <th className="text-left p-2 font-medium w-32">Fornecedor</th>
                         <th className="text-right p-2 font-medium w-24">%Fórmula</th>
+                        <th className="text-right p-2 font-medium w-24">Qtd/Lote</th>
                         <th className="text-right p-2 font-medium w-28">Preço R$ (Kg)</th>
                         <th className="text-right p-2 font-medium w-24">Custo R$</th>
                         <th className="text-right p-2 font-medium w-28">Custo Kg/U$</th>
@@ -952,10 +973,14 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                     <tbody>
                       {items.map(item => {
                         const costPct = totalCostBrl > 0 ? (item.cost_brl / totalCostBrl * 100) : 0;
+                        const qtyLote = volume > 0 ? (volume * (item.percentage || 0) / 100) : 0;
+                        const qtyLabel = qtyLote > 0 ? `${qtyLote.toFixed(3)} ${volumeUnit}` : "—";
                         return (
                           <tr key={item.id} className="border-t hover:bg-muted/30">
                             <td className="p-2 font-medium">{item.ingredient_name}</td>
+                            <td className="p-2 text-xs text-muted-foreground">{item.fornecedor || "—"}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.percentage || 0).toFixed(3)}</td>
+                            <td className="p-2 text-right font-mono text-xs text-blue-600">{qtyLabel}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.price_per_kg || 0).toFixed(2)}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.cost_brl || 0).toFixed(2)}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.cost_kg_usd || 0).toFixed(2)}</td>
@@ -971,13 +996,15 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         );
                       })}
                       {items.length === 0 && (
-                        <tr><td colSpan={7} className="p-4 text-center text-xs text-muted-foreground">Nenhum ingrediente. Adicione abaixo.</td></tr>
+                        <tr><td colSpan={9} className="p-4 text-center text-xs text-muted-foreground">Nenhum ingrediente. Adicione abaixo.</td></tr>
                       )}
                     </tbody>
                     <tfoot>
                       <tr className="border-t-2 bg-muted/30 font-bold">
                         <td className="p-2 text-xs">Custo Unit.</td>
+                        <td className="p-2"></td>
                         <td className={`p-2 text-right font-mono text-xs ${isOk ? "text-green-600" : "text-amber-600"}`}>{totalPct.toFixed(2)}</td>
+                        <td className="p-2 text-right font-mono text-xs text-blue-600">{volume > 0 ? `${volume} ${volumeUnit}` : "—"}</td>
                         <td className="p-2 text-right font-mono text-xs">{totalPriceSum.toFixed(2)}</td>
                         <td className="p-2 text-right font-mono text-xs bg-muted">
                           <span className="text-green-700 font-bold">R$ {custoUnit.toFixed(2)}</span>
@@ -988,9 +1015,9 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                       </tr>
                       {indicePerdas > 0 && (
                         <tr className="bg-muted/20">
-                          <td colSpan={3} className="p-2 text-xs text-muted-foreground">Com índice de perdas ({indicePerdas}%)</td>
+                          <td colSpan={4} className="p-2 text-xs text-muted-foreground">Com índice de perdas ({indicePerdas}%)</td>
                           <td className="p-2 text-right font-mono text-xs font-bold text-orange-600">R$ {custoComPerdas.toFixed(2)}</td>
-                          <td colSpan={3}></td>
+                          <td colSpan={4}></td>
                         </tr>
                       )}
                     </tfoot>
@@ -1009,7 +1036,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                       </Label>
                       <Input value={newItem.ingredient_name}
                         onChange={e => {
-                          setNewItem(p => ({ ...p, ingredient_name: e.target.value, catalog_id: "" }));
+                          setNewItem(p => ({ ...p, ingredient_name: e.target.value, catalog_id: "", fornecedor: "" }));
                           setShowSuggestions(true);
                         }}
                         onFocus={() => setShowSuggestions(true)}
@@ -1041,6 +1068,12 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         </div>
                       )}
                     </div>
+                    <div className="w-28">
+                      <Label className="text-[11px] text-muted-foreground">Fornecedor</Label>
+                      <Input value={newItem.fornecedor}
+                        onChange={e => setNewItem(p => ({ ...p, fornecedor: e.target.value }))}
+                        placeholder="Fornecedor" className="h-8 text-sm" />
+                    </div>
                     <div className="w-20">
                       <Label className="text-[11px] text-muted-foreground">%Fórmula</Label>
                       <Input type="number" step="0.001" value={newItem.percentage}
@@ -1067,6 +1100,302 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
       {formulas.length === 0 && !showCreate && (
         <EmptyState icon={Beaker} title="Nenhuma fórmula criada" subtitle="Crie a primeira versão da manipulação" />
       )}
+    </div>
+  );
+}
+
+/* ============ FICHA TÉCNICA TAB ============ */
+const FT_PARAMS = [
+  { key: "aspecto", label: "Aspecto" },
+  { key: "cor", label: "Cor" },
+  { key: "densidade", label: "Densidade" },
+  { key: "odor", label: "Odor" },
+  { key: "ph", label: "pH" },
+  { key: "teor_alcool", label: "Teor de Álcool" },
+];
+
+function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
+  const [analise, setAnalise] = useState({});
+  const [form, setForm] = useState({
+    produto: "", lote: "", data_fabricacao: "", validade: "", quantidade: "",
+    elaboracao: "", resp_tecnico: "", status_aprovacao: "",
+    aspecto: { especificacao: "", resultado: "", pa: "" },
+    cor: { especificacao: "", resultado: "", pa: "" },
+    densidade: { especificacao: "", resultado: "", pa: "" },
+    odor: { especificacao: "", resultado: "", pa: "" },
+    ph: { especificacao: "", resultado: "", pa: "" },
+    teor_alcool: { especificacao: "", resultado: "", pa: "" },
+  });
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    api.get(`/pd/requests/${reqId}/ficha-tecnica-ui`).then(({ data }) => {
+      const a = data.analise || {};
+      setAnalise(a);
+      setForm(prev => ({
+        produto: a.produto || req.project_name || "",
+        lote: a.lote || "",
+        data_fabricacao: a.data_fabricacao || "",
+        validade: a.validade || "",
+        quantidade: a.quantidade || "",
+        elaboracao: a.elaboracao || "",
+        resp_tecnico: a.resp_tecnico || "",
+        status_aprovacao: a.status_aprovacao || "",
+        aspecto: a.aspecto || { especificacao: "", resultado: "", pa: "" },
+        cor: a.cor || { especificacao: "", resultado: "", pa: "" },
+        densidade: a.densidade || { especificacao: "", resultado: "", pa: "" },
+        odor: a.odor || { especificacao: "", resultado: "", pa: "" },
+        ph: a.ph || { especificacao: "", resultado: "", pa: "" },
+        teor_alcool: a.teor_alcool || { especificacao: "", resultado: "", pa: "" },
+      }));
+    }).catch(() => {}).finally(() => setLoading(false));
+  }, [reqId, req.project_name]);
+
+  const setParam = (key, field, val) => {
+    setForm(prev => ({ ...prev, [key]: { ...prev[key], [field]: val } }));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.put(`/pd/requests/${reqId}/ficha-tecnica-ui`, form);
+      toast.success("Ficha Técnica salva!");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao salvar");
+    } finally { setSaving(false); }
+  };
+
+  const latest = formulas?.[0];
+  const items = latest?.items || [];
+
+  if (loading) return <div className="flex items-center justify-center py-16"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
+
+  return (
+    <div className="space-y-6 max-w-4xl" data-testid="ficha-tecnica-tab">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-base font-semibold flex items-center gap-2">
+            <ClipboardList className="h-4 w-4 text-primary" />
+            Ficha Técnica de Manipulação
+          </h3>
+          <p className="text-xs text-muted-foreground mt-0.5">Laudo analítico do produto fabricado</p>
+        </div>
+        {canEdit && (
+          <Button size="sm" onClick={handleSave} disabled={saving} className="gap-1.5" data-testid="ft-save-btn">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+            Salvar Ficha
+          </Button>
+        )}
+      </div>
+
+      {/* Identificação */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Identificação do Produto</CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-2 md:grid-cols-3 gap-3">
+          {[
+            { key: "produto", label: "Produto" },
+            { key: "lote", label: "Lote" },
+            { key: "data_fabricacao", label: "Data de Fabricação" },
+            { key: "validade", label: "Validade" },
+            { key: "quantidade", label: "Quantidade" },
+          ].map(({ key, label }) => (
+            <div key={key}>
+              <Label className="text-xs text-muted-foreground">{label}</Label>
+              <Input
+                value={form[key] || ""}
+                onChange={e => setForm(p => ({ ...p, [key]: e.target.value }))}
+                placeholder={label}
+                className="h-8 text-sm mt-1"
+                disabled={!canEdit}
+                data-testid={`ft-field-${key}`}
+              />
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      {/* Tabela de Análise do Produto Fabricado */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Análise do Produto Fabricado</CardTitle>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="border rounded-b-md overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-[#0A0A0B] text-white text-xs">
+                  <th className="text-left p-3 font-medium w-32">TESTE</th>
+                  <th className="text-left p-3 font-medium">ESPECIFICAÇÃO</th>
+                  <th className="text-left p-3 font-medium">RESULTADO</th>
+                  <th className="text-center p-3 font-medium w-36">PA</th>
+                </tr>
+              </thead>
+              <tbody>
+                {FT_PARAMS.map(({ key, label }) => (
+                  <tr key={key} className="border-t hover:bg-muted/20">
+                    <td className="p-3 font-medium text-sm">{label}</td>
+                    <td className="p-2">
+                      <Input
+                        value={form[key]?.especificacao || ""}
+                        onChange={e => setParam(key, "especificacao", e.target.value)}
+                        placeholder="Especificação..."
+                        className="h-7 text-xs border-0 bg-transparent focus:bg-background focus:border"
+                        disabled={!canEdit}
+                        data-testid={`ft-${key}-especificacao`}
+                      />
+                    </td>
+                    <td className="p-2">
+                      <Input
+                        value={form[key]?.resultado || ""}
+                        onChange={e => setParam(key, "resultado", e.target.value)}
+                        placeholder="Resultado medido..."
+                        className="h-7 text-xs border-0 bg-transparent focus:bg-background focus:border"
+                        disabled={!canEdit}
+                        data-testid={`ft-${key}-resultado`}
+                      />
+                    </td>
+                    <td className="p-2 text-center">
+                      {canEdit ? (
+                        <Select value={form[key]?.pa || ""} onValueChange={v => setParam(key, "pa", v)}>
+                          <SelectTrigger className="h-7 text-xs w-full" data-testid={`ft-${key}-pa`}>
+                            <SelectValue placeholder="—" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="Conforme">Conforme</SelectItem>
+                            <SelectItem value="Não Conforme">Não Conforme</SelectItem>
+                            <SelectItem value="N/A">N/A</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <Badge className={
+                          form[key]?.pa === "Conforme" ? "bg-green-500/20 text-green-700 border-green-300" :
+                          form[key]?.pa === "Não Conforme" ? "bg-red-500/20 text-red-700 border-red-300" :
+                          "bg-muted text-muted-foreground"
+                        }>
+                          {form[key]?.pa || "—"}
+                        </Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Tabela de Formulação */}
+      {items.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground flex items-center justify-between">
+              Formulação
+              {latest && <Badge variant="outline" className="font-mono text-xs">v{latest.version}</Badge>}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="overflow-hidden border-t">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-muted text-muted-foreground">
+                    <th className="text-left p-2 font-medium">Ingrediente</th>
+                    <th className="text-left p-2 font-medium">Fornecedor</th>
+                    <th className="text-right p-2 font-medium w-20">%Fórmula</th>
+                    <th className="text-right p-2 font-medium w-24">Qtd/Lote</th>
+                    <th className="text-right p-2 font-medium w-24">Custo R$</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((item, i) => {
+                    const vol = latest?.volume || 0;
+                    const vu = latest?.volume_unit || "mL";
+                    const qty = vol > 0 ? `${(vol * (item.percentage || 0) / 100).toFixed(3)} ${vu}` : "—";
+                    return (
+                      <tr key={item.id || i} className="border-t hover:bg-muted/20">
+                        <td className="p-2 font-medium">{item.ingredient_name}</td>
+                        <td className="p-2 text-muted-foreground">{item.fornecedor || "—"}</td>
+                        <td className="p-2 text-right font-mono">{(item.percentage || 0).toFixed(3)}</td>
+                        <td className="p-2 text-right font-mono text-blue-600">{qty}</td>
+                        <td className="p-2 text-right font-mono">R$ {(item.cost_brl || 0).toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Descrição da Elaboração */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Descrição da Elaboração</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Textarea
+            value={form.elaboracao || ""}
+            onChange={e => setForm(p => ({ ...p, elaboracao: e.target.value }))}
+            placeholder="Descreva o modo de preparo passo a passo..."
+            rows={5}
+            disabled={!canEdit}
+            data-testid="ft-elaboracao"
+          />
+        </CardContent>
+      </Card>
+
+      {/* Aprovação */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Aprovação</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex gap-4">
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => canEdit && setForm(p => ({ ...p, status_aprovacao: "aprovado" }))}
+              data-testid="ft-aprovado-btn"
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg border-2 text-sm font-semibold transition-all ${
+                form.status_aprovacao === "aprovado"
+                  ? "border-green-500 bg-green-50 text-green-700"
+                  : "border-muted hover:border-green-300 text-muted-foreground"
+              } ${!canEdit ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+            >
+              <CheckSquare className="h-4 w-4" /> APROVADO
+            </button>
+            <button
+              type="button"
+              disabled={!canEdit}
+              onClick={() => canEdit && setForm(p => ({ ...p, status_aprovacao: "reprovado" }))}
+              data-testid="ft-reprovado-btn"
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg border-2 text-sm font-semibold transition-all ${
+                form.status_aprovacao === "reprovado"
+                  ? "border-red-500 bg-red-50 text-red-700"
+                  : "border-muted hover:border-red-300 text-muted-foreground"
+              } ${!canEdit ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+            >
+              <XSquare className="h-4 w-4" /> REPROVADO
+            </button>
+          </div>
+          <div className="max-w-xs">
+            <Label className="text-xs text-muted-foreground">Resp. Técnico</Label>
+            <Input
+              value={form.resp_tecnico || ""}
+              onChange={e => setForm(p => ({ ...p, resp_tecnico: e.target.value }))}
+              placeholder="Nome do responsável técnico"
+              className="mt-1 h-9"
+              disabled={!canEdit}
+              data-testid="ft-resp-tecnico"
+            />
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

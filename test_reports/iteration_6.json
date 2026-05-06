@@ -1,0 +1,64 @@
+{
+  "summary": "Comprehensive testing of P&D Module improvements: Formulação (Fornecedor field, Qtd/Lote, RN-PD-02), Ficha Técnica UI tab, and blocking tasks in status transitions. All 13 backend tests pass. UI verified with screenshots: formula table has all required columns, Ficha Técnica tab is present and functional, save/persist flow works, RN-PD-02 UI toast confirmed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "_enrich_formula_items() helper (line 608 pd_routes.py)",
+        "issue": "When building enriched items for PDF generation, the 'fornecedor' field from catalog overwrites the item's own stored fornecedor. For manually-entered ingredients without catalog_id: fornecedor is set to '' instead of the item's own value. Does NOT affect UI display (main detail endpoint returns raw items), but PDF generation loses manual fornecedor values.",
+        "priority": "LOW"
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "PDDetail.js - canEdit logic (line 95)",
+        "issue": "canEdit is restricted to admin and gestor roles only: `authUser.role === 'admin' || authUser.role === 'gestor'`. This means formulador, qa, lider_pd, engenharia_produto roles CANNOT edit formula ingredients or Ficha Técnica fields via UI. The formulador is the primary P&D user and should likely have canEdit=true. Backend APIs work correctly for formulador, but UI disables all inputs.",
+        "selector": "const canEdit = authUser && (authUser.role === 'admin' || authUser.role === 'gestor')",
+        "priority": "HIGH"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "P&D Kanban (/pd)",
+        "issues": [
+          "PDPage.js uses /crm/pd/cards endpoint (CRM pipeline view), not /pd/requests. So formulador sees 0 cards on the kanban even though 10+ P&D requests exist. This is expected architecture (two separate views) but formulador cannot navigate to P&D requests from the kanban. The route /pd/:id works directly when accessed by URL."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_pd_module_iter6.py",
+    "/app/test_reports/pytest/pd_iter6_results.xml"
+  ],
+  "action_items": [
+    "CRITICAL: Fix canEdit logic to include 'formulador' (and optionally 'lider_pd', 'qa') roles so they can edit formula ingredients and Ficha Técnica fields via UI. Currently only admin/gestor can edit via UI.",
+    "LOW: Fix _enrich_formula_items() at line 608 to use item's own fornecedor as fallback when catalog has no fornecedor: change `'fornecedor': catalog.get('fornecedor', '') if catalog else ''` to `'fornecedor': catalog.get('fornecedor', '') if catalog else item.get('fornecedor', '')`",
+    "INFO: formulador password is 'kuryos123' (from ROLE_USERS_PASSWORD env var), NOT 'admin123'. Update /app/memory/test_credentials.md to reflect correct password."
+  ],
+  "critical_code_review_comments": [
+    "canEdit restricted to admin/gestor only (PDDetail.js line 95) - formulador cannot edit anything in P&D detail via UI",
+    "Formula item enrichment overwrites stored fornecedor with catalog value (pd_routes.py line 608) - affects PDF generation",
+    "RN-PD-02 backend validation is correct and thorough (checks no-dev, no-formula, no-items, total != 100%)",
+    "Ficha Técnica UI tab: all sections (Identificação, Análise 6 params, Formulação, Elaboração, Aprovação) render correctly",
+    "All new data-testid attributes added correctly (ft-field-*, ft-*-especificacao, ft-*-resultado, ficha-tecnica-tab)"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_pd_module_iter6.py"
+  ],
+  "success_rate": {
+    "backend": "100% (13/13 passed)",
+    "frontend": "85% (all features present and functional, but formulador canEdit restriction blocks UI editing)"
+  },
+  "test_credentials": {
+    "admin": "admin@kuryos.com / admin123",
+    "formulador": "formulador@kuryos.com / kuryos123 (NOT admin123 - uses ROLE_USERS_PASSWORD env var)"
+  },
+  "seed_data_creation": "Created several TEST_ P&D requests during testing: TEST_RN_PD_02_Block, TEST_RN_PD_02_NoItems, TEST_RN_PD_02_BadPct. These are IN_PROGRESS status with auto-created developments.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Auth uses HttpOnly cookies - use requests.Session() for backend tests, not Authorization headers. Formulador password is 'kuryos123'. The main P&D detail URL is /pd/{id} which uses /pd/requests/{id}/full endpoint. canEdit in PDDetail.js is restricted to admin/gestor - formulador cannot edit UI fields. Test card IDs created: 4f67861c (TEST_RN_PD_02_BadPct with 50% formula). Ficha Técnica data-testids: ft-field-{key} for identification fields, ft-{param}-especificacao and ft-{param}-resultado for analysis table.",
+  "rca_of_issue": "canEdit bug RCA: PDDetail.js line 95 hardcodes role check to admin/gestor. Fix: add 'formulador', 'lider_pd', 'qa' to the allowed roles array for canEdit. Alternatively, use a permission array or backend-driven canEdit flag."
+}
