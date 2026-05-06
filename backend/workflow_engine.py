@@ -1154,6 +1154,15 @@ async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
             )
             created += 1
 
+        # Auto-escalate blocking tasks overdue > 3 days
+        if due_dt < now and task.get("blocking") and not task.get("escalated"):
+            delta_days = (now - due_dt).days
+            if delta_days >= 3:
+                await db.workflow_tasks.update_one(
+                    {"id": task["id"], "tenant_id": tenant_id},
+                    {"$set": {"escalated": True, "escalated_at": _now_iso(), "updated_at": _now_iso()}},
+                )
+
     return created
 
 

@@ -530,7 +530,7 @@ async def run_stability_scheduler():
                 await check_stability_alerts_for_tenant(tenant["id"])
         except Exception as exc:  # pragma: no cover
             logger.error(f"Stability scheduler error: {exc}")
-        await asyncio.sleep(21600)
+        await asyncio.sleep(3600)  # run every 1 hour for better D-2 responsiveness
 
 # ============ HELPER: Calculate formula item costs ============
 
@@ -2465,7 +2465,6 @@ async def get_live_document_version(version_id: str, request: Request):
 
 @pd_router.get("/document-versions/{version_id}/pdf")
 async def export_live_document_pdf(version_id: str, request: Request):
-    """Exporta PDF da versao do documento vivo (FT/EPA). Aplica watermark 'EM REVISAO' quando ainda nao aprovado."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
