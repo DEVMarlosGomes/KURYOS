@@ -65,6 +65,20 @@
 - Estoque Lab for controlled movement of laboratory raw materials and finished samples
 - Relatorios with KPIs for queue, lead time, approval rate and homologation coverage
 
+### Phase 5 - Lista + Kanban + Filtros Dinâmicos (Jan/2026)
+- Reusable components: `ViewSwitcher`, `FilterBar` (+ helper `applyFilters`), `ListView`
+- Toggle Kanban ↔ Lista in 5 modules: Pipeline Comercial, CRM Clientes, CRM Projetos, CRM Amostras, Pipeline P&D
+- Per-page localStorage persistence of the selected view (`<prefix>:view`)
+- Dynamic filters with search + multi/single selects + active-filter chips + "Limpar filtros"
+- Per-page filter fields: search keys, fase/status, temperatura, categoria, responsável, cliente, tipo de serviço, origem (Cliente vs Pesquisa Interna)
+- Encoding cleanup: full rewrite of CRM2Page.js (was double-encoded UTF-8 — `DiscussÃ£o`, `NegociaÃ§Ã£o`, etc.)
+- Copy/glossary normalization: "Notificações" (sidebar), "Pipeline Padrão" (default name + DB migration), "Preço/Concorrência/Indicação/Inbound — Conteúdo/Prospecção Ativa" in CRM1 dropdowns
+- Tested by testing_agent_v3: 100% success rate on scope (test_reports/iteration_5.json)
+
+### Pre-deploy hardening (Jan/2026)
+- `load_dotenv(override=False)` to avoid overriding K8s envs in production
+- CORS middleware now respects `CORS_ORIGINS` env var (uses `allow_origin_regex=".*"` when `*`)
+
 ## 9. Integracoes Automaticas entre Modulos
 Esta secao mapeia todos os gatilhos automaticos entre CRM, P&D e Documentos Internos. Cada gatilho elimina uma dependencia humana, convertendo-a em tarefa rastreavel ou em acao automatica do sistema.
 
