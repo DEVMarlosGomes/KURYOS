@@ -1,0 +1,80 @@
+{
+  "summary": "Comprehensive testing of 3 new features: (1) Formula Locking/Versioning (RN-BF-01), (2) Estabilidades Tab, (3) Tasks Sistema. Found and fixed 4 bugs: useMemo not imported (Estabilidades crash), Dialog not imported (Registrar Leitura crash), MongoDB _id not removed in stability readings (500 error), and tenant_id missing from pd_formulas (new-version 404). All 15 backend tests pass after fixes.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/pd/formulas/{formula_id}/new-version",
+        "issue": "FIXED: Returned 404 'Fórmula não encontrada' because pd_formulas collection did not store tenant_id when formula was created. Query `find_one({'id': ..., 'tenant_id': ...})` always failed. Fixed by adding tenant_id to create_formula() document.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "POST /api/pd/stability/studies/{study_id}/readings",
+        "issue": "FIXED: Returned 500 'ObjectId not serializable' because reading dict had MongoDB _id field. Fixed by calling reading.pop('_id', None) after insert_one.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "EstabilidadesTab (PDDetail.js)",
+        "issue": "FIXED: useMemo not imported - React crash when visiting Estabilidades tab. Added useMemo to React imports.",
+        "selector": "line 1 of PDDetail.js",
+        "priority": "CRITICAL"
+      },
+      {
+        "component": "EstabilidadesTab (PDDetail.js)",
+        "issue": "FIXED: Dialog/DialogContent/etc not imported - 'Dialog is not defined' crash when clicking 'Registrar Leitura'. Added Dialog imports from @/components/ui/dialog.",
+        "selector": "line 14 of PDDetail.js",
+        "priority": "CRITICAL"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "Manipulação tab",
+        "issues": ["'Nova Versão' button in header area doesn't open dialog (first button found). Only the 'Nova Versão' button in the locked formula row (v1) opens the dialog correctly. Minor UX issue - header button may be for a different action."]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_pd_iter7.py",
+    "/app/test_reports/pytest/pd_iter7_results.xml"
+  ],
+  "action_items": [
+    "No remaining bugs - all 4 found issues were fixed by testing agent",
+    "INFO: Header 'Nova Versão' button in Manipulação tab (top-right) doesn't open dialog - only the per-formula 'Nova Versão' button does. Investigate if this is expected behavior.",
+    "CARRY FORWARD from iter6: Fix canEdit to include formulador/lider_pd/qa roles so they can edit via UI (not just admin/gestor)"
+  ],
+  "critical_code_review_comments": [
+    "FIXED: pd_formulas missing tenant_id field on create - caused new-version endpoint to always 404",
+    "FIXED: stability readings missing _id removal - caused 500 on POST readings",
+    "FIXED: useMemo missing import in PDDetail.js - crashed Estabilidades tab",
+    "FIXED: Dialog components missing import in PDDetail.js - crashed Registrar Leitura flow",
+    "Nova Versão button in formula header area (top-right of Manipulação tab) does not open dialog - only the per-formula button works"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_pd_iter7.py",
+    "/app/backend/pd_routes.py",
+    "/app/frontend/src/pages/PDDetail.js"
+  ],
+  "success_rate": {
+    "backend": "100% (15/15 passed after fixes)",
+    "frontend": "95% (all features present and functional after fixing 2 missing imports; minor Nova Versão header button non-functional)"
+  },
+  "test_credentials": {
+    "admin": "admin@kuryos.com / admin123",
+    "formulador": "formulador@kuryos.com / kuryos123"
+  },
+  "seed_data_creation": "Created TEST_ITER7_LockClass, TEST_ITER7_LockV5, TEST_ITER7_Base cards. These are IN_TESTS and IN_PROGRESS status with formulas and locked versions.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Auth uses HttpOnly cookies. pd_formulas now has tenant_id field (fixed). Estabilidades tab works with 9 conditions, 12 parameters, 7 checkpoints. Formula locking flow fully working: add item blocked (RN-BF-01), new version with justification >= 10 chars creates v2. Tasks page has Verificar D-1 (toast on click) and Criar Tarefa (full dialog). Test cards: 78f64746-53e7-4187-bc1e-1cb7e2c9269e (IN_TESTS, LockClass). canEdit still restricted to admin/gestor in PDDetail.js line 95 (from iter6 issue, still open).",
+  "rca_of_issues": [
+    "Bug 1 RCA: create_formula() in pd_routes.py did not include tenant_id in the formula document. create_formula_new_version() queries with tenant_id filter. Fix: add tenant_id to formula dict in create_formula().",
+    "Bug 2 RCA: After insert_one(), MongoDB adds _id (ObjectId) to the dict. The endpoint returned the reading dict without removing _id, causing JSON serialization failure. Fix: reading.pop('_id', None) after insert.",
+    "Bug 3 RCA: PDDetail.js uses useMemo (line 1232 in EstabilidadesTab) but only imported useState/useEffect/useCallback. Fix: add useMemo to React import.",
+    "Bug 4 RCA: PDDetail.js uses Dialog/DialogContent/etc in both FormulaTab (line 1144) and EstabilidadesTab (line 1378) but Dialog was never imported from @/components/ui/dialog. Fix: add Dialog import."
+  ]
+}

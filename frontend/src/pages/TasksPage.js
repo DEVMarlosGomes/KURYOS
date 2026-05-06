@@ -6,6 +6,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,10 @@ import {
   Layers,
   ShieldCheck,
   ShieldX,
+  Plus,
+  Bell,
+  TrendingUp,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { formatApiError } from "@/lib/formatError";
@@ -91,6 +96,34 @@ export default function TasksPage() {
   const [actionMode, setActionMode] = useState("complete");
   const [comment, setComment] = useState("");
   const [allOpenTasks, setAllOpenTasks] = useState([]);
+  const [showCreateTask, setShowCreateTask] = useState(false);
+  const [createForm, setCreateForm] = useState({ title: "", description: "", entity_type: "pd_card", entity_id: "", due_in_days: 3, blocking: false, priority: "normal" });
+  const [creatingTask, setCreatingTask] = useState(false);
+  const [checkingReminders, setCheckingReminders] = useState(false);
+
+  const checkReminders = async () => {
+    setCheckingReminders(true);
+    try {
+      const { data } = await api.post("/workflow/tasks/check-reminders");
+      toast.success(`Lembretes: ${data.d1_notified} D-1 enviados · ${data.escalated} escalados`);
+      loadTasks();
+    } catch { toast.error("Erro ao verificar lembretes"); }
+    finally { setCheckingReminders(false); }
+  };
+
+  const submitCreateTask = async () => {
+    if (!createForm.title.trim()) return toast.error("Título obrigatório");
+    if (!createForm.entity_id.trim()) return toast.error("ID da entidade obrigatório");
+    setCreatingTask(true);
+    try {
+      await api.post("/workflow/tasks", { ...createForm, due_in_days: Number(createForm.due_in_days) || 3 });
+      toast.success("Tarefa criada!");
+      setShowCreateTask(false);
+      setCreateForm({ title: "", description: "", entity_type: "pd_card", entity_id: "", due_in_days: 3, blocking: false, priority: "normal" });
+      loadTasks();
+    } catch (err) { toast.error(formatApiError(err)); }
+    finally { setCreatingTask(false); }
+  };
 
   useEffect(() => {
     loadTasks();
@@ -206,7 +239,7 @@ export default function TasksPage() {
             Painel inicial de <span className="font-medium text-foreground">{user?.role}</span> · {VIEW_LABELS[viewMode]}
           </p>
         </div>
-        <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
           {blockingCount > 0 && (
             <Badge variant="destructive" className="text-xs px-3 py-1.5" data-testid="blocking-count">
               <AlertTriangle className="h-3 w-3 mr-1" />
@@ -214,6 +247,13 @@ export default function TasksPage() {
             </Badge>
           )}
           {isLeader && <Badge variant="outline">Visao global habilitada</Badge>}
+          <Button size="sm" variant="outline" className="gap-1.5" onClick={checkReminders} disabled={checkingReminders} data-testid="check-reminders-btn">
+            {checkingReminders ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Bell className="h-3.5 w-3.5" />}
+            Verificar D-1
+          </Button>
+          <Button size="sm" className="gap-1.5" onClick={() => setShowCreateTask(true)} data-testid="create-task-btn">
+            <Plus className="h-3.5 w-3.5" /> Criar Tarefa
+          </Button>
           <Badge variant="outline" data-testid="total-count">
             {tasks.length} itens
           </Badge>
@@ -313,6 +353,16 @@ export default function TasksPage() {
                       {task.description && <p className="text-xs text-muted-foreground mt-1">{task.description}</p>}
                     </div>
                     <div className="flex items-center gap-1.5 flex-wrap">
+                      {task.escalated && task.status !== "concluida" && (
+                        <Badge className="text-[10px] bg-red-600 text-white gap-1">
+                          <TrendingUp className="h-2.5 w-2.5" /> Escalado
+                        </Badge>
+                      )}
+                      {task.d1_notified && task.status !== "concluida" && !task.escalated && (
+                        <Badge className="text-[10px] bg-amber-500/20 text-amber-700 border-amber-300 gap-1">
+                          <Bell className="h-2.5 w-2.5" /> D-1
+                        </Badge>
+                      )}
                       {task.blocking && task.status !== "concluida" && (
                         <Badge variant="destructive" className="text-[10px] uppercase tracking-wider">
                           Bloqueante
@@ -436,6 +486,71 @@ export default function TasksPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Criar Tarefa Manual Dialog */}
+      {showCreateTask && (
+        <Dialog open onOpenChange={() => setShowCreateTask(false)}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2"><Plus className="h-4 w-4" />Criar Tarefa Manual</DialogTitle>
+              <DialogDescription>Cria uma tarefa vinculada a uma entidade do sistema.</DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-2">
+              <div>
+                <Label className="text-xs text-muted-foreground">Título *</Label>
+                <Input value={createForm.title} onChange={e => setCreateForm(p => ({ ...p, title: e.target.value }))} placeholder="Título da tarefa" className="mt-1" data-testid="create-task-title" />
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Descrição</Label>
+                <Textarea value={createForm.description} onChange={e => setCreateForm(p => ({ ...p, description: e.target.value }))} placeholder="Detalhes da tarefa..." rows={2} className="mt-1" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs text-muted-foreground">Tipo de Entidade</Label>
+                  <Select value={createForm.entity_type} onValueChange={v => setCreateForm(p => ({ ...p, entity_type: v }))}>
+                    <SelectTrigger className="mt-1 h-8 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {Object.entries(ENTITY_LABEL).map(([k, l]) => <SelectItem key={k} value={k}>{l}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="text-xs text-muted-foreground">ID da Entidade *</Label>
+                  <Input value={createForm.entity_id} onChange={e => setCreateForm(p => ({ ...p, entity_id: e.target.value }))} placeholder="ID do card/projeto..." className="mt-1 h-8 text-xs" data-testid="create-task-entity-id" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs text-muted-foreground">Prazo (dias)</Label>
+                  <Input type="number" value={createForm.due_in_days} onChange={e => setCreateForm(p => ({ ...p, due_in_days: e.target.value }))} className="mt-1 h-8 text-xs" />
+                </div>
+                <div>
+                  <Label className="text-xs text-muted-foreground">Prioridade</Label>
+                  <Select value={createForm.priority} onValueChange={v => setCreateForm(p => ({ ...p, priority: v }))}>
+                    <SelectTrigger className="mt-1 h-8 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="baixa">Baixa</SelectItem>
+                      <SelectItem value="normal">Normal</SelectItem>
+                      <SelectItem value="alta">Alta</SelectItem>
+                      <SelectItem value="critica">Crítica</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="blocking-check" checked={createForm.blocking} onChange={e => setCreateForm(p => ({ ...p, blocking: e.target.checked }))} className="rounded" />
+                <Label htmlFor="blocking-check" className="text-sm cursor-pointer">Tarefa bloqueante (impede transição de status)</Label>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowCreateTask(false)}>Cancelar</Button>
+              <Button onClick={submitCreateTask} disabled={creatingTask} data-testid="confirm-create-task-btn">
+                {creatingTask ? "Criando..." : "Criar Tarefa"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }

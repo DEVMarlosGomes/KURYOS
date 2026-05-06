@@ -1221,6 +1221,11 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
                 status_code=400,
                 detail=f"O total da fórmula deve ser 100% (atual: {total_pct:.2f}%). Ajuste os ingredientes antes de avançar (RN-PD-02)."
             )
+        # RN-BF-01: Auto-lock formula on transition to IN_TESTS
+        await db.pd_formulas.update_one(
+            {"id": formula_check["id"]},
+            {"$set": {"locked": True, "locked_at": now_iso(), "locked_by": user["id"], "locked_by_name": user.get("name", "")}}
+        )
 
     # Check blocking workflow tasks
     if new_status not in ("IN_PROGRESS", "REJECTED"):
@@ -1332,6 +1337,7 @@ async def create_formula(dev_id: str, data: FormulaCreate, request: Request):
     formula_id = new_id()
     formula = {
         "id": formula_id,
+        "tenant_id": user["tenant_id"],
         "development_id": dev_id,
         "version": next_version,
         "name": data.name,
@@ -1622,6 +1628,8 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
     formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+    if formula.get("locked"):
+        raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
     
     cotacao = formula.get("cotacao_usd", 6.00) or 6.00
     cost_brl, cost_kg_usd = calc_item_costs(data.percentage, data.price_per_kg, cotacao)
@@ -1677,6 +1685,8 @@ async def update_formula_item(item_id: str, data: FormulaItemUpdate, request: Re
     ppk = update_fields.get("price_per_kg", existing.get("price_per_kg", 0))
     
     formula = await db.pd_formulas.find_one({"id": existing["formula_id"]}, {"_id": 0})
+    if formula and formula.get("locked"):
+        raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
     cotacao = formula.get("cotacao_usd", 6.00) if formula else 6.00
     
     cost_brl, cost_kg_usd = calc_item_costs(pct, ppk, cotacao)
@@ -2072,6 +2082,7 @@ async def create_stability_reading(study_id: str, data: StabilityReadingCreate, 
         "created_by_name": user.get("name", ""),
     }
     await db.pd_stability_readings.insert_one(reading)
+    reading.pop("_id", None)
 
     updated_conditions: List[Dict[str, Any]] = []
     for condition in study.get("conditions", []):
@@ -2713,6 +2724,85 @@ async def pd_metrics(request: Request):
         "by_status": by_status,
         "by_priority": by_priority,
     }
+
+# ============ FORMULA VERSIONAMENTO (RN-BF-01 / RN-PD-06) ============
+
+class FormulaNewVersionInput(BaseModel):
+    justification: str = Field(min_length=10, description="Justificativa obrigatória para nova versão")
+
+@pd_router.post("/formulas/{formula_id}/new-version")
+async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInput, request: Request):
+    """RN-BF-01 / RN-PD-06: Creates a new unlocked version of a locked formula with mandatory justification."""
+    user = await get_current_user(request)
+    old = await db.pd_formulas.find_one({"id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not old:
+        raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+    if not old.get("locked"):
+        raise HTTPException(status_code=400, detail="Apenas fórmulas registradas (bloqueadas) podem ser versionadas. Edite diretamente a fórmula atual.")
+
+    old_items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+    new_formula_id = new_id()
+    new_version_num = old.get("version", 1) + 1
+
+    new_formula = {
+        "id": new_formula_id,
+        "tenant_id": user["tenant_id"],
+        "development_id": old["development_id"],
+        "name": old.get("name", f"Fórmula v{new_version_num}"),
+        "notes": old.get("notes", ""),
+        "volume": old.get("volume", 0),
+        "volume_unit": old.get("volume_unit", "mL"),
+        "indice_perdas": old.get("indice_perdas", 0),
+        "cotacao_usd": old.get("cotacao_usd", 6.00),
+        "version": new_version_num,
+        "locked": False,
+        "parent_formula_id": formula_id,
+        "version_justification": data.justification.strip(),
+        "created_at": now_iso(),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+    }
+    await db.pd_formulas.insert_one(new_formula)
+    new_formula.pop("_id", None)
+
+    new_items = []
+    for item in old_items:
+        new_item = {**{k: v for k, v in item.items() if k != "_id"}, "id": new_id(), "formula_id": new_formula_id}
+        new_items.append(new_item)
+    if new_items:
+        await db.pd_formula_items.insert_many(new_items)
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="formula_new_version_created",
+        entity_type="pd_formula",
+        entity_id=new_formula_id,
+        after={"version": new_version_num, "parent_formula_id": formula_id, "justification": data.justification.strip()},
+    )
+    new_formula["items"] = [
+        {k: v for k, v in it.items() if k != "_id"} for it in new_items
+    ]
+    return new_formula
+
+
+# ============ STABILITY STUDY INIT FOR PD CARD ============
+
+@pd_router.get("/requests/{req_id}/stability-study")
+async def get_or_init_stability_study_for_card(req_id: str, request: Request):
+    """Gets (or auto-creates) the stability study for a P&D card, including all readings."""
+    user = await get_current_user(request)
+    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not pd_req:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    study = await _ensure_stability_study_for_pd_card(pd_req, user)
+    readings = await db.pd_stability_readings.find(
+        {"study_id": study["id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort([("day_offset", 1), ("created_at", 1)]).to_list(5000)
+    constants = {"conditions": STABILITY_CONDITIONS, "parameters": STABILITY_PARAMETERS, "checkpoints": STABILITY_CHECKPOINTS}
+    return {"study": study, "readings": readings, "constants": constants}
+
 
 # ============ FICHA TÉCNICA - UI DATA (analise laboratorial) ============
 

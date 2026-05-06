@@ -323,6 +323,63 @@ async def get_entity_audit(entity_type: str, entity_id: str, request: Request):
 
 
 # ======================================================================
+#   TASK REMINDERS + ESCALATION (D-1 notifications + auto-escalation)
+# ======================================================================
+
+@workflow_router.post("/tasks/check-reminders")
+async def check_task_reminders(request: Request):
+    """Checks for D-1 reminders and auto-escalation for overdue blocking tasks."""
+    from datetime import datetime, timezone, timedelta
+    user = await _get_current_user(request)
+    now = datetime.now(timezone.utc)
+    tomorrow_start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_end = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # D-1: tasks due tomorrow not yet reminded
+    d1_tasks = await db.workflow_tasks.find({
+        "tenant_id": user["tenant_id"],
+        "status": {"$in": ["pendente", "em_andamento"]},
+        "due_date": {"$gte": tomorrow_start.isoformat(), "$lt": tomorrow_end.isoformat()},
+        "d1_notified": {"$ne": True},
+    }, {"_id": 0}).to_list(500)
+
+    notified_count = 0
+    for task in d1_tasks:
+        if task.get("responsible_id"):
+            await create_user_notification(
+                tenant_id=user["tenant_id"],
+                user_id=task["responsible_id"],
+                title=f"Lembrete D-1: {task['title']}",
+                message=f"Vence amanhã ({task.get('due_date','')[:10]}). Entidade: {task.get('entity_type','')}/{task.get('entity_id','')[:8]}",
+                notif_type="d1_reminder",
+                entity_type=task.get("entity_type", ""),
+                entity_id=task.get("entity_id", ""),
+            )
+        await db.workflow_tasks.update_one({"id": task["id"]}, {"$set": {"d1_notified": True}})
+        notified_count += 1
+
+    # Escalation: blocking tasks overdue > 3 days, not yet escalated
+    cutoff_3d = (now - timedelta(days=3)).isoformat()
+    overdue_tasks = await db.workflow_tasks.find({
+        "tenant_id": user["tenant_id"],
+        "status": {"$in": ["pendente", "em_andamento"]},
+        "due_date": {"$lt": cutoff_3d},
+        "escalated": {"$ne": True},
+        "blocking": True,
+    }, {"_id": 0}).to_list(500)
+
+    escalated_count = 0
+    for task in overdue_tasks:
+        await db.workflow_tasks.update_one(
+            {"id": task["id"]},
+            {"$set": {"escalated": True, "escalated_at": now.isoformat()}}
+        )
+        escalated_count += 1
+
+    return {"d1_notified": notified_count, "escalated": escalated_count, "checked_at": now.isoformat()}
+
+
+# ======================================================================
 #   ADMIN: RESET OPERATIONAL DATA
 # ======================================================================
 

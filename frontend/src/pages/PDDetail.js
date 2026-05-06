@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import api from "@/lib/api";
@@ -12,6 +12,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { BACKEND_URL } from "@/lib/backend";
 import {
@@ -19,7 +20,8 @@ import {
   Loader2, ArrowRight, FileText, DollarSign, Beaker, Package, History,
   Eye, Download, Pencil, Save, X, ShieldCheck, Send, MessageSquare, Settings2,
   Bell, Hourglass, AlertTriangle, Sparkles, ClipboardList, ThumbsUp, ThumbsDown,
-  PrinterIcon, CheckSquare, XSquare
+  PrinterIcon, CheckSquare, XSquare, Lock, Unlock, RefreshCw, TestTube, TrendingUp,
+  Thermometer, Wind, Snowflake, Sun
 } from "lucide-react";
 
 const STATUS_CONFIG = {
@@ -227,6 +229,7 @@ export default function PDDetail() {
             <TabsTrigger value="formula" className="gap-1.5"><Beaker className="h-3.5 w-3.5" />Manipulação</TabsTrigger>
             <TabsTrigger value="tests" className="gap-1.5"><FlaskConical className="h-3.5 w-3.5" />Testes</TabsTrigger>
             <TabsTrigger value="samples" className="gap-1.5"><Package className="h-3.5 w-3.5" />Amostras</TabsTrigger>
+            <TabsTrigger value="estabilidades" className="gap-1.5"><TestTube className="h-3.5 w-3.5" />Estabilidades</TabsTrigger>
             <TabsTrigger value="ficha_tecnica" className="gap-1.5"><ClipboardList className="h-3.5 w-3.5" />Ficha Técnica</TabsTrigger>
             <TabsTrigger value="updates" className="gap-1.5 relative">
               <Bell className="h-3.5 w-3.5" />Atualizações
@@ -266,6 +269,10 @@ export default function PDDetail() {
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
+          </TabsContent>
+
+          <TabsContent value="estabilidades">
+            <EstabilidadesTab reqId={req.id} req={req} canEdit={canEdit} />
           </TabsContent>
 
           <TabsContent value="ficha_tecnica">
@@ -720,6 +727,9 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
   const [configForm, setConfigForm] = useState({});
   const [catalog, setCatalog] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showNewVersion, setShowNewVersion] = useState(null); // formula to create new version from
+  const [newVersionJustification, setNewVersionJustification] = useState("");
+  const [creatingVersion, setCreatingVersion] = useState(false);
 
   useEffect(() => {
     api.get("/pd/catalog").then(({ data }) => {
@@ -745,8 +755,23 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
     setShowSuggestions(false);
   };
 
+  const createNewVersion = async () => {
+    if (!newVersionJustification.trim() || newVersionJustification.trim().length < 10) {
+      return toast.error("Justificativa deve ter no mínimo 10 caracteres");
+    }
+    setCreatingVersion(true);
+    try {
+      await api.post(`/pd/formulas/${showNewVersion.id}/new-version`, { justification: newVersionJustification });
+      toast.success(`Nova versão v${(showNewVersion.version || 1) + 1} criada!`);
+      setShowNewVersion(null);
+      setNewVersionJustification("");
+      onRefresh();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao criar nova versão");
+    } finally { setCreatingVersion(false); }
+  };
+
   const createFormula = async () => {
-    if (!formulaName.trim()) return toast.error("Nome é obrigatório");
     setSaving(true);
     try {
       await api.post(`/pd/developments/${devId}/formulas`, {
@@ -888,8 +913,18 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                 <CardTitle className="text-sm flex items-center gap-2">
                   <Badge variant="outline" className="text-xs font-mono">v{f.version}</Badge>
                   {f.name}
+                  {f.locked && (
+                    <Badge className="text-[10px] bg-amber-500/20 text-amber-700 border-amber-300 gap-1">
+                      <Lock className="h-2.5 w-2.5" /> Registrada
+                    </Badge>
+                  )}
+                  {f.version_justification && (
+                    <span className="text-[10px] text-muted-foreground truncate max-w-xs" title={f.version_justification}>
+                      "{f.version_justification.slice(0, 40)}..."
+                    </span>
+                  )}
                 </CardTitle>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
                   {volume > 0 && (
                     <span className="text-xs text-muted-foreground">{volume} {volumeUnit}</span>
                   )}
@@ -897,6 +932,11 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                     R$ {custoUnit.toFixed(2)}
                   </span>
                   <Badge variant="secondary" className="text-[10px]">{items.length} itens</Badge>
+                  {canEdit && f.locked && (
+                    <Button size="sm" variant="outline" className="h-7 text-xs gap-1 border-amber-300 hover:bg-amber-50" onClick={() => { setShowNewVersion(f); setNewVersionJustification(""); }} data-testid={`new-version-btn-${f.id}`}>
+                      <RefreshCw className="h-3 w-3" /> Nova Versão
+                    </Button>
+                  )}
                 </div>
               </div>
             </CardHeader>
@@ -1099,6 +1139,301 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
 
       {formulas.length === 0 && !showCreate && (
         <EmptyState icon={Beaker} title="Nenhuma fórmula criada" subtitle="Crie a primeira versão da manipulação" />
+      )}
+      {/* Nova Versão Dialog */}
+      {showNewVersion && (
+        <Dialog open onOpenChange={() => setShowNewVersion(null)}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <RefreshCw className="h-4 w-4 text-amber-500" />
+                Criar Nova Versão da Fórmula
+              </DialogTitle>
+              <DialogDescription>
+                A fórmula <strong>v{showNewVersion.version}</strong> está registrada e bloqueada (RN-BF-01).
+                Uma nova versão será criada copiando os ingredientes atuais. A versão anterior permanece imutável.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-2">
+              <div>
+                <Label className="text-sm font-medium">Justificativa <span className="text-red-500">*</span></Label>
+                <Textarea
+                  value={newVersionJustification}
+                  onChange={e => setNewVersionJustification(e.target.value)}
+                  placeholder="Descreva o motivo da alteração da fórmula (mínimo 10 caracteres)..."
+                  rows={4}
+                  className="mt-1"
+                  data-testid="new-version-justification"
+                />
+                <p className="text-xs text-muted-foreground mt-1">{newVersionJustification.length}/10 mínimo</p>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowNewVersion(null)}>Cancelar</Button>
+              <Button onClick={createNewVersion} disabled={creatingVersion || newVersionJustification.trim().length < 10} data-testid="confirm-new-version-btn">
+                {creatingVersion ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                Criar v{(showNewVersion.version || 1) + 1}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
+  );
+}
+/* ============ ESTABILIDADES TAB ============ */
+
+const CONDITION_ICONS = {
+  ambient: Sparkles,
+  climate_30_75: Wind,
+  oven_40: Thermometer,
+  oven_45: Thermometer,
+  refrigerated_5: Snowflake,
+  freezer_minus5: Snowflake,
+  light_exposure: Sun,
+  dark_storage: Eye,
+  freeze_thaw: RefreshCw,
+};
+
+const CONDITION_COLORS = {
+  ambient: "text-green-600",
+  climate_30_75: "text-yellow-600",
+  oven_40: "text-orange-500",
+  oven_45: "text-red-500",
+  refrigerated_5: "text-blue-400",
+  freezer_minus5: "text-blue-600",
+  light_exposure: "text-yellow-500",
+  dark_storage: "text-purple-500",
+  freeze_thaw: "text-cyan-500",
+};
+
+function EstabilidadesTab({ reqId, req, canEdit }) {
+  const [study, setStudy] = useState(null);
+  const [readings, setReadings] = useState([]);
+  const [constants, setConstants] = useState({ conditions: [], parameters: [], checkpoints: [] });
+  const [loading, setLoading] = useState(true);
+  const [readingDialog, setReadingDialog] = useState(null); // { conditionCode, conditionLabel }
+  const [readingForm, setReadingForm] = useState({ day_offset: 0, parameters: {}, notes: "" });
+  const [savingReading, setSavingReading] = useState(false);
+
+  const fetchStudy = async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get(`/pd/requests/${reqId}/stability-study`);
+      setStudy(data.study);
+      setReadings(data.readings || []);
+      setConstants(data.constants || { conditions: [], parameters: [], checkpoints: [] });
+    } catch (err) {
+      toast.error("Erro ao carregar estabilidades");
+    } finally { setLoading(false); }
+  };
+
+  useEffect(() => { fetchStudy(); }, [reqId]);
+
+  const readingsByCondition = useMemo(() => {
+    const map = {};
+    readings.forEach(r => {
+      if (!map[r.condition_code]) map[r.condition_code] = {};
+      map[r.condition_code][r.day_offset] = r;
+    });
+    return map;
+  }, [readings]);
+
+  const openReadingDialog = (cond) => {
+    const existing = readingsByCondition[cond.code] || {};
+    const completed = Object.keys(existing).map(Number);
+    const pending = constants.checkpoints.filter(d => !completed.includes(d));
+    const nextDay = pending[0] ?? 0;
+    setReadingForm({ day_offset: nextDay, parameters: {}, notes: "" });
+    setReadingDialog(cond);
+  };
+
+  const submitReading = async () => {
+    if (!readingDialog || !study) return;
+    if (Object.keys(readingForm.parameters).length === 0) return toast.error("Informe ao menos um parâmetro");
+    setSavingReading(true);
+    try {
+      await api.post(`/pd/stability/studies/${study.id}/readings`, {
+        condition_code: readingDialog.code,
+        day_offset: readingForm.day_offset,
+        parameters: readingForm.parameters,
+        notes: readingForm.notes,
+      });
+      toast.success(`Leitura D${readingForm.day_offset} registrada!`);
+      setReadingDialog(null);
+      fetchStudy();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao registrar leitura");
+    } finally { setSavingReading(false); }
+  };
+
+  const getOverallStatus = (cond) => {
+    const studyCond = study?.conditions?.find(c => c.code === cond.code);
+    return studyCond?.status || "pending_d0";
+  };
+
+  const isAlertD2 = (cond) => {
+    const studyCond = study?.conditions?.find(c => c.code === cond.code);
+    if (!studyCond?.next_due_at) return false;
+    const diff = new Date(studyCond.next_due_at).getTime() - Date.now();
+    return diff > 0 && diff <= 2 * 24 * 3600 * 1000;
+  };
+
+  if (loading) return <div className="flex items-center justify-center py-16"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
+
+  return (
+    <div className="space-y-5" data-testid="estabilidades-tab">
+      {/* Study Header */}
+      {study && (
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-base font-semibold flex items-center gap-2">
+              <TestTube className="h-4 w-4 text-primary" />
+              Estudo de Estabilidade
+            </h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Iniciado: {study.started_at ? new Date(study.started_at).toLocaleDateString("pt-BR") : "—"}
+              &nbsp;·&nbsp;Checkpoints: D{constants.checkpoints.join(" / D")}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant={study.status === "concluido" ? "default" : "secondary"} className="text-xs">
+              {study.status === "concluido" ? "Concluído" : study.status === "ativo" ? "Ativo" : study.status}
+            </Badge>
+            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={fetchStudy}>
+              <RefreshCw className="h-3 w-3" /> Atualizar
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Conditions Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+        {constants.conditions.map(cond => {
+          const CIcon = CONDITION_ICONS[cond.code] || Thermometer;
+          const colorCls = CONDITION_COLORS[cond.code] || "text-muted-foreground";
+          const existing = readingsByCondition[cond.code] || {};
+          const completedDays = Object.keys(existing).map(Number).sort((a, b) => a - b);
+          const total = constants.checkpoints.length;
+          const done = completedDays.length;
+          const progress = total > 0 ? (done / total) * 100 : 0;
+          const status = getOverallStatus(cond);
+          const alertD2 = isAlertD2(cond);
+          const studyCond = study?.conditions?.find(c => c.code === cond.code);
+          const nextDue = studyCond?.next_due_day_offset;
+          return (
+            <Card key={cond.code} className={`relative ${alertD2 ? "border-amber-400 shadow-amber-100" : ""}`} data-testid={`condition-${cond.code}`}>
+              {alertD2 && (
+                <div className="absolute top-2 right-2">
+                  <Badge className="text-[10px] bg-amber-500 text-white animate-pulse">D-2</Badge>
+                </div>
+              )}
+              <CardContent className="p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <CIcon className={`h-4 w-4 ${colorCls}`} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{cond.label}</p>
+                    <p className="text-[11px] text-muted-foreground">{cond.temperature} · {cond.humidity}</p>
+                  </div>
+                </div>
+                {/* Progress bar */}
+                <div>
+                  <div className="flex justify-between text-[10px] text-muted-foreground mb-1">
+                    <span>{done}/{total} checkpoints</span>
+                    {nextDue != null && <span className="text-blue-600">Próx: D{nextDue}</span>}
+                  </div>
+                  <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full bg-primary transition-all rounded-full" style={{ width: `${progress}%` }} />
+                  </div>
+                </div>
+                {/* Checkpoints chips */}
+                <div className="flex flex-wrap gap-1">
+                  {constants.checkpoints.map(day => {
+                    const reading = existing[day];
+                    return (
+                      <span
+                        key={day}
+                        className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-medium border ${
+                          reading ? "bg-green-50 border-green-300 text-green-700" : "bg-muted border-border text-muted-foreground"
+                        }`}
+                        title={reading ? `Registrado em ${new Date(reading.reading_at).toLocaleDateString("pt-BR")}` : `D${day} pendente`}
+                      >
+                        D{day}{reading ? " ✓" : ""}
+                      </span>
+                    );
+                  })}
+                </div>
+                {canEdit && study?.status !== "concluido" && (
+                  <Button size="sm" variant="outline" className="w-full h-7 text-xs gap-1" onClick={() => openReadingDialog(cond)} data-testid={`registrar-leitura-${cond.code}`}>
+                    <Plus className="h-3 w-3" /> Registrar Leitura
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* Registrar Leitura Dialog */}
+      {readingDialog && (
+        <Dialog open onOpenChange={() => setReadingDialog(null)}>
+          <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <TestTube className="h-4 w-4 text-primary" />
+                Registrar Leitura — {readingDialog.label}
+              </DialogTitle>
+              <DialogDescription>
+                {readingDialog.temperature} · {readingDialog.humidity}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4 py-2">
+              <div>
+                <Label className="text-sm font-medium">Checkpoint (Dia)</Label>
+                <Select value={String(readingForm.day_offset)} onValueChange={v => setReadingForm(p => ({ ...p, day_offset: Number(v) }))}>
+                  <SelectTrigger className="mt-1" data-testid="checkpoint-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {constants.checkpoints.map(d => {
+                      const alreadyDone = !!(readingsByCondition[readingDialog.code] || {})[d];
+                      return (
+                        <SelectItem key={d} value={String(d)} disabled={alreadyDone}>
+                          D{d} {alreadyDone ? "(já registrado)" : ""}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {constants.parameters.map(param => (
+                  <div key={param.code}>
+                    <Label className="text-xs text-muted-foreground">{param.label}</Label>
+                    <Input
+                      value={readingForm.parameters[param.code] || ""}
+                      onChange={e => setReadingForm(p => ({ ...p, parameters: { ...p.parameters, [param.code]: e.target.value } }))}
+                      placeholder={param.label}
+                      className="h-8 text-sm mt-1"
+                      data-testid={`param-${param.code}`}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Observações</Label>
+                <Textarea value={readingForm.notes} onChange={e => setReadingForm(p => ({ ...p, notes: e.target.value }))} placeholder="Observações adicionais..." rows={2} className="mt-1" />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setReadingDialog(null)}>Cancelar</Button>
+              <Button onClick={submitReading} disabled={savingReading} data-testid="submit-reading-btn">
+                {savingReading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Save className="h-4 w-4 mr-2" />}
+                Salvar Leitura D{readingForm.day_offset}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );
