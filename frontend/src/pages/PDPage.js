@@ -10,10 +10,13 @@ import { Badge } from "@/components/ui/badge";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { GripVertical, Search, Building2, Calendar, Plus, Sparkles, ExternalLink } from "lucide-react";
+import { GripVertical, Building2, Calendar, Plus, Sparkles, ExternalLink } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import PDSubNav from "@/components/PDSubNav";
+import ViewSwitcher from "@/components/ViewSwitcher";
+import FilterBar, { applyFilters } from "@/components/FilterBar";
+import ListView from "@/components/ListView";
 
 const STAGES = [
     { id: "solicitado", label: "Aberto", color: "bg-gray-400" },
@@ -27,6 +30,8 @@ export default function PDPage() {
     const [cards, setCards] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
+    const [view, setView] = useState(() => localStorage.getItem("pd:view") || "kanban");
+    const [filters, setFilters] = useState({});
     const [selectedCard, setSelectedCard] = useState(null);
     const [showResearch, setShowResearch] = useState(false);
     const [researchForm, setResearchForm] = useState({
@@ -40,6 +45,10 @@ export default function PDPage() {
     });
     const [creatingResearch, setCreatingResearch] = useState(false);
     const navigate = useNavigate();
+
+    useEffect(() => {
+        localStorage.setItem("pd:view", view);
+    }, [view]);
 
     const loadCards = useCallback(async () => {
         try {
@@ -135,22 +144,83 @@ export default function PDPage() {
     return (
         <div className="p-6 page-enter">
             <PDSubNav active="pd" />
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
                 <div>
                     <h1 className="text-3xl font-heading font-semibold tracking-tight">Pipeline P&D</h1>
                     <p className="text-sm text-muted-foreground mt-1">{cards.length} cards em desenvolvimento</p>
                 </div>
                 <div className="flex items-center gap-2">
-                    <div className="relative">
-                        <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                        <Input placeholder="Buscar card..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 w-64" />
-                    </div>
+                    <ViewSwitcher value={view} onChange={setView} testIdPrefix="pd" />
                     <Button onClick={() => setShowResearch(true)} className="gap-1.5">
                         <Sparkles className="h-4 w-4" /> Nova Pesquisa Interna
                     </Button>
                 </div>
             </div>
 
+            {(() => {
+                const filterFields = [
+                    {
+                        key: "search",
+                        type: "search",
+                        placeholder: "Buscar por número, produto, cliente ou aplicação...",
+                        searchKeys: [
+                            (c) => c.numero_completo,
+                            (c) => c.produto,
+                            (c) => c.cliente,
+                            (c) => c.descricao_aplicacao,
+                            (c) => c.responsavel_pd,
+                        ],
+                    },
+                    {
+                        key: "status_pd",
+                        type: "multi",
+                        label: "Status",
+                        options: STAGES.map((s) => ({ value: s.id, label: s.label })),
+                        getter: (c) => c.status_pd,
+                    },
+                    {
+                        key: "responsavel_pd",
+                        type: "select",
+                        label: "Responsável P&D",
+                        options: Array.from(new Set(cards.map((c) => c.responsavel_pd).filter(Boolean)))
+                            .map((v) => ({ value: v, label: v })),
+                        getter: (c) => c.responsavel_pd,
+                    },
+                    {
+                        key: "cliente",
+                        type: "select",
+                        label: "Cliente",
+                        options: Array.from(new Set(cards.map((c) => c.cliente).filter(Boolean)))
+                            .map((v) => ({ value: v, label: v })),
+                        getter: (c) => c.cliente,
+                    },
+                    {
+                        key: "is_internal_research",
+                        type: "select",
+                        label: "Origem",
+                        options: [
+                            { value: "true", label: "Pesquisa Interna" },
+                            { value: "false", label: "Cliente" },
+                        ],
+                        getter: (c) => String(Boolean(c.is_internal_research)),
+                    },
+                ];
+                const filteredCards = applyFilters(cards, filters, filterFields);
+                const filteredByStage = STAGES.reduce((acc, s) => {
+                    acc[s.id] = filteredCards.filter((c) => c.status_pd === s.id);
+                    return acc;
+                }, {});
+
+                return (
+                    <>
+                        <FilterBar
+                            filters={filters}
+                            onChange={setFilters}
+                            fields={filterFields}
+                            testIdPrefix="pd-filter"
+                        />
+
+                        {view === "kanban" ? (
             <DragDropContext onDragEnd={handleDragEnd}>
                 <div className="kanban-board">
                     {STAGES.map((stage) => (
@@ -166,12 +236,12 @@ export default function PDPage() {
                                             <div className={`w-2 h-2 rounded-full ${stage.color}`} />
                                             <h3 className="font-heading font-medium text-sm truncate">{stage.label}</h3>
                                             <span className="text-xs text-muted-foreground mono-num ml-auto">
-                                                {(cardsByStage[stage.id] || []).length}
+                                                {(filteredByStage[stage.id] || []).length}
                                             </span>
                                         </div>
                                     </div>
                                     <div className="p-2 space-y-2 min-h-[200px]">
-                                        {(cardsByStage[stage.id] || []).map((card, index) => (
+                                        {(filteredByStage[stage.id] || []).map((card, index) => (
                                             <Draggable draggableId={card.id} index={index} key={card.id}>
                                                 {(provided, snapshot) => (
                                                     <div
@@ -208,7 +278,7 @@ export default function PDPage() {
                                                                 </p>
                                                                 {card.responsavel_pd && (
                                                                     <p className="text-xs text-muted-foreground mt-0.5">
-                                                                        👤 {String(card.responsavel_pd)}
+                                                                        Responsável: {String(card.responsavel_pd)}
                                                                     </p>
                                                                 )}
                                                             </div>
@@ -228,6 +298,41 @@ export default function PDPage() {
                     ))}
                 </div>
             </DragDropContext>
+                        ) : (
+                            <ListView
+                                items={filteredCards}
+                                onRowClick={openCardDetail}
+                                emptyMessage="Nenhum card P&D corresponde aos filtros."
+                                testIdPrefix="pd-list"
+                                columns={[
+                                    { key: "numero_completo", label: "Número",
+                                      render: (c) => (
+                                          <span className={`font-mono text-xs font-semibold ${c.is_internal_research ? "text-purple-600" : "text-primary"}`}>
+                                              {c.numero_completo || "?"}
+                                          </span>
+                                      ) },
+                                    { key: "produto", label: "Produto",
+                                      render: (c) => <span className="font-medium">{c.produto || "—"}</span> },
+                                    { key: "descricao_aplicacao", label: "Aplicação",
+                                      render: (c) => c.descricao_aplicacao || "—" },
+                                    { key: "cliente", label: "Cliente",
+                                      render: (c) => c.cliente || (c.is_internal_research ? "— Pesquisa Interna —" : "—") },
+                                    { key: "responsavel_pd", label: "Responsável P&D",
+                                      render: (c) => c.responsavel_pd || "Não atribuído" },
+                                    { key: "status_pd", label: "Status",
+                                      render: (c) => (
+                                          <Badge variant="outline" className="text-[10px]">
+                                              {STAGES.find((s) => s.id === c.status_pd)?.label || c.status_pd}
+                                          </Badge>
+                                      ) },
+                                    { key: "prazo_prometido", label: "Prazo",
+                                      render: (c) => c.prazo_prometido ? new Date(c.prazo_prometido).toLocaleDateString("pt-BR") : "—" },
+                                ]}
+                            />
+                        )}
+                    </>
+                );
+            })()}
 
             {/* Card Detail Sheet */}
             <Sheet open={!!selectedCard} onOpenChange={(open) => !open && setSelectedCard(null)}>

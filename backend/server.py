@@ -1599,7 +1599,7 @@ SEED_STAGES = [
 async def seed_default_pipeline(tenant_id: str):
     pipeline_id = new_id()
     await db.pipelines.insert_one({
-        "id": pipeline_id, "tenant_id": tenant_id, "name": "Pipeline Padrao", "created_at": now_iso()
+        "id": pipeline_id, "tenant_id": tenant_id, "name": "Pipeline Padrão", "created_at": now_iso()
     })
 
     for stage_data in SEED_STAGES:

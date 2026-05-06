@@ -16,9 +16,12 @@ import {
 import {
     Select, SelectContent, SelectItem, SelectTrigger, SelectValue
 } from "@/components/ui/select";
-import { GripVertical, Search, Building2, FlaskConical, AlertTriangle, PackageCheck, ChevronRight, Trash2, Plus, X, Edit2 } from "lucide-react";
+import { GripVertical, Building2, FlaskConical, AlertTriangle, PackageCheck, ChevronRight, Trash2, Plus, X, Edit2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import ViewSwitcher from "@/components/ViewSwitcher";
+import FilterBar, { applyFilters } from "@/components/FilterBar";
+import ListView from "@/components/ListView";
 
 function CRMSubNav({ active }) {
     const navigate = useNavigate();
@@ -61,6 +64,8 @@ export default function CRM3Page() {
     const [samples, setSamples] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
+    const [view, setView] = useState(() => localStorage.getItem("crm3:view") || "kanban");
+    const [filters, setFilters] = useState({});
     const [selectedSample, setSelectedSample] = useState(null);
     const [selectedVariacao, setSelectedVariacao] = useState(null);
     const [showReasonModal, setShowReasonModal] = useState(false);
@@ -70,6 +75,10 @@ export default function CRM3Page() {
     const [feedbackText, setFeedbackText] = useState("");
     const [reworkDirections, setReworkDirections] = useState("");
     const [tab, setTab] = useState("briefing");
+
+    useEffect(() => {
+        localStorage.setItem("crm3:view", view);
+    }, [view]);
 
     const loadSamples = useCallback(async () => {
         try {
@@ -351,17 +360,62 @@ export default function CRM3Page() {
     return (
         <div className="p-6 page-enter" data-testid="crm3-page">
             <CRMSubNav active="samples" />
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
                 <div>
                     <h1 className="text-3xl font-heading font-semibold tracking-tight">Pipeline de Amostras</h1>
                     <p className="text-sm text-muted-foreground mt-1">{samples.length} amostras</p>
                 </div>
-                <div className="relative">
-                    <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                    <Input placeholder="Buscar amostra..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 w-64" />
-                </div>
+                <ViewSwitcher value={view} onChange={setView} testIdPrefix="crm3" />
             </div>
 
+            {(() => {
+                const allVariacoes = STAGES.flatMap((s) => variacoesByStage[s.id] || []);
+                const filterFields = [
+                    {
+                        key: "search",
+                        type: "search",
+                        placeholder: "Buscar por código, produto, projeto ou cliente...",
+                        searchKeys: [
+                            (v) => v.codigo,
+                            (v) => v.sample_numero,
+                            (v) => v.nome_produto,
+                            (v) => v.projeto_nome,
+                            (v) => v.cliente_nome,
+                            (v) => v.descricao_aplicacao,
+                        ],
+                    },
+                    {
+                        key: "status",
+                        type: "multi",
+                        label: "Status",
+                        options: STAGES.map((s) => ({ value: s.id, label: s.label })),
+                        getter: (v) => v.status,
+                    },
+                    {
+                        key: "cliente_nome",
+                        type: "select",
+                        label: "Cliente",
+                        options: Array.from(new Set(allVariacoes.map((v) => v.cliente_nome).filter(Boolean)))
+                            .map((v) => ({ value: v, label: v })),
+                        getter: (v) => v.cliente_nome,
+                    },
+                ];
+                const filteredVariacoes = applyFilters(allVariacoes, filters, filterFields);
+                const filteredByStage = STAGES.reduce((acc, s) => {
+                    acc[s.id] = filteredVariacoes.filter((v) => v.status === s.id);
+                    return acc;
+                }, {});
+
+                return (
+                    <>
+                        <FilterBar
+                            filters={filters}
+                            onChange={setFilters}
+                            fields={filterFields}
+                            testIdPrefix="crm3-filter"
+                        />
+
+                        {view === "kanban" ? (
             <DragDropContext onDragEnd={handleDragEnd}>
                 <div className="kanban-board" data-testid="crm3-kanban">
                     {STAGES.map((stage) => (
@@ -378,12 +432,12 @@ export default function CRM3Page() {
                                             <div className={`w-2 h-2 rounded-full ${stage.color}`} />
                                             <h3 className="font-heading font-medium text-sm truncate">{stage.label}</h3>
                                             <span className="text-xs text-muted-foreground mono-num ml-auto">
-                                                {(variacoesByStage[stage.id] || []).length}
+                                                {(filteredByStage[stage.id] || []).length}
                                             </span>
                                         </div>
                                     </div>
                                     <div className="p-2 space-y-2 min-h-[200px]">
-                                        {(variacoesByStage[stage.id] || []).map((variacao, index) => {
+                                        {(filteredByStage[stage.id] || []).map((variacao, index) => {
                                             const draggableId = variacao.sample_id + (variacao.id ? `:${variacao.id}` : '');
                                             return (
                                             <Draggable draggableId={draggableId} index={index} key={draggableId}>
@@ -441,6 +495,44 @@ export default function CRM3Page() {
                     ))}
                 </div>
             </DragDropContext>
+                        ) : (
+                            <ListView
+                                items={filteredVariacoes}
+                                onRowClick={(v) => {
+                                    setSelectedSample(v.sample_completa);
+                                    setSelectedVariacao(v);
+                                    setTab("briefing");
+                                }}
+                                emptyMessage="Nenhuma amostra/variação corresponde aos filtros."
+                                testIdPrefix="crm3-list"
+                                getRowId={(v) => v.sample_id + (v.id ? `:${v.id}` : "")}
+                                columns={[
+                                    { key: "codigo", label: "Código",
+                                      render: (v) => (
+                                          <span className="font-mono text-xs font-semibold text-primary">
+                                              {v.codigo || v.sample_numero || "?"}
+                                          </span>
+                                      ) },
+                                    { key: "nome_produto", label: "Produto",
+                                      render: (v) => <span className="font-medium">{v.nome_produto || "—"}</span> },
+                                    { key: "descricao_aplicacao", label: "Aplicação",
+                                      render: (v) => v.descricao_aplicacao || "—" },
+                                    { key: "projeto_nome", label: "Projeto",
+                                      render: (v) => v.projeto_nome || "—" },
+                                    { key: "cliente_nome", label: "Cliente",
+                                      render: (v) => v.cliente_nome || "—" },
+                                    { key: "status", label: "Status",
+                                      render: (v) => (
+                                          <Badge variant="outline" className="text-[10px]">
+                                              {STAGE_LABELS[v.status] || v.status}
+                                          </Badge>
+                                      ) },
+                                ]}
+                            />
+                        )}
+                    </>
+                );
+            })()}
 
             {/* Sample Detail Sheet */}
             <Sheet open={!!selectedSample} onOpenChange={(v) => { if (!v) { setSelectedSample(null); loadSamples(); } }}>

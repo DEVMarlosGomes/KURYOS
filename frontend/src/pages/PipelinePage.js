@@ -13,6 +13,9 @@ import {
     Select, SelectContent, SelectItem, SelectTrigger, SelectValue
 } from "@/components/ui/select";
 import CardSheet from "@/components/CardSheet";
+import ViewSwitcher from "@/components/ViewSwitcher";
+import FilterBar, { applyFilters } from "@/components/FilterBar";
+import ListView from "@/components/ListView";
 import { Plus, Phone, Mail, GripVertical, Wifi, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 import { Textarea } from "@/components/ui/textarea";
@@ -36,8 +39,14 @@ export default function PipelinePage() {
         textura_esperada: "", aplicacao: "", sensorial: "", ph: "", outras_observacoes: "",
     });
     const [wsConnected, setWsConnected] = useState(false);
+    const [view, setView] = useState(() => localStorage.getItem("pipeline:view") || "kanban");
+    const [filters, setFilters] = useState({});
     const wsRef = useRef(null);
     const boardLoadedRef = useRef(false);
+
+    useEffect(() => {
+        localStorage.setItem("pipeline:view", view);
+    }, [view]);
 
     const loadBoard = useCallback(async () => {
         try {
@@ -182,6 +191,7 @@ export default function PipelinePage() {
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
+                    <ViewSwitcher value={view} onChange={setView} testIdPrefix="pipeline" />
                     <span className={`flex items-center gap-1.5 text-xs ${wsConnected ? "text-green-500" : "text-muted-foreground"}`} data-testid="ws-status">
                         {wsConnected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
                         {wsConnected ? "Tempo real" : "Offline"}
@@ -192,9 +202,40 @@ export default function PipelinePage() {
                 </div>
             </div>
 
+            {(() => {
+                const stageOptions = board.stages.map((s) => ({ value: s.id, label: s.name }));
+                const filterFields = [
+                    { key: "search", type: "search", placeholder: "Buscar por nome, telefone, e-mail...",
+                      searchKeys: [(c) => c.nome_cliente, (c) => c.telefone, (c) => c.email, (c) => c.produto] },
+                    { key: "stage", type: "multi", label: "Fase", options: stageOptions, getter: (c) => c.stage_id },
+                    { key: "status", type: "select", label: "Temperatura",
+                      options: [
+                          { value: "frio", label: "Frio" },
+                          { value: "morno", label: "Morno" },
+                          { value: "quente", label: "Quente" },
+                      ] },
+                ];
+                const allCards = board.stages.flatMap((s) => s.cards.map((c) => ({ ...c, stage_id: s.id })));
+                const filteredCards = applyFilters(allCards, filters, filterFields);
+                const filteredStages = board.stages.map((s) => ({
+                    ...s,
+                    cards: filteredCards.filter((c) => c.stage_id === s.id),
+                }));
+                const stageNameById = Object.fromEntries(board.stages.map((s) => [s.id, s.name]));
+
+                return (
+                    <>
+                        <FilterBar
+                            filters={filters}
+                            onChange={setFilters}
+                            fields={filterFields}
+                            testIdPrefix="pipeline-filter"
+                        />
+
+                        {view === "kanban" ? (
             <DragDropContext onDragEnd={handleDragEnd}>
                 <div className="kanban-board" data-testid="kanban-board">
-                    {board.stages.map((stage) => (
+                    {filteredStages.map((stage) => (
                         <Droppable droppableId={stage.id} key={stage.id}>
                             {(provided, snapshot) => (
                                 <div
@@ -265,6 +306,37 @@ export default function PipelinePage() {
                     ))}
                 </div>
             </DragDropContext>
+                        ) : (
+                            <ListView
+                                items={filteredCards}
+                                onRowClick={(c) => setSelectedCardId(c.id)}
+                                emptyMessage="Nenhum lead corresponde aos filtros."
+                                testIdPrefix="pipeline-list"
+                                columns={[
+                                    { key: "nome_cliente", label: "Cliente",
+                                      render: (c) => <span className="font-medium">{c.nome_cliente}</span> },
+                                    { key: "produto", label: "Produto",
+                                      render: (c) => c.produto || c.nome_projeto || "—" },
+                                    { key: "telefone", label: "Telefone",
+                                      render: (c) => c.telefone || "—" },
+                                    { key: "email", label: "E-mail",
+                                      render: (c) => c.email || "—" },
+                                    { key: "stage_id", label: "Fase",
+                                      render: (c) => stageNameById[c.stage_id] || "—" },
+                                    { key: "status", label: "Temperatura",
+                                      render: (c) => (
+                                          <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-[0.1em] ${TEMP_CLASSES[c.status] || "badge-frio"}`}>
+                                              {TEMP_LABELS[c.status] || "FRIO"}
+                                          </span>
+                                      ) },
+                                    { key: "created_at", label: "Criado em",
+                                      render: (c) => new Date(c.created_at).toLocaleDateString("pt-BR") },
+                                ]}
+                            />
+                        )}
+                    </>
+                );
+            })()}
 
             <CardSheet
                 cardId={selectedCardId}

@@ -57,7 +57,7 @@ export default function NotificationPanel() {
                 <button className="sidebar-item relative w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-muted-foreground hover:text-foreground"
                     data-testid="notifications-btn">
                     <Bell className="h-4 w-4 shrink-0" />
-                    Notificacoes
+                    Notificações
                     {unread > 0 && (
                         <span className="absolute top-1.5 left-6 h-4 min-w-[16px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center"
                             data-testid="unread-badge">{unread}</span>
@@ -66,7 +66,7 @@ export default function NotificationPanel() {
             </PopoverTrigger>
             <PopoverContent side="right" align="start" className="w-80 p-0" data-testid="notifications-panel">
                 <div className="p-3 border-b flex items-center justify-between">
-                    <h3 className="font-heading font-medium text-sm">Notificacoes</h3>
+                    <h3 className="font-heading font-medium text-sm">Notificações</h3>
                     {unread > 0 && (
                         <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={markAllRead} data-testid="mark-all-read">
                             <CheckCheck className="h-3 w-3 mr-1" /> Marcar todas lidas

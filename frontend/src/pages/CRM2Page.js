@@ -11,10 +11,13 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Plus, GripVertical, Search, FolderOpen, Building2, PackagePlus, Archive, ChevronRight } from "lucide-react";
+import { GripVertical, Building2, PackagePlus, Archive, ChevronRight } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import SampleBatchModal from "@/components/SampleBatchModal";
+import ViewSwitcher from "@/components/ViewSwitcher";
+import FilterBar, { applyFilters } from "@/components/FilterBar";
+import ListView from "@/components/ListView";
 
 function CRMSubNav({ active }) {
     const navigate = useNavigate();
@@ -43,11 +46,11 @@ function CRMSubNav({ active }) {
 }
 
 const STAGES = [
-    { id: "projeto_em_discussao", label: "Projeto em DiscussÃ£o", color: "bg-violet-500" },
+    { id: "projeto_em_discussao", label: "Projeto em Discussão", color: "bg-violet-500" },
     { id: "amostra_solicitada", label: "Amostra Solicitada", color: "bg-emerald-500" },
     { id: "amostra_em_desenvolvimento", label: "Amostra em Desenvolvimento", color: "bg-blue-500" },
     { id: "amostra_enviada", label: "Amostra Enviada", color: "bg-cyan-500" },
-    { id: "em_negociacao", label: "Em NegociaÃ§Ã£o", color: "bg-amber-500" },
+    { id: "em_negociacao", label: "Em Negociação", color: "bg-amber-500" },
     { id: "pedido_aprovado", label: "Pedido Aprovado", color: "bg-lime-500" },
     { id: "projeto_arquivado", label: "Projeto Arquivado", color: "bg-slate-500" },
 ];
@@ -96,7 +99,8 @@ function createEmptySample() {
 export default function CRM2Page() {
     const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
-    const [search, setSearch] = useState("");
+    const [filters, setFilters] = useState({});
+    const [view, setView] = useState(() => localStorage.getItem("crm2:view") || "kanban");
     const [constants, setConstants] = useState(null);
     const [users, setUsers] = useState([]);
     const [selectedProjectId, setSelectedProjectId] = useState(null);
@@ -108,10 +112,13 @@ export default function CRM2Page() {
     const [pendingArchiveProject, setPendingArchiveProject] = useState(null);
     const [archiveReason, setArchiveReason] = useState("");
 
+    useEffect(() => {
+        localStorage.setItem("crm2:view", view);
+    }, [view]);
+
     const loadProjects = useCallback(async () => {
         try {
-            const params = search ? { search } : {};
-            const { data } = await api.get("/crm/projects", { params });
+            const { data } = await api.get("/crm/projects");
             setProjects(Array.isArray(data) ? data.map((project) => ({
                 ...project,
                 stage: project.stage === "amostras" ? "amostra_solicitada" : project.stage,
@@ -122,7 +129,7 @@ export default function CRM2Page() {
         } finally {
             setLoading(false);
         }
-    }, [search]);
+    }, []);
 
     const loadMetadata = useCallback(async () => {
         try {
@@ -163,10 +170,56 @@ export default function CRM2Page() {
     const projectRestrictionOptions = constants?.project_restricoes_tecnicas || [];
     const sampleConstants = constants || {};
 
+    // === Filter configuration ===
+    const filterFields = useMemo(() => ([
+        {
+            key: "search",
+            type: "search",
+            placeholder: "Buscar por projeto, cliente ou conceito...",
+            searchKeys: [
+                (p) => p.nome_projeto,
+                (p) => p.cliente_nome,
+                (p) => p.ideia_conceito,
+                (p) => p.referencia_mercado,
+            ],
+        },
+        {
+            key: "stage",
+            type: "multi",
+            label: "Fase",
+            options: STAGES.map((s) => ({ value: s.id, label: s.label })),
+            getter: (p) => p.stage,
+        },
+        {
+            key: "categoria",
+            type: "select",
+            label: "Categoria",
+            options: Array.from(new Set(projects.map((p) => p.categoria).filter(Boolean)))
+                .map((v) => ({ value: v, label: formatSlugLabel(v) })),
+            getter: (p) => p.categoria,
+        },
+        {
+            key: "responsavel_comercial",
+            type: "select",
+            label: "Responsável",
+            options: (users || []).map((u) => ({ value: u.id, label: u.name })),
+            getter: (p) => p.responsavel_comercial,
+        },
+        {
+            key: "tipo_servico",
+            type: "select",
+            label: "Tipo de serviço",
+            options: projectServiceOptions.map((v) => ({ value: v, label: formatSlugLabel(v) })),
+            getter: (p) => p.tipo_servico,
+        },
+    ]), [projects, users, projectServiceOptions]);
+
+    const filteredProjects = useMemo(() => applyFilters(projects, filters, filterFields), [projects, filters, filterFields]);
+
     const projectsByStage = useMemo(() => STAGES.reduce((accumulator, stage) => {
-        accumulator[stage.id] = projects.filter((project) => (project.stage || "") === stage.id);
+        accumulator[stage.id] = filteredProjects.filter((project) => (project.stage || "") === stage.id);
         return accumulator;
-    }, {}), [projects]);
+    }, {}), [filteredProjects]);
 
     const generateVariacaoLetters = (count) => {
         const letters = [];
@@ -247,7 +300,7 @@ export default function CRM2Page() {
             && sample.prazo_entrega_cliente
         ));
         if (!validSamples.length) {
-            toast.error("Preencha os campos obrigatÃ³rios de pelo menos uma amostra.");
+            toast.error("Preencha os campos obrigatórios de pelo menos uma amostra.");
             return;
         }
 
@@ -323,95 +376,131 @@ export default function CRM2Page() {
         );
     }
 
+    const userNameById = Object.fromEntries((users || []).map((u) => [u.id, u.name]));
+
     return (
         <div className="p-6 page-enter" data-testid="crm2-page">
             <CRMSubNav active="projects" />
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
                 <div>
                     <h1 className="text-3xl font-heading font-semibold tracking-tight">Pipeline de Projetos</h1>
-                    <p className="text-sm text-muted-foreground mt-1">{projects.length} projetos</p>
+                    <p className="text-sm text-muted-foreground mt-1">
+                        {filteredProjects.length} de {projects.length} projetos
+                    </p>
                 </div>
-                <div className="relative">
-                    <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                    <Input placeholder="Buscar projeto..." value={search} onChange={(event) => setSearch(event.target.value)} className="pl-9 w-64" />
-                </div>
+                <ViewSwitcher value={view} onChange={setView} testIdPrefix="crm2" />
             </div>
 
-            <DragDropContext onDragEnd={handleDragEnd}>
-                <div className="flex gap-4 overflow-x-auto pb-2" data-testid="crm2-kanban">
-                    {STAGES.map((stage) => (
-                        <Droppable droppableId={stage.id} key={stage.id}>
-                            {(provided, snapshot) => (
-                                <div
-                                    ref={provided.innerRef}
-                                    {...provided.droppableProps}
-                                    className={`min-w-[320px] rounded-lg border border-border/60 ${snapshot.isDraggingOver ? "bg-accent/50" : "bg-muted/30"}`}
-                                >
-                                    <div className="p-3 border-b border-border">
-                                        <div className="flex items-center gap-2">
-                                            <div className={`w-2 h-2 rounded-full ${stage.color}`} />
-                                            <h3 className="font-heading font-medium text-sm">{stage.label}</h3>
-                                            <span className="text-xs text-muted-foreground mono-num ml-auto">
-                                                {(projectsByStage[stage.id] || []).length}
-                                            </span>
+            <FilterBar
+                filters={filters}
+                onChange={setFilters}
+                fields={filterFields}
+                testIdPrefix="crm2-filter"
+            />
+
+            {view === "kanban" ? (
+                <DragDropContext onDragEnd={handleDragEnd}>
+                    <div className="flex gap-4 overflow-x-auto pb-2" data-testid="crm2-kanban">
+                        {STAGES.map((stage) => (
+                            <Droppable droppableId={stage.id} key={stage.id}>
+                                {(provided, snapshot) => (
+                                    <div
+                                        ref={provided.innerRef}
+                                        {...provided.droppableProps}
+                                        className={`min-w-[320px] rounded-lg border border-border/60 ${snapshot.isDraggingOver ? "bg-accent/50" : "bg-muted/30"}`}
+                                    >
+                                        <div className="p-3 border-b border-border">
+                                            <div className="flex items-center gap-2">
+                                                <div className={`w-2 h-2 rounded-full ${stage.color}`} />
+                                                <h3 className="font-heading font-medium text-sm">{stage.label}</h3>
+                                                <span className="text-xs text-muted-foreground mono-num ml-auto">
+                                                    {(projectsByStage[stage.id] || []).length}
+                                                </span>
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div className="p-2 space-y-2 min-h-[420px]">
-                                        {(projectsByStage[stage.id] || []).map((project, index) => (
-                                            <Draggable draggableId={project.id} index={index} key={project.id}>
-                                                {(draggableProvided, snapshot) => (
-                                                    <div
-                                                        ref={draggableProvided.innerRef}
-                                                        {...draggableProvided.draggableProps}
-                                                        className={`bg-card border border-border rounded-md p-3 cursor-pointer transition-transform duration-150 ${
-                                                            snapshot.isDragging ? "kanban-card-dragging" : "hover:-translate-y-0.5 hover:shadow-sm"
-                                                        }`}
-                                                        onClick={() => setSelectedProjectId(project.id)}
-                                                    >
-                                                        <div className="flex items-start justify-between gap-2">
-                                                            <div className="min-w-0">
-                                                                <p className="font-medium text-sm truncate">{project.nome_projeto}</p>
-                                                                <p className="text-xs text-muted-foreground flex items-center gap-1 mt-1">
-                                                                    <Building2 className="h-3 w-3" />
-                                                                    {project.cliente_nome}
-                                                                </p>
-                                                                {project.ideia_conceito && (
-                                                                    <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{project.ideia_conceito}</p>
+                                        <div className="p-2 space-y-2 min-h-[420px]">
+                                            {(projectsByStage[stage.id] || []).map((project, index) => (
+                                                <Draggable draggableId={project.id} index={index} key={project.id}>
+                                                    {(draggableProvided, dragSnapshot) => (
+                                                        <div
+                                                            ref={draggableProvided.innerRef}
+                                                            {...draggableProvided.draggableProps}
+                                                            className={`bg-card border border-border rounded-md p-3 cursor-pointer transition-transform duration-150 ${
+                                                                dragSnapshot.isDragging ? "kanban-card-dragging" : "hover:-translate-y-0.5 hover:shadow-sm"
+                                                            }`}
+                                                            onClick={() => setSelectedProjectId(project.id)}
+                                                        >
+                                                            <div className="flex items-start justify-between gap-2">
+                                                                <div className="min-w-0">
+                                                                    <p className="font-medium text-sm truncate">{project.nome_projeto}</p>
+                                                                    <p className="text-xs text-muted-foreground flex items-center gap-1 mt-1">
+                                                                        <Building2 className="h-3 w-3" />
+                                                                        {project.cliente_nome}
+                                                                    </p>
+                                                                    {project.ideia_conceito && (
+                                                                        <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{project.ideia_conceito}</p>
+                                                                    )}
+                                                                </div>
+                                                                <div {...draggableProvided.dragHandleProps}>
+                                                                    <GripVertical className="h-4 w-4 text-muted-foreground/50" />
+                                                                </div>
+                                                            </div>
+                                                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                                {project.categoria && (
+                                                                    <Badge variant="outline" className="text-[10px]">
+                                                                        {formatSlugLabel(project.categoria)}
+                                                                    </Badge>
+                                                                )}
+                                                                {project.posicionamento && (
+                                                                    <Badge variant="secondary" className="text-[10px]">
+                                                                        {formatSlugLabel(project.posicionamento)}
+                                                                    </Badge>
+                                                                )}
+                                                                {project.prazo_desejado_amostra && (
+                                                                    <span className="text-[10px] text-muted-foreground ml-auto">
+                                                                        {new Date(project.prazo_desejado_amostra).toLocaleDateString("pt-BR")}
+                                                                    </span>
                                                                 )}
                                                             </div>
-                                                            <div {...draggableProvided.dragHandleProps}>
-                                                                <GripVertical className="h-4 w-4 text-muted-foreground/50" />
-                                                            </div>
                                                         </div>
-                                                        <div className="mt-2 flex flex-wrap items-center gap-2">
-                                                            {project.categoria && (
-                                                                <Badge variant="outline" className="text-[10px]">
-                                                                    {formatSlugLabel(project.categoria)}
-                                                                </Badge>
-                                                            )}
-                                                            {project.posicionamento && (
-                                                                <Badge variant="secondary" className="text-[10px]">
-                                                                    {formatSlugLabel(project.posicionamento)}
-                                                                </Badge>
-                                                            )}
-                                                            {project.prazo_desejado_amostra && (
-                                                                <span className="text-[10px] text-muted-foreground ml-auto">
-                                                                    {new Date(project.prazo_desejado_amostra).toLocaleDateString("pt-BR")}
-                                                                </span>
-                                                            )}
-                                                        </div>
-                                                    </div>
-                                                )}
-                                            </Draggable>
-                                        ))}
-                                        {provided.placeholder}
+                                                    )}
+                                                </Draggable>
+                                            ))}
+                                            {provided.placeholder}
+                                        </div>
                                     </div>
-                                </div>
-                            )}
-                        </Droppable>
-                    ))}
-                </div>
-            </DragDropContext>
+                                )}
+                            </Droppable>
+                        ))}
+                    </div>
+                </DragDropContext>
+            ) : (
+                <ListView
+                    items={filteredProjects}
+                    onRowClick={(p) => setSelectedProjectId(p.id)}
+                    emptyMessage="Nenhum projeto corresponde aos filtros."
+                    testIdPrefix="crm2-list"
+                    columns={[
+                        { key: "nome_projeto", label: "Projeto",
+                          render: (p) => <span className="font-medium">{p.nome_projeto}</span> },
+                        { key: "cliente_nome", label: "Cliente" },
+                        { key: "categoria", label: "Categoria",
+                          render: (p) => p.categoria ? formatSlugLabel(p.categoria) : "—" },
+                        { key: "tipo_servico", label: "Tipo de serviço",
+                          render: (p) => p.tipo_servico ? formatSlugLabel(p.tipo_servico) : "—" },
+                        { key: "stage", label: "Fase",
+                          render: (p) => (
+                              <Badge variant="outline" className="text-[10px]">
+                                  {stageLabelMap[p.stage] || p.stage}
+                              </Badge>
+                          ) },
+                        { key: "responsavel_comercial", label: "Responsável",
+                          render: (p) => userNameById[p.responsavel_comercial] || "—" },
+                        { key: "prazo_desejado_amostra", label: "Prazo amostra",
+                          render: (p) => p.prazo_desejado_amostra ? new Date(p.prazo_desejado_amostra).toLocaleDateString("pt-BR") : "—" },
+                    ]}
+                />
+            )}
 
             <Sheet
                 open={!!selectedProjectId}
@@ -438,7 +527,7 @@ export default function CRM2Page() {
                             <Separator />
                             <div className="flex-1 overflow-y-auto p-6 space-y-5">
                                 <section className="space-y-3">
-                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">PrÃ©-briefing</h4>
+                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Pré-briefing</h4>
                                     <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                         <div className="space-y-2 md:col-span-2">
                                             <Label>Nome do projeto</Label>
@@ -455,7 +544,7 @@ export default function CRM2Page() {
                                             />
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>ResponsÃ¡vel comercial</Label>
+                                            <Label>Responsável comercial</Label>
                                             <Select
                                                 value={selectedProject.responsavel_comercial || ""}
                                                 onValueChange={(value) => handleUpdateProject(selectedProject.id, { responsavel_comercial: value })}
@@ -477,14 +566,14 @@ export default function CRM2Page() {
                                             />
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>ReferÃªncia de mercado</Label>
+                                            <Label>Referência de mercado</Label>
                                             <Input
                                                 defaultValue={selectedProject.referencia_mercado || ""}
                                                 onBlur={(event) => { if (event.target.value !== selectedProject.referencia_mercado) handleUpdateProject(selectedProject.id, { referencia_mercado: event.target.value }); }}
                                             />
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>PÃºblico-alvo</Label>
+                                            <Label>Público-alvo</Label>
                                             <Input
                                                 defaultValue={selectedProject.publico_alvo || ""}
                                                 onBlur={(event) => { if (event.target.value !== selectedProject.publico_alvo) handleUpdateProject(selectedProject.id, { publico_alvo: event.target.value }); }}
@@ -505,7 +594,7 @@ export default function CRM2Page() {
                                             </Select>
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>Tipo de serviÃ§o</Label>
+                                            <Label>Tipo de serviço</Label>
                                             <Select
                                                 value={selectedProject.tipo_servico || ""}
                                                 onValueChange={(value) => handleUpdateProject(selectedProject.id, { tipo_servico: value })}
@@ -519,7 +608,7 @@ export default function CRM2Page() {
                                             </Select>
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>Faixa de preÃ§o de venda</Label>
+                                            <Label>Faixa de preço de venda</Label>
                                             <Input
                                                 type="number"
                                                 defaultValue={selectedProject.faixa_preco_venda || ""}
@@ -558,7 +647,7 @@ export default function CRM2Page() {
                                             />
                                         </div>
                                         <div className="space-y-2 md:col-span-2">
-                                            <Label>RestriÃ§Ãµes tÃ©cnicas</Label>
+                                            <Label>Restrições técnicas</Label>
                                             <div className="flex flex-wrap gap-2">
                                                 {projectRestrictionOptions.map((option) => {
                                                     const active = (selectedProject.restricoes_tecnicas || []).includes(option);
@@ -582,7 +671,7 @@ export default function CRM2Page() {
                                             </div>
                                         </div>
                                         <div className="space-y-2 md:col-span-2">
-                                            <Label>ObservaÃ§Ãµes livres</Label>
+                                            <Label>Observações livres</Label>
                                             <Textarea
                                                 defaultValue={selectedProject.observacoes_livres || ""}
                                                 rows={2}
@@ -596,7 +685,7 @@ export default function CRM2Page() {
 
                                 <section className="space-y-3">
                                     <div className="flex items-center justify-between">
-                                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">HistÃ³rico de amostras</h4>
+                                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Histórico de amostras</h4>
                                         <Button size="sm" onClick={handleManualSampleCreation}>
                                             <PackagePlus className="h-4 w-4 mr-1" /> Criar amostras
                                         </Button>
@@ -612,7 +701,7 @@ export default function CRM2Page() {
                                                 <div>
                                                     <p className="font-medium">{sample.nome_produto || sample.nome_amostra || "Amostra"}</p>
                                                     <p className="text-xs text-muted-foreground">
-                                                        #{sample.numero_amostra} Â· {sample.prazo_entrega_cliente ? new Date(sample.prazo_entrega_cliente).toLocaleDateString("pt-BR") : "sem prazo"}
+                                                        #{sample.numero_amostra} · {sample.prazo_entrega_cliente ? new Date(sample.prazo_entrega_cliente).toLocaleDateString("pt-BR") : "sem prazo"}
                                                     </p>
                                                 </div>
                                                 <Badge variant="outline">{stageLabelMap[sample.stage] || sample.stage}</Badge>
@@ -622,7 +711,7 @@ export default function CRM2Page() {
                                                     <div key={variacao.id} className="flex items-start justify-between gap-3 rounded-md bg-muted/40 px-3 py-2">
                                                         <div>
                                                             <p className="text-sm font-medium">{variacao.codigo}</p>
-                                                            <p className="text-xs text-muted-foreground">{variacao.descricao_aplicacao || "Sem descriÃ§Ã£o"}</p>
+                                                            <p className="text-xs text-muted-foreground">{variacao.descricao_aplicacao || "Sem descrição"}</p>
                                                             {variacao.feedback_cliente && (
                                                                 <p className="text-xs text-muted-foreground mt-1">Feedback: {variacao.feedback_cliente}</p>
                                                             )}
@@ -645,7 +734,7 @@ export default function CRM2Page() {
                                 <Separator />
 
                                 <section className="space-y-3">
-                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">HistÃ³rico de movimentaÃ§Ãµes</h4>
+                                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Histórico de movimentações</h4>
                                     {(selectedProject.historico_movimentacoes || []).slice().reverse().map((movement, index) => (
                                         <div key={index} className="flex gap-3 items-start">
                                             <div className="mt-1 w-2 h-2 rounded-full bg-primary shrink-0" />
@@ -656,7 +745,7 @@ export default function CRM2Page() {
                                                     <span className="font-medium">{stageLabelMap[movement.para] || movement.para}</span>
                                                 </p>
                                                 <p className="text-xs text-muted-foreground">
-                                                    {movement.usuario} Â· {new Date(movement.data).toLocaleString("pt-BR")}
+                                                    {movement.usuario} · {new Date(movement.data).toLocaleString("pt-BR")}
                                                 </p>
                                             </div>
                                         </div>

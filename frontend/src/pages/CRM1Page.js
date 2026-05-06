@@ -20,6 +20,9 @@ import { Plus, GripVertical, User, Trash2, Search, ChevronRight, AlertTriangle, 
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
+import ViewSwitcher from "@/components/ViewSwitcher";
+import FilterBar, { applyFilters } from "@/components/FilterBar";
+import ListView from "@/components/ListView";
 
 function CRMSubNav({ active }) {
     const navigate = useNavigate();
@@ -80,10 +83,10 @@ const ORIGEM_OPTIONS = [
 ];
 
 const LOSS_REASON_OPTIONS = [
-    { value: "preco", label: "Preco" },
+    { value: "preco", label: "Preço" },
     { value: "prazo", label: "Prazo" },
     { value: "qualidade", label: "Qualidade" },
-    { value: "concorrencia", label: "Concorrencia" },
+    { value: "concorrencia", label: "Concorrência" },
     { value: "projeto_cancelado", label: "Projeto Cancelado" },
     { value: "sem_retorno", label: "Sem Retorno" },
     { value: "outro", label: "Outro" },
@@ -99,11 +102,11 @@ const VOLUME_OPTIONS = [
 const STAGE_ORDER = ["prospeccao", "qualificado", "projeto_em_discussao", "negociacao", "cliente_fechado", "cliente_perdido"];
 
 const CANAL_GROUP_LABELS = {
-    prospeccao_ativa_digital: "Prospeccao Ativa - Digital",
-    prospeccao_ativa_presencial: "Prospeccao Ativa - Presencial",
-    indicacao: "Indicacao",
-    inbound_digital: "Inbound - Digital",
-    inbound_conteudo: "Inbound - Conteudo",
+    prospeccao_ativa_digital: "Prospecção Ativa — Digital",
+    prospeccao_ativa_presencial: "Prospecção Ativa — Presencial",
+    indicacao: "Indicação",
+    inbound_digital: "Inbound — Digital",
+    inbound_conteudo: "Inbound — Conteúdo",
     relacionamento_existente: "Relacionamento Existente",
     outros: "Outros",
 };
@@ -179,6 +182,8 @@ export default function CRM1Page() {
     const [clients, setClients] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
+    const [view, setView] = useState(() => localStorage.getItem("crm1:view") || "kanban");
+    const [filters, setFilters] = useState({});
     const [selectedClient, setSelectedClient] = useState(null);
     const [showNewClient, setShowNewClient] = useState(false);
     const [showBatchProjects, setShowBatchProjects] = useState(false);
@@ -188,6 +193,10 @@ export default function CRM1Page() {
     const [batchClientId, setBatchClientId] = useState(null);
     const [crmConstants, setCrmConstants] = useState(null);
     const [crmUsers, setCrmUsers] = useState([]);
+
+    useEffect(() => {
+        localStorage.setItem("crm1:view", view);
+    }, [view]);
 
     const [newClient, setNewClient] = useState(createEmptyClient());
 
@@ -279,6 +288,66 @@ export default function CRM1Page() {
         acc[stage.id] = clients.filter(c => c.stage === stage.id);
         return acc;
     }, {});
+
+    // === Filter configuration & filtered data ===
+    const filterFields = useMemo(() => ([
+        {
+            key: "search",
+            type: "search",
+            placeholder: "Buscar por empresa, CNPJ, contato ou e-mail...",
+            searchKeys: [
+                (c) => c.nome_empresa,
+                (c) => c.cnpj,
+                (c) => c.contato_principal?.nome,
+                (c) => c.contato_principal?.email,
+                (c) => c.contato_principal?.whatsapp,
+                (c) => c.segmento,
+            ],
+        },
+        {
+            key: "stage",
+            type: "multi",
+            label: "Fase",
+            options: STAGES.map((s) => ({ value: s.id, label: s.label })),
+            getter: (c) => c.stage,
+        },
+        {
+            key: "temperatura_lead",
+            type: "select",
+            label: "Temperatura",
+            options: [
+                { value: "quente", label: "Quente" },
+                { value: "morno", label: "Morno" },
+                { value: "frio", label: "Frio" },
+            ],
+            getter: (c) => c.temperatura_lead,
+        },
+        {
+            key: "categoria_interesse",
+            type: "multi",
+            label: "Categoria",
+            options: Array.from(new Set(clients.flatMap((c) => c.categoria_interesse || []).filter(Boolean)))
+                .map((v) => ({ value: v, label: formatSlugLabel(v) })),
+            getter: (c) => c.categoria_interesse || [],
+        },
+        {
+            key: "responsavel_comercial",
+            type: "select",
+            label: "Responsável",
+            options: (crmUsers || []).map((u) => ({ value: u.id, label: u.name })),
+            getter: (c) => c.responsavel_comercial,
+        },
+    ]), [clients, crmUsers]);
+
+    const filteredClients = useMemo(() => applyFilters(clients, filters, filterFields), [clients, filters, filterFields]);
+
+    const filteredClientsByStage = useMemo(() => STAGES.reduce((acc, stage) => {
+        acc[stage.id] = filteredClients.filter((c) => c.stage === stage.id);
+        return acc;
+    }, {}), [filteredClients]);
+
+    const userNameById = useMemo(() => Object.fromEntries((crmUsers || []).map((u) => [u.id, u.name])), [crmUsers]);
+    const stageLabelById = useMemo(() => Object.fromEntries(STAGES.map((s) => [s.id, s.label])), []);
 
     const openProjectBatchModal = useCallback((client, shouldMoveClient = false) => {
         if (!client) return;
@@ -438,29 +507,29 @@ export default function CRM1Page() {
     return (
         <div className="p-6 page-enter" data-testid="crm1-page">
             <CRMSubNav active="clients" />
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
                 <div>
                     <h1 className="text-3xl font-heading font-semibold tracking-tight">Pipeline Comercial</h1>
                     <p className="text-sm text-muted-foreground mt-1">
-                        {clients.length} clientes no pipeline
+                        {filteredClients.length} de {clients.length} clientes
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
-                    <div className="relative">
-                        <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                        <Input
-                            placeholder="Buscar empresa..."
-                            value={search}
-                            onChange={(e) => setSearch(e.target.value)}
-                            className="pl-9 w-64"
-                        />
-                    </div>
+                    <ViewSwitcher value={view} onChange={setView} testIdPrefix="crm1" />
                     <Button onClick={() => { setNewClient(createEmptyClient(user?.id || "")); setShowNewClient(true); }} data-testid="new-client-btn">
                         <Plus className="h-4 w-4 mr-2" /> Novo Cliente
                     </Button>
                 </div>
             </div>
 
+            <FilterBar
+                filters={filters}
+                onChange={setFilters}
+                fields={filterFields}
+                testIdPrefix="crm1-filter"
+            />
+
+            {view === "kanban" ? (
             <DragDropContext onDragEnd={handleDragEnd}>
                 <div className="kanban-board" data-testid="crm1-kanban">
                     {STAGES.map((stage) => (
@@ -477,12 +546,12 @@ export default function CRM1Page() {
                                             <div className={`w-2 h-2 rounded-full ${stage.color}`} />
                                             <h3 className="font-heading font-medium text-sm truncate">{stage.label}</h3>
                                             <span className="text-xs text-muted-foreground mono-num ml-auto">
-                                                {(clientsByStage[stage.id] || []).length}
+                                                {(filteredClientsByStage[stage.id] || []).length}
                                             </span>
                                         </div>
                                     </div>
                                     <div className="p-2 space-y-2 min-h-[200px]">
-                                        {(clientsByStage[stage.id] || []).map((client, index) => (
+                                        {(filteredClientsByStage[stage.id] || []).map((client, index) => (
                                             <Draggable draggableId={client.id} index={index} key={client.id}>
                                                 {(provided, snapshot) => (
                                                     <div
@@ -538,6 +607,36 @@ export default function CRM1Page() {
                     ))}
                 </div>
             </DragDropContext>
+            ) : (
+                <ListView
+                    items={filteredClients}
+                    onRowClick={(c) => setSelectedClient(c)}
+                    emptyMessage="Nenhum cliente corresponde aos filtros."
+                    testIdPrefix="crm1-list"
+                    columns={[
+                        { key: "nome_empresa", label: "Empresa",
+                          render: (c) => <span className="font-medium">{c.nome_empresa}</span> },
+                        { key: "cnpj", label: "CNPJ",
+                          render: (c) => c.cnpj || "—" },
+                        { key: "contato_principal", label: "Contato principal",
+                          render: (c) => c.contato_principal?.nome || "—" },
+                        { key: "stage", label: "Fase",
+                          render: (c) => (
+                              <Badge variant="outline" className="text-[10px]">
+                                  {stageLabelById[c.stage] || c.stage}
+                              </Badge>
+                          ) },
+                        { key: "temperatura_lead", label: "Temperatura",
+                          render: (c) => c.temperatura_lead ? formatSlugLabel(c.temperatura_lead) : "—" },
+                        { key: "categoria_interesse", label: "Categorias",
+                          render: (c) => (c.categoria_interesse || []).slice(0, 3).map(formatSlugLabel).join(", ") || "—" },
+                        { key: "responsavel_comercial", label: "Responsável",
+                          render: (c) => userNameById[c.responsavel_comercial] || "—" },
+                        { key: "created_at", label: "Criado em",
+                          render: (c) => new Date(c.created_at).toLocaleDateString("pt-BR") },
+                    ]}
+                />
+            )}
 
             {/* Client Detail Sheet */}
             <ClientDetailSheet
