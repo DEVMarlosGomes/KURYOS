@@ -605,7 +605,7 @@ async def _enrich_formula_items(tenant_id: str, formula_items: List[Dict[str, An
             "nome_tecnico": catalog.get("nome") if catalog else item.get("ingredient_name", ""),
             "nome_comercial": catalog.get("nome") if catalog else item.get("ingredient_name", ""),
             "inci": catalog.get("inci", "") if catalog else "",
-            "fornecedor": catalog.get("fornecedor", "") if catalog else "",
+            "fornecedor": catalog.get("fornecedor", "") if catalog else item.get("fornecedor", ""),
             "unidade_lote": "kg" if volume_unit == "L" else volume_unit,
             "quantidade_lote_padrao": qty,
         })

@@ -92,7 +92,7 @@ export default function PDDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user: authUser } = useAuth();
-  const canEdit = authUser && (authUser.role === "admin" || authUser.role === "gestor");
+  const canEdit = authUser && ["admin", "gestor", "formulador", "lider_pd", "engenharia_produto"].includes(authUser.role);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
