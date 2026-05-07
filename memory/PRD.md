@@ -78,3 +78,30 @@ Sistema full-stack: React frontend + FastAPI backend + MongoDB.
 - Card preview mantém top-line + hint "Clique para ver todas as informações do briefing"
 - Backend já retornava `client_info` em GET /api/pd/requests/{id}/full — sem mudanças no backend
 - **Testado**: 100% sucesso (iteração 9). Test data: PD `c04daf64-da3a-4e86-b6d9-04e917209adc`
+
+## Update — 07/05/2026 (sessão 2): Módulo Pedidos (Ordem de Produção)
+**Solicitação**: "aba de pedidos. Depois que virar um pedido, vai pra essa aba. Pós amostra pronta, aprovada e com pedido feito"
+
+### Backend (`/app/backend/orders_routes.py`)
+- Coleção MongoDB: `orders` (com índices em tenant_id, status, pd_request_id, created_at)
+- Endpoints CRUD: `GET/POST /api/orders`, `GET/PUT/DELETE /api/orders/{id}`, `GET /api/orders/{id}/pdf`
+- **Auto-criação na aprovação P&D**: hook em `pd_routes.py` chama `auto_create_order_on_pd_approval(pd_id, user)` quando status vira APPROVED — **idempotente** (1 pedido por PD)
+- **Auto-fill do CRM**: razão social, CNPJ, cidade/UF, responsável, telefone, e-mail vindos de `crm_clients` via `client_card_id` → `cards` → `cliente_id`
+- **Auto-fill do P&D**: itens iniciais com SKU/código interno + nome do projeto + volume
+- **PDF "Ordem de Produção"** gerado via reportlab com layout idêntico ao mockup Kuryos: título centralizado, logo, 6 seções numeradas (Informações Iniciais, Dados do Cliente, Frete, Pedido com tabela em azul Kuryos #1F2C5C, Condições, Insumos), notas de rodapé
+
+### Frontend
+- Nova entrada no Sidebar: **Pedidos** (icon: ShoppingCart, visível a TODOS os perfis)
+- `/orders` — `OrdersPage.js`: listagem com 5 stats (Total, Rascunho, Confirmado, Em Produção, Valor Total), busca, filtro por status, cards clicáveis com badge "Auto-gerado"
+- `/orders/:id` — `OrderDetail.js`: 6 seções editáveis, dropdown de status, botões "Gerar PDF" + "Editar/Salvar/Cancelar", tabela de itens com auto-recálculo de valor_total
+- Link de volta ao P&D quando pedido foi auto-gerado
+
+### Status workflow
+`rascunho` → `confirmado` → `em_producao` → `concluido` (+ `cancelado`)
+
+### Numeração
+Format `MM_NN` (ex: `05_01`) — sequencial mensal por tenant
+
+### Testado
+- iteração 10: 19/19 backend pytest + frontend admin/vendedor/formulador — **100% sucesso, sem bugs**
+- Validado: auto-criação, idempotência, RBAC, CRUD, PDF download, edit flow, navegação P&D↔Pedidos
