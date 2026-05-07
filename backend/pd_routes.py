@@ -1055,6 +1055,7 @@ async def search_clients(request: Request, q: str = ""):
 @pd_router.post("/requests")
 async def create_pd_request(data: PDRequestCreate, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
     req_id = new_id()
     
     pd_request = {
@@ -1104,6 +1105,7 @@ async def create_pd_request(data: PDRequestCreate, request: Request):
 @pd_router.get("/requests")
 async def list_pd_requests(request: Request, status: Optional[str] = None):
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     query = {"tenant_id": user["tenant_id"]}
     if status:
         query["status"] = status
@@ -1114,6 +1116,7 @@ async def list_pd_requests(request: Request, status: Optional[str] = None):
 @pd_router.get("/requests/{req_id}")
 async def get_pd_request(req_id: str, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
@@ -1122,6 +1125,7 @@ async def get_pd_request(req_id: str, request: Request):
 @pd_router.put("/requests/{req_id}")
 async def update_pd_request(req_id: str, data: PDRequestUpdate, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
     existing = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Solicitacao nao encontrada")
@@ -1174,6 +1178,7 @@ async def update_pd_request(req_id: str, data: PDRequestUpdate, request: Request
 @pd_router.delete("/requests/{req_id}")
 async def delete_pd_request(req_id: str, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
     result = await db.pd_requests.delete_one({"id": req_id, "tenant_id": user["tenant_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
@@ -1199,6 +1204,7 @@ async def delete_pd_request(req_id: str, request: Request):
 @pd_router.put("/requests/{req_id}/status")
 async def transition_status(req_id: str, data: StatusTransition, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_FULL)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
@@ -1308,6 +1314,7 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
 @pd_router.get("/requests/{req_id}/history")
 async def get_status_history(req_id: str, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
@@ -1322,6 +1329,7 @@ async def get_status_history(req_id: str, request: Request):
 @pd_router.get("/requests/{req_id}/development")
 async def get_development(req_id: str, request: Request):
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
@@ -2776,6 +2784,7 @@ async def run_stability_scheduler_now(request: Request):
 async def get_pd_full_detail(req_id: str, request: Request):
     """Get complete P&D request with all related data"""
     user = await get_current_user(request)
+    require_roles(user, PD_READ)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
