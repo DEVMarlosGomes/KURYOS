@@ -6,7 +6,7 @@ Test SKU blocking functionality for CRM delete endpoints
 import requests
 import json
 
-BASE_URL = "https://dynamic-perms-module.preview.emergentagent.com/api"
+BASE_URL = "https://traga-card.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 

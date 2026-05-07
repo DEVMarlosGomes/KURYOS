@@ -335,6 +335,7 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({});
+  const [showBriefingDetail, setShowBriefingDetail] = useState(false);
 
   const startEditing = () => {
     setForm({
@@ -407,16 +408,23 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <div className="lg:col-span-2 space-y-4">
-        {/* Briefing Card from CRM - PROMINENT */}
+        {/* Briefing Card from CRM - PROMINENT (Click to expand details) */}
         {clientInfo && (
-          <Card className="border-blue-200 dark:border-blue-900">
+          <Card
+            className="border-blue-200 dark:border-blue-900 cursor-pointer hover:border-blue-400 dark:hover:border-blue-700 hover:shadow-md transition-all group"
+            onClick={() => setShowBriefingDetail(true)}
+            data-testid="briefing-card-clickable"
+          >
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
                 <CardTitle className="text-base flex items-center gap-2">
                   <span className="w-2 h-2 rounded-full bg-blue-500" />
                   Briefing do Projeto (CRM)
                 </CardTitle>
-                <Badge variant="outline" className="text-[10px]">Dados do Pipeline</Badge>
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-[10px]">Dados do Pipeline</Badge>
+                  <Eye className="h-3.5 w-3.5 text-muted-foreground group-hover:text-blue-500 transition-colors" />
+                </div>
               </div>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
@@ -433,42 +441,155 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
               {clientInfo.objetivo_projeto && (
                 <div className="pt-2 border-t">
                   <span className="text-muted-foreground text-xs font-medium block mb-1">4. Objetivo do Projeto</span>
-                  <p className="whitespace-pre-wrap">{clientInfo.objetivo_projeto}</p>
+                  <p className="whitespace-pre-wrap line-clamp-2">{clientInfo.objetivo_projeto}</p>
                 </div>
               )}
-              {clientInfo.aplicacoes_desenvolver && (
-                <div>
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">5. Aplicações a Desenvolver</span>
-                  <p className="whitespace-pre-wrap">{clientInfo.aplicacoes_desenvolver}</p>
-                </div>
-              )}
-              {clientInfo.ativos_claims && (
-                <div>
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">6. Ativos para Claims</span>
-                  <p className="whitespace-pre-wrap">{clientInfo.ativos_claims}</p>
-                </div>
-              )}
-              {clientInfo.referencias && (
-                <div>
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">7. Referências</span>
-                  <p className="whitespace-pre-wrap">{clientInfo.referencias}</p>
-                </div>
-              )}
-              {clientInfo.referencias_fotos_url && (
-                <div>
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">8. Referências Fotos</span>
-                  <a href={clientInfo.referencias_fotos_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline text-sm break-all">{clientInfo.referencias_fotos_url}</a>
-                </div>
-              )}
-              {clientInfo.outras_observacoes && (
-                <div>
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">14. Outras Observações</span>
-                  <p className="whitespace-pre-wrap bg-muted/50 p-2 rounded">{clientInfo.outras_observacoes}</p>
-                </div>
-              )}
+              <div className="pt-2 border-t border-dashed flex items-center justify-center text-xs text-muted-foreground group-hover:text-blue-500 transition-colors">
+                <Eye className="h-3 w-3 mr-1.5" />
+                Clique para ver todas as informações do briefing
+              </div>
             </CardContent>
           </Card>
         )}
+
+        {/* Briefing Detail Dialog - Full info from CRM */}
+        <Dialog open={showBriefingDetail} onOpenChange={setShowBriefingDetail}>
+          <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto" data-testid="briefing-detail-dialog">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
+                Briefing do Projeto (CRM)
+                <Badge variant="outline" className="text-[10px] ml-2">Dados do Pipeline</Badge>
+              </DialogTitle>
+              <DialogDescription>
+                Todas as informações do projeto vindas do CRM / Pipeline
+              </DialogDescription>
+            </DialogHeader>
+
+            {clientInfo && (
+              <div className="space-y-5 text-sm py-2">
+                {/* Identificação */}
+                <section>
+                  <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
+                    <span className="w-1 h-4 bg-blue-500 rounded" />
+                    Identificação
+                  </h4>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-3 pl-3">
+                    <InfoRow label="1. Produto" value={clientInfo.produto} />
+                    <InfoRow label="2. Cliente" value={clientInfo.nome_cliente} />
+                    <InfoRow label="3. Nome do Projeto" value={clientInfo.nome_projeto} />
+                    <InfoRow label="9. Orçamento" value={clientInfo.orcamento_projeto} />
+                  </div>
+                </section>
+
+                {/* Especificações Técnicas */}
+                <section>
+                  <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
+                    <span className="w-1 h-4 bg-purple-500 rounded" />
+                    Especificações Técnicas
+                  </h4>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-3 pl-3">
+                    <InfoRow label="10. Textura Esperada" value={clientInfo.textura_esperada} />
+                    <InfoRow label="11. Aplicação" value={clientInfo.aplicacao} />
+                    <InfoRow label="12. Sensorial" value={clientInfo.sensorial} />
+                    <InfoRow label="13. pH" value={clientInfo.ph} />
+                  </div>
+                </section>
+
+                {/* Objetivo & Detalhes */}
+                {(clientInfo.objetivo_projeto || clientInfo.aplicacoes_desenvolver || clientInfo.ativos_claims) && (
+                  <section>
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
+                      <span className="w-1 h-4 bg-green-500 rounded" />
+                      Objetivos & Detalhes do Projeto
+                    </h4>
+                    <div className="space-y-3 pl-3">
+                      {clientInfo.objetivo_projeto && (
+                        <div>
+                          <span className="text-muted-foreground text-xs font-medium block mb-1">4. Objetivo do Projeto</span>
+                          <p className="whitespace-pre-wrap bg-muted/40 p-3 rounded-md">{clientInfo.objetivo_projeto}</p>
+                        </div>
+                      )}
+                      {clientInfo.aplicacoes_desenvolver && (
+                        <div>
+                          <span className="text-muted-foreground text-xs font-medium block mb-1">5. Aplicações a Desenvolver</span>
+                          <p className="whitespace-pre-wrap bg-muted/40 p-3 rounded-md">{clientInfo.aplicacoes_desenvolver}</p>
+                        </div>
+                      )}
+                      {clientInfo.ativos_claims && (
+                        <div>
+                          <span className="text-muted-foreground text-xs font-medium block mb-1">6. Ativos para Claims</span>
+                          <p className="whitespace-pre-wrap bg-muted/40 p-3 rounded-md">{clientInfo.ativos_claims}</p>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                )}
+
+                {/* Referências */}
+                {(clientInfo.referencias || clientInfo.referencias_fotos_url) && (
+                  <section>
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
+                      <span className="w-1 h-4 bg-amber-500 rounded" />
+                      Referências
+                    </h4>
+                    <div className="space-y-3 pl-3">
+                      {clientInfo.referencias && (
+                        <div>
+                          <span className="text-muted-foreground text-xs font-medium block mb-1">7. Referências</span>
+                          <p className="whitespace-pre-wrap bg-muted/40 p-3 rounded-md">{clientInfo.referencias}</p>
+                        </div>
+                      )}
+                      {clientInfo.referencias_fotos_url && (
+                        <div>
+                          <span className="text-muted-foreground text-xs font-medium block mb-1">8. Referências Fotos</span>
+                          <a href={clientInfo.referencias_fotos_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline text-sm break-all bg-muted/40 p-3 rounded-md block">
+                            {clientInfo.referencias_fotos_url}
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                )}
+
+                {/* Observações Adicionais */}
+                {clientInfo.outras_observacoes && (
+                  <section>
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
+                      <span className="w-1 h-4 bg-rose-500 rounded" />
+                      Outras Observações
+                    </h4>
+                    <div className="pl-3">
+                      <span className="text-muted-foreground text-xs font-medium block mb-1">14. Outras Observações</span>
+                      <p className="whitespace-pre-wrap bg-muted/40 p-3 rounded-md">{clientInfo.outras_observacoes}</p>
+                    </div>
+                  </section>
+                )}
+
+                {/* Metadata */}
+                <section className="pt-3 border-t">
+                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span>
+                      {req.created_by_name && <>Criado por <strong>{req.created_by_name}</strong></>}
+                      {req.created_at && <> em {new Date(req.created_at).toLocaleDateString("pt-BR")}</>}
+                    </span>
+                    {clientInfo.nome_cliente && (
+                      <Badge variant="secondary" className="text-[10px]">
+                        Cliente: {clientInfo.nome_cliente}
+                      </Badge>
+                    )}
+                  </div>
+                </section>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowBriefingDetail(false)} data-testid="close-briefing-detail-btn">
+                Fechar
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         {/* Request Details */}
         <Card>

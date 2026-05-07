@@ -1,0 +1,26 @@
+{
+  "summary": "Frontend test of clickable 'Briefing do Projeto (CRM)' card on PD detail page (/pd/{id}) verified end-to-end. The card renders preview info, opens a full-detail Dialog with all 5 sections (Identificação, Especificações Técnicas, Objetivos & Detalhes, Referências, Outras Observações) and all 14 CRM client_info fields. Backend GET /api/pd/requests/{id}/full returns full client_info as expected. Dialog opens via card click, closes via Fechar button and via ESC. Reopen also works.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "PDDetail.js is ~1900+ lines with multiple internal components (OverviewTab, FormulaTab, TestsTab, etc.). Recommend splitting tabs into separate files under /app/frontend/src/pages/pd/ for maintainability.",
+    "Briefing field labels use hard-coded numbering (1., 2., 3., 9., 10., ...) that skips numbers (jumps from 3 to 9). The numbering is misleading; either renumber sequentially or remove numbers."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "admin@kuryos.com / admin123",
+  "seed_data_creation": "Inserted into MongoDB (db=kuryos_crm): one card (id=d32ba21f-95d3-49b5-a69a-242d2b054e55) with all 14 briefing fields populated, and one pd_request (id=c04daf64-da3a-4e86-b6d9-04e917209adc, project_name='TEST_Sérum Vitamina C 20%') linked via client_card_id. Used by GET /api/pd/requests/{id}/full to populate client_info. Recommend cleanup if not needed.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Briefing detail dialog is fully functional. Test data lives at /pd/c04daf64-da3a-4e86-b6d9-04e917209adc. Note: section headings use CSS text-transform: uppercase, so Playwright inner_text() returns uppercase strings — use case-insensitive matching when asserting headings.",
+  "rca of the issue": "Not applicable — feature works as specified."
+}
