@@ -65,3 +65,16 @@ Sistema full-stack: React frontend + FastAPI backend + MongoDB.
 - Admin: admin@kuryos.com / admin123
 - Formulador: formulador@kuryos.com / kuryos123
 - Demais roles: {role}@kuryos.com / kuryos123
+
+## Update — 07/05/2026: Briefing Card → Modal de Detalhes (P&D)
+**Solicitação**: "traga essas informações para o P&D ao clicar no card"
+- Card "Briefing do Projeto (CRM)" no PDDetail (Overview) agora é **clicável** (cursor-pointer, hover, ícone Eye)
+- Ao clicar, abre **Dialog completo** (data-testid `briefing-detail-dialog`) com 5 seções:
+  - **Identificação**: Produto, Cliente, Nome do Projeto, Orçamento (1, 2, 3, 9)
+  - **Especificações Técnicas**: Textura, Aplicação, Sensorial, pH (10, 11, 12, 13)
+  - **Objetivos & Detalhes**: Objetivo, Aplicações a Desenvolver, Ativos para Claims (4, 5, 6)
+  - **Referências**: Texto + URL de fotos (7, 8)
+  - **Outras Observações** (14)
+- Card preview mantém top-line + hint "Clique para ver todas as informações do briefing"
+- Backend já retornava `client_info` em GET /api/pd/requests/{id}/full — sem mudanças no backend
+- **Testado**: 100% sucesso (iteração 9). Test data: PD `c04daf64-da3a-4e86-b6d9-04e917209adc`
