@@ -19,6 +19,8 @@ import CRM3Page from "@/pages/CRM3Page";
 import SKUsPage from "@/pages/SKUsPage";
 import TasksPage from "@/pages/TasksPage";
 import AuditLogPage from "@/pages/AuditLogPage";
+import OrdersPage from "@/pages/OrdersPage";
+import OrderDetail from "@/pages/OrderDetail";
 import Sidebar from "@/components/Sidebar";
 import RoleGuard, { ROLE_GROUPS } from "@/components/RoleGuard";
 import { Toaster } from "@/components/ui/sonner";
@@ -80,6 +82,8 @@ function AppLayout() {
                     <Route path="/pd/relatorios" element={<RoleGuard allowed={PD_READ}><PDReports /></RoleGuard>} />
                     <Route path="/pd/:id" element={<RoleGuard allowed={PD_READ}><PDDetail /></RoleGuard>} />
                     <Route path="/tasks" element={<TasksPage />} />
+                    <Route path="/orders" element={<OrdersPage />} />
+                    <Route path="/orders/:id" element={<OrderDetail />} />
                     <Route path="/audit" element={<RoleGuard allowed={AUDIT_ROLES}><AuditLogPage /></RoleGuard>} />
                     <Route path="/team" element={<RoleGuard allowed={ADMIN_ONLY}><TeamPage /></RoleGuard>} />
                 </Routes>

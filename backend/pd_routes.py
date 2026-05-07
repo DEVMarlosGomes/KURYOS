@@ -1307,6 +1307,14 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             {"pd_request_id": req_id},
             {"$set": {"status": "completed", "completed_at": now_iso()}}
         )
+
+    # Auto-create order when PD is APPROVED
+    if new_status == "APPROVED":
+        try:
+            from orders_routes import auto_create_order_on_pd_approval
+            await auto_create_order_on_pd_approval(req_id, user)
+        except Exception as exc:
+            logger.error(f"Failed to auto-create order for PD {req_id}: {exc}")
     
     updated = await db.pd_requests.find_one({"id": req_id}, {"_id": 0})
     return updated

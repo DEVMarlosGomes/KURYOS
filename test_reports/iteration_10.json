@@ -1,0 +1,34 @@
+{
+  "summary": "Full e2e testing of Pedidos (Orders) module — backend (19/19 pytest passed) and frontend (admin/vendedor/formulador). All CRUD, PDF generation, RBAC, search/filter, navigation, edit mode, sidebar visibility verified. Auto-creation from PD APPROVED + idempotency confirmed for PD c04daf64-da3a-4e86-b6d9-04e917209adc → order 05_01 (id de558195-9ecc-41c7-a399-46ec8e2f6229). PDF downloaded as ordem_producao_05_01.pdf with valid %PDF header.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_orders.py",
+    "/app/test_reports/pytest/orders_iter10.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "orders_routes.py (~627 lines) is borderline acceptable but PDF generation logic (~250 lines) should ideally be split into a separate orders_pdf.py module for readability and unit-testing.",
+    "_calculate_totals() preserves existing valor_total when >0 instead of always recomputing on update — this can desync if user edits qtd/valor_unitario but front-end forgets to clear valor_total. Consider always recomputing on PUT to guarantee consistency. Currently the frontend appears to send fresh items so this works, but it is fragile.",
+    "POST /api/orders does not validate that the referenced pd_request_id or client_card_id belong to the same tenant — if a user crafts a request with another tenant's IDs, _enrich_from_crm/_build_items_from_pd safely return empty due to tenant_id filter, so it's not a leak, but server should still 400 when the provided ID is invalid for clarity.",
+    "Order list endpoint returns up to 1000 orders with no pagination — fine for MVP, will need cursor/limit when volume grows.",
+    "PDF export endpoint has no role/permission check beyond authentication — confirm intentional (problem statement says 'all roles can access')."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_orders.py"
+  ],
+  "success_rate": {"backend": "100% (19/19)", "frontend": "100%"},
+  "test_credentials": "admin@kuryos.com/admin123, vendedor@kuryos.com/kuryos123, formulador@kuryos.com/kuryos123",
+  "seed_data_creation": "Test created and DELETED a temporary order with numero_pedido=TEST_99_99. The pre-existing auto-created order 05_01 (PD c04daf64) was preserved as expected by the request.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Pedidos module is fully working. Auto-creation hook in pd_routes.py (line ~1305-1325) correctly invokes auto_create_order_on_pd_approval and is idempotent (single order per pd_request_id verified). Frontend list at /orders renders 5 stat cards (TOTAL/RASCUNHO/CONFIRMADO/EM PRODUÇÃO/VALOR TOTAL) — note CSS text-transform uppercase, so case-insensitive matching is required in Playwright assertions. Detail page at /orders/{id} has 6 sections + Gerar PDF + Editar. Sidebar 'Pedidos' link visible to admin/vendedor/formulador (RBAC ungated, per spec). PDF endpoint returns valid %PDF >1KB with all 6 sections.",
+  "rca of the issue": "Not applicable — feature is correctly implemented."
+}

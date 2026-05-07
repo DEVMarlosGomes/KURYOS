@@ -40,6 +40,7 @@ from openpyxl.styles import Font as XlFont, Alignment, PatternFill
 from pd_routes import pd_router, init_pd, run_stability_scheduler, check_stability_alerts_for_tenant
 from crm_routes import crm_router, init_crm, run_alert_scheduler
 from estoque_routes import estoque_router, init_estoque
+from orders_routes import orders_router, init_orders
 from workflow_engine import init_workflow, run_workflow_notification_scheduler
 from workflow_routes import workflow_router, init_workflow_routes
 from rbac import (
@@ -1774,6 +1775,12 @@ async def startup():
     # Initialize Estoque module
     init_estoque(db, get_current_user, new_id, now_iso)
 
+    # Initialize Orders module
+    init_orders(db, get_current_user, new_id, now_iso)
+    await db.orders.create_index([("tenant_id", 1), ("status", 1)])
+    await db.orders.create_index([("tenant_id", 1), ("pd_request_id", 1)])
+    await db.orders.create_index([("tenant_id", 1), ("created_at", -1)])
+
     # Initialize Workflow Engine + Routes (ERP v3.0)
     init_workflow(db, new_id, now_iso)
     init_workflow_routes(db, get_current_user, new_id, now_iso)
@@ -1843,6 +1850,7 @@ app.include_router(router)
 app.include_router(pd_router)
 app.include_router(crm_router)
 app.include_router(estoque_router)
+app.include_router(orders_router)
 app.include_router(workflow_router)
 
 @app.websocket("/api/ws")

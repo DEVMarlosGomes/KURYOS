@@ -4,7 +4,7 @@ import { useTheme } from "@/App";
 import {
     LayoutDashboard, Kanban, Users, LogOut, Moon, Sun, FlaskConical, Building2,
     Package, ChevronDown, ChevronRight, ShieldCheck, BarChart3, Warehouse, ClipboardList,
-    CheckSquare, History, BookOpen, Database, Menu, X
+    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -73,6 +73,14 @@ const NAV_MODULES = [
         label: "Estoque",
         icon: Warehouse,
         roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "gestor"],
+    },
+    {
+        key: "orders",
+        type: "link",
+        path: "/orders",
+        label: "Pedidos",
+        icon: ShoppingCart,
+        roles: null, // all roles per user request
     },
     {
         key: "audit",
