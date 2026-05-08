@@ -105,3 +105,43 @@ Format `MM_NN` (ex: `05_01`) — sequencial mensal por tenant
 ### Testado
 - iteração 10: 19/19 backend pytest + frontend admin/vendedor/formulador — **100% sucesso, sem bugs**
 - Validado: auto-criação, idempotência, RBAC, CRUD, PDF download, edit flow, navegação P&D↔Pedidos
+
+## Update — 08/05/2026 (sessão E2E): Validação end-to-end completa do fluxo CRM → SKU
+
+**Solicitação**: "RODE ESSE PROJETO DE PONTA A PONTA CRIANDO CLIENTE, QUALIFICANDO ELE ATÉ APROVAR. FAÇA ETAPA POR ETAPA COMPLETO."
+
+### Escopo executado
+- Login via `POST /api/auth/login` (cookie HttpOnly) com `admin@kuryos.com`
+- Cliente criado em `prospeccao` (Bella Cosmética Premium Ltda) → qualificado → projeto_em_discussao
+- 2 tarefas bloqueantes geradas pelo workflow engine — concluídas via `/api/workflow/tasks/{id}/complete`
+- Projeto criado via batch (`POST /api/crm/projects/batch`) e movido até `amostra_solicitada`
+- Amostra `#101` criada com 2 variações (`POST /api/crm/samples/batch/v2`); cards P&D auto-criados
+- Variação `101/A` percorreu solicitada → em_elaboracao → enviada → aprovada (com bloqueio por feedback do cliente exercitado)
+- 🎉 **SKU `KRY-001` gerado automaticamente** ao aprovar a variação (preço R$ 95,50, status ativo)
+- Projeto auto-avançou para `em_negociacao` (auto-orquestração via `project_auto_moved`)
+- Validação UI: capturadas screenshots Login, CRM1, CRM2, CRM3, SKUs, Pipeline P&D, Tasks e detalhes — UI espelha exatamente os dados criados via API
+- 20+ entries em `/api/workflow/audit-logs` confirmam toda a trilha
+
+### Comportamentos validados em produção
+- ✅ Validação de CNPJ (algoritmo) e enums (segmento/porte/UF/canal_origem)
+- ✅ Workflow engine bloqueia transição com tarefas `blocking=true`
+- ✅ RBAC: tarefas atribuídas automaticamente por papel
+- ✅ Herança de dados cliente→projeto→amostra→variação
+- ✅ Auto-criação de pd_card por variação (sync bidirecional CRM↔P&D)
+- ✅ Geração sequencial de SKU (`KRY-001` formato)
+- ✅ Auto-orquestração de stages após aprovação de amostra
+
+### Artefatos gerados
+- `/app/E2E_REPORT.md` — relatório markdown completo com cada etapa (curl, payloads, responses, screenshots descritos)
+- IDs criados:
+  - Client: `60f9d0b1-43b5-4d54-83c4-d855bc18214f`
+  - Project: `0dff86d9-e2f2-4951-8a8e-d85dc13e82f2`
+  - Sample: `e6d83c4b-5687-4f36-ac5f-6a4e5aea07cc`
+  - Variação A: `b43bfd3a-55c5-490d-b18c-ad9ca0cfd2cb` → SKU `e541ee14-...` (KRY-001)
+  - Variação B: `72ee8419-e9fd-42ee-825c-736ce633a2b4` (em "solicitada", pronta para próximo ciclo)
+
+### Próximos passos sugeridos (backlog dessa sessão)
+- Aprovar 101/B para gerar `KRY-002` e validar incremento sequencial
+- Criar pedido para `KRY-001` (`POST /api/orders`) e validar auto-cálculo de `frequencia_media_recompra_dias`
+- Mover o cliente até `cliente_fechado` registrando `data_pedido` e `valor_primeiro_pedido`
+
