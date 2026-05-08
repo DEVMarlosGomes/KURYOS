@@ -1168,23 +1168,6 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
-    if not sample:
-        raise HTTPException(status_code=404, detail="Amostra nÃ£o encontrada")
-
-    tipo_amostra = update_fields.get("tipo_amostra", sample.get("tipo_amostra", ""))
-    referencia_formula = update_fields.get("referencia_formula", sample.get("referencia_formula", ""))
-    if tipo_amostra == "adaptacao_de_formula" and not clean_text(referencia_formula):
-        raise HTTPException(status_code=400, detail="referencia_formula Ã© obrigatÃ³ria para adaptaÃ§Ã£o de fÃ³rmula")
-
-    resultado = update_fields.get("resultado", sample.get("resultado", ""))
-    feedback_cliente = update_fields.get("feedback_cliente", sample.get("feedback_cliente", ""))
-    direcoes_retrabalho = update_fields.get("direcoes_retrabalho", sample.get("direcoes_retrabalho", ""))
-    if resultado == "retrabalho" and (not clean_text(feedback_cliente) or not clean_text(direcoes_retrabalho)):
-        raise HTTPException(status_code=400, detail="Retrabalho exige feedback_cliente e direcoes_retrabalho")
-
     # RN-CL-04: Registrar data de atualização de temperatura
     if "temperatura_lead" in update_fields:
         update_fields["ultima_atualizacao_temperatura"] = _now_iso()
