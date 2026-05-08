@@ -2866,6 +2866,41 @@ async def get_pd_full_detail(req_id: str, request: Request):
     if pd_req.get("client_card_id"):
         client_info = await db.cards.find_one({"id": pd_req["client_card_id"]}, {"_id": 0})
 
+    # CRM v3 fallback: pd_request can come from a sample variation (linked_amostra_id)
+    if not client_info and pd_req.get("linked_amostra_id"):
+        sample = await db.crm_samples.find_one(
+            {"id": pd_req["linked_amostra_id"], "tenant_id": user["tenant_id"]},
+            {"_id": 0},
+        )
+        if sample:
+            variacao = None
+            if pd_req.get("linked_variacao_id"):
+                variacao = next(
+                    (v for v in sample.get("variacoes", []) if v.get("id") == pd_req["linked_variacao_id"]),
+                    None,
+                )
+            client_info = {
+                "produto": sample.get("produto") or sample.get("nome_produto", ""),
+                "nome_cliente": sample.get("cliente_nome", ""),
+                "nome_projeto": sample.get("projeto_nome", ""),
+                "orcamento_projeto": sample.get("orcamento_projeto", ""),
+                "textura_esperada": sample.get("textura_esperada", ""),
+                "aplicacao": sample.get("aplicacao", ""),
+                "sensorial": sample.get("sensorial", ""),
+                "ph": sample.get("ph", ""),
+                "objetivo_projeto": sample.get("objetivo_projeto", ""),
+                "aplicacoes_desenvolver": sample.get("aplicacoes_desenvolver", ""),
+                "ativos_claims": sample.get("ativos_claims", ""),
+                "referencias": sample.get("referencias", ""),
+                "referencias_fotos": sample.get("referencias_fotos", []) or [],
+                "observacoes": (variacao or {}).get("observacoes_especificas", "")
+                or sample.get("observacao_tecnica", ""),
+                "_source": "crm_sample",
+                "_amostra_id": sample.get("id"),
+                "_variacao_id": (variacao or {}).get("id"),
+                "_variacao_codigo": (variacao or {}).get("codigo"),
+            }
+
     # Get updates + pending (new feature: Atualizações)
     updates_list = await db.pd_updates.find(
         {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}

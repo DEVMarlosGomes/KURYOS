@@ -123,13 +123,23 @@ export default function PDPage() {
         }
     };
 
-    const openCardDetail = (card) => {
+    const openCardDetail = async (card) => {
         // If linked to pd_request, navigate to full detail page (like Abelinha print)
         if (card.pd_request_id) {
             navigate(`/pd/${card.pd_request_id}`);
-        } else {
-            setSelectedCard(card);
+            return;
         }
+        // Lazy: fetch single card to trigger backend auto-creation of pd_request, then navigate
+        try {
+            const { data } = await api.get(`/crm/pd/cards/${card.id}`);
+            if (data?.pd_request_id) {
+                navigate(`/pd/${data.pd_request_id}`);
+                return;
+            }
+        } catch (e) {
+            // Fall back to side sheet on error
+        }
+        setSelectedCard(card);
     };
 
     if (loading) return (

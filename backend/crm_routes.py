@@ -1971,6 +1971,110 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
     return {"created": created_samples, "count": len(created_samples)}
 
 
+async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
+    """Garante que existe um pd_request linkado ao pd_card. Retorna o pd_request_id.
+    Cria sob demanda quando o card é proveniente de variação CRM (sem pd_request prévio).
+    Permite que o clique no card P&D abra a tela completa de PDDetail (/pd/{id}).
+    """
+    existing_id = card.get("pd_request_id")
+    if existing_id:
+        return existing_id
+
+    now = _now_iso()
+    req_id = _new_id()
+
+    sample_id = card.get("amostra_id")
+    variacao_id = card.get("amostra_variacao_id")
+    cliente_id = card.get("cliente_id")
+
+    # Build a description from briefing data so the operator sees everything
+    desc_parts = []
+    if card.get("objetivo_projeto"):
+        desc_parts.append(f"Objetivo: {card['objetivo_projeto']}")
+    if card.get("textura_esperada"):
+        desc_parts.append(f"Textura: {card['textura_esperada']}")
+    if card.get("aplicacao"):
+        desc_parts.append(f"Aplicação: {card['aplicacao']}")
+    if card.get("sensorial"):
+        desc_parts.append(f"Sensorial: {card['sensorial']}")
+    if card.get("ph"):
+        desc_parts.append(f"pH: {card['ph']}")
+    if card.get("ativos_claims"):
+        desc_parts.append(f"Ativos/Claims: {card['ativos_claims']}")
+    if card.get("aplicacoes_desenvolver"):
+        desc_parts.append(f"Aplicações a desenvolver: {card['aplicacoes_desenvolver']}")
+    if card.get("briefing_base"):
+        desc_parts.append(f"\nBriefing base:\n{card['briefing_base']}")
+    if card.get("briefing_especifico"):
+        desc_parts.append(f"\nBriefing específico:\n{card['briefing_especifico']}")
+    if card.get("descricao_aplicacao"):
+        desc_parts.append(f"\nDescrição da aplicação (variação): {card['descricao_aplicacao']}")
+    if card.get("observacoes_especificas"):
+        desc_parts.append(f"Observações específicas: {card['observacoes_especificas']}")
+
+    description = "\n".join(desc_parts).strip()
+
+    # Volume from sample
+    volume_str = ""
+    if card.get("quantidade_por_variacao"):
+        volume_str = f"{card['quantidade_por_variacao']}{card.get('unidade_quantidade', 'g')}"
+
+    pd_request = {
+        "id": req_id,
+        "tenant_id": user["tenant_id"],
+        "client_card_id": None,  # CRM v3 uses crm_clients (not cards). Set null.
+        "client_name": card.get("cliente", ""),
+        "project_name": card.get("projeto_nome") or card.get("produto") or variacao_id or req_id,
+        "technical_name": f"{card.get('produto', '')} - {card.get('numero_completo', '')}".strip(" -"),
+        "commercial_name": card.get("produto", ""),
+        "internal_code": card.get("numero_completo", ""),
+        "request_type": "Amostra",
+        "category": card.get("tipo_amostra", ""),
+        "description": description,
+        "references": card.get("referencias", ""),
+        "restrictions": "",
+        "volume": volume_str,
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": card.get("prazo_entrega_cliente") or None,
+        "status": "OPEN",
+        "is_internal_research": False,
+        "kickoff_completed": False,
+        # Link back to CRM source
+        "linked_amostra_id": sample_id,
+        "linked_variacao_id": variacao_id,
+        "linked_cliente_id": cliente_id,
+        "linked_projeto_id": card.get("projeto_id"),
+        "linked_pd_card_id": card.get("id"),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db.pd_requests.insert_one(pd_request)
+    await db.pd_request_status_history.insert_one({
+        "id": _new_id(),
+        "pd_request_id": req_id,
+        "from_status": None,
+        "to_status": "OPEN",
+        "changed_by": user["id"],
+        "changed_by_name": user.get("name", ""),
+        "comment": "Criado automaticamente a partir de variação CRM",
+        "created_at": now,
+    })
+
+    # Link card -> pd_request
+    await db.pd_cards.update_one(
+        {"id": card["id"], "tenant_id": user["tenant_id"]},
+        {"$set": {"pd_request_id": req_id, "updated_at": now}},
+    )
+    card["pd_request_id"] = req_id
+
+    logger.info(f"Auto-created pd_request {req_id} for pd_card {card.get('id')} (variação {card.get('numero_completo')})")
+    return req_id
+
+
 async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict):
     """Cria um card no Pipeline P&D para uma variação de amostra (ERP v3.0)."""
     now = _now_iso()
@@ -2051,6 +2155,12 @@ async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict)
     )
 
     logger.info(f"Created P&D card {card_id} for variação {variacao['codigo']}")
+
+    # Auto-create paired pd_request so clicking the card opens the full PDDetail screen
+    try:
+        await _ensure_pd_request_for_card(card, user)
+    except Exception as exc:  # pragma: no cover - non-fatal
+        logger.warning(f"Failed to auto-create pd_request for card {card_id}: {exc}")
 
 
 @crm_router.get("/samples")
@@ -3087,7 +3197,14 @@ async def get_pd_card(card_id: str, request: Request):
     )
     if not card:
         raise HTTPException(status_code=404, detail="Card não encontrado")
-    
+
+    # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
+    if not card.get("pd_request_id"):
+        try:
+            await _ensure_pd_request_for_card(card, user)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
+
     # Buscar amostra e variação relacionadas
     if card.get("amostra_id"):
         sample = await db.crm_samples.find_one(
