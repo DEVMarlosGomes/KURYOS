@@ -968,6 +968,43 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
 
   return (
     <div className="space-y-4">
+      {/* Briefing técnico (CRM) — alvos para o P&D só preencher MPs/insumos */}
+      {clientInfo && clientInfo._source === "crm_sample" && (
+        <Card className="border-blue-200 dark:border-blue-900 bg-blue-50/30 dark:bg-blue-950/20" data-testid="formula-briefing-targets">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+              Alvos do Briefing (CRM){clientInfo._variacao_codigo ? ` — Variação ${clientInfo._variacao_codigo}` : ""}
+            </CardTitle>
+            <p className="text-[11px] text-muted-foreground">
+              Volume, fragrância e parâmetros já vieram da solicitação. P&D só precisa adicionar MPs/insumos/ingredientes.
+            </p>
+          </CardHeader>
+          <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs pt-0">
+            {req?.volume && (
+              <div><span className="text-muted-foreground">Volume alvo:</span> <span className="font-medium">{req.volume}</span></div>
+            )}
+            {clientInfo.ph && (
+              <div><span className="text-muted-foreground">pH alvo:</span> <span className="font-medium">{clientInfo.ph}</span></div>
+            )}
+            {clientInfo.textura_esperada && (
+              <div className="col-span-2"><span className="text-muted-foreground">Textura:</span> <span className="font-medium">{clientInfo.textura_esperada}</span></div>
+            )}
+            {clientInfo.sensorial && (
+              <div className="col-span-2"><span className="text-muted-foreground">Sensorial:</span> <span className="font-medium">{clientInfo.sensorial}</span></div>
+            )}
+            {clientInfo.aplicacao && (
+              <div className="col-span-2"><span className="text-muted-foreground">Aplicação:</span> <span className="font-medium">{clientInfo.aplicacao}</span></div>
+            )}
+            {clientInfo.ativos_claims && (
+              <div className="col-span-4"><span className="text-muted-foreground">Ativos / Claims:</span> <span className="font-medium">{clientInfo.ativos_claims}</span></div>
+            )}
+            {clientInfo.orcamento_projeto && (
+              <div className="col-span-2"><span className="text-muted-foreground">Orçamento:</span> <span className="font-medium">{clientInfo.orcamento_projeto}</span></div>
+            )}
+          </CardContent>
+        </Card>
+      )}
       <div className="flex items-center justify-between">
         <h3 className="text-base font-semibold">Manipulação / Formulação ({formulas.length})</h3>
         <Button size="sm" onClick={() => setShowCreate(true)} className="gap-1.5" disabled={!canEdit}>

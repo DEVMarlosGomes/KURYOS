@@ -1978,6 +1978,18 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
     """
     existing_id = card.get("pd_request_id")
     if existing_id:
+        # Backfill: garantir que development + fórmula inicial existem
+        # (cards criados antes do bootstrap automático ainda podem estar sem dev)
+        try:
+            existing_dev = await db.pd_developments.find_one(
+                {"pd_request_id": existing_id, "tenant_id": user["tenant_id"]}
+            )
+            if not existing_dev and card.get("amostra_id") and card.get("amostra_variacao_id"):
+                await _bootstrap_pd_development_for_variacao(
+                    pd_request_id=existing_id, card=card, user=user
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Backfill bootstrap failed for pd_request {existing_id}: {exc}")
         return existing_id
 
     now = _now_iso()
@@ -2071,8 +2083,160 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
     )
     card["pd_request_id"] = req_id
 
+    # Auto-create development + initial formula pre-filled with briefing data
+    # so the operator only needs to add raw materials/ingredients
+    try:
+        await _bootstrap_pd_development_for_variacao(
+            pd_request_id=req_id, card=card, user=user
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f"Failed to bootstrap dev/formula for pd_request {req_id}: {exc}")
+
     logger.info(f"Auto-created pd_request {req_id} for pd_card {card.get('id')} (variação {card.get('numero_completo')})")
     return req_id
+
+
+async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict, user: dict):
+    """Cria development + fórmula v1 pré-preenchida a partir da variação CRM.
+    Inclui a fragrância da variação como primeiro item (P&D só adiciona MPs/insumos).
+    """
+    sample_id = card.get("amostra_id")
+    variacao_id = card.get("amostra_variacao_id")
+    if not sample_id or not variacao_id:
+        return
+
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        return
+    variacao = next(
+        (v for v in sample.get("variacoes", []) if v.get("id") == variacao_id), None
+    )
+    if not variacao:
+        return
+
+    now = _now_iso()
+
+    # Move pd_request to IN_PROGRESS so the dev/formula appear active
+    await db.pd_requests.update_one(
+        {"id": pd_request_id, "tenant_id": user["tenant_id"]},
+        {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+    )
+    await db.pd_request_status_history.insert_one({
+        "id": _new_id(),
+        "pd_request_id": pd_request_id,
+        "from_status": "OPEN",
+        "to_status": "IN_PROGRESS",
+        "changed_by": user["id"],
+        "changed_by_name": user.get("name", ""),
+        "comment": "Bootstrap automático: desenvolvimento + fórmula inicial criados a partir do briefing CRM",
+        "created_at": now,
+    })
+
+    # 1) Development
+    dev_id = _new_id()
+    await db.pd_developments.insert_one({
+        "id": dev_id,
+        "pd_request_id": pd_request_id,
+        "tenant_id": user["tenant_id"],
+        "assigned_to": user["id"],
+        "assigned_to_name": user.get("name", ""),
+        "lab_responsible": None,
+        "current_version": 1,
+        "status": "active",
+        "started_at": now,
+        "completed_at": None,
+    })
+
+    # 2) Initial formula pre-filled
+    quantidade = sample.get("quantidade_por_variacao") or 0.0
+    unidade = (sample.get("unidade_quantidade") or "g").lower()
+    if unidade in ("ml", "l"):
+        volume_unit = "mL" if unidade == "ml" else "L"
+    elif unidade in ("g", "kg"):
+        volume_unit = unidade
+    else:
+        volume_unit = "g"
+
+    notes_lines = [
+        "Pré-preenchido automaticamente a partir do briefing CRM.",
+        "→ P&D: adicionar MPs/insumos/ingredientes. Fragrância já está como item nº 1.",
+        "",
+    ]
+    if sample.get("ph"):
+        notes_lines.append(f"pH alvo: {sample['ph']}")
+    if sample.get("textura_esperada"):
+        notes_lines.append(f"Textura esperada: {sample['textura_esperada']}")
+    if sample.get("sensorial"):
+        notes_lines.append(f"Sensorial: {sample['sensorial']}")
+    if sample.get("aplicacao"):
+        notes_lines.append(f"Aplicação: {sample['aplicacao']}")
+    if sample.get("ativos_claims"):
+        notes_lines.append(f"Ativos/Claims obrigatórios: {sample['ativos_claims']}")
+    if sample.get("orcamento_projeto"):
+        notes_lines.append(f"Orçamento alvo: {sample['orcamento_projeto']}")
+    if variacao.get("descricao_aplicacao"):
+        notes_lines.append("")
+        notes_lines.append(f"Variação {variacao.get('codigo', '')}: {variacao['descricao_aplicacao']}")
+    if variacao.get("observacoes_especificas"):
+        notes_lines.append(f"Observações específicas: {variacao['observacoes_especificas']}")
+
+    formula_id = _new_id()
+    formula_name = f"Manipulação {variacao.get('codigo', '')} — {sample.get('nome_produto', '')} v1".strip()
+    await db.pd_formulas.insert_one({
+        "id": formula_id,
+        "tenant_id": user["tenant_id"],
+        "development_id": dev_id,
+        "version": 1,
+        "name": formula_name,
+        "notes": "\n".join(notes_lines).strip(),
+        "volume": float(quantidade or 0.0),
+        "volume_unit": volume_unit,
+        "indice_perdas": 0.0,
+        "cotacao_usd": 6.00,
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "created_at": now,
+    })
+
+    # 3) Fragrance pre-filled as first item (if available)
+    if variacao.get("percentual_fragrancia") is not None and float(variacao.get("percentual_fragrancia") or 0) > 0:
+        ref_frag = variacao.get("referencia_fragrancia") or "Fragrância da variação"
+        pct = float(variacao.get("percentual_fragrancia") or 0)
+        custo_kg = float(variacao.get("custo_fragrancia") or 0)
+        cotacao = 6.00
+        cost_brl = round((pct / 100.0) * custo_kg, 4)
+        cost_kg_usd = round((custo_kg / cotacao) if cotacao else 0.0, 4)
+        item_id = _new_id()
+        await db.pd_formula_items.insert_one({
+            "id": item_id,
+            "formula_id": formula_id,
+            "ingredient_name": ref_frag,
+            "percentage": pct,
+            "price_per_kg": custo_kg,
+            "cost_brl": cost_brl,
+            "cost_kg_usd": cost_kg_usd,
+            "fornecedor": "",
+            "phase": "Fragrância",
+            "function": "Fragrância",
+            "catalog_id": None,
+        })
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="pd_dev_bootstrap_from_variacao",
+        entity_type="pd_request",
+        entity_id=pd_request_id,
+        after={
+            "development_id": dev_id,
+            "formula_id": formula_id,
+            "variacao_codigo": variacao.get("codigo"),
+            "amostra_id": sample_id,
+        },
+    )
 
 
 async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict):
