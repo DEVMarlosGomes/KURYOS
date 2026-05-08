@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 
 # Configuration
-BASE_URL = "https://traga-card.preview.emergentagent.com/api"
+BASE_URL = "https://approval-pipeline-9.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@kuryos.com"
 ADMIN_PASSWORD = "admin123"
 
