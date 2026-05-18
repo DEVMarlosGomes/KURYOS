@@ -1,0 +1,156 @@
+{
+  "project_name": "CRM Kuryos",
+  "domain": "SaaS CRM for Cosmetics & Perfumery",
+  "theme": "dark_and_light_support",
+  "archetype": "Archetype 4 (Swiss & High-Contrast) + Archetype 5 (Jewel & Luxury)",
+  "design_vision": {
+    "philosophy": "A high-end, consultative CRM that merges the rigorous efficiency of a Kanban pipeline with the elegant, tactile aesthetics of the luxury cosmetics industry.",
+    "emotion": "Professional, authoritative, sleek, and highly organized.",
+    "contrast_strategy": "High contrast structural grayscale to highlight data. Color is purely functional (lead temperatures) and used sparingly to guide the eye."
+  },
+  "typography": {
+    "rules": {
+      "anti_default": "Banned: Inter, Roboto, Open Sans. Headings must have tracking-tight.",
+      "hierarchy": "Max heading size is text-5xl on desktop. Do not skip more than 2 steps in typography hierarchy.",
+      "body": "Left-align all paragraphs and dense information. Use loose line-height (leading-relaxed) for readability."
+    },
+    "fonts": {
+      "heading": {
+        "family": "Outfit",
+        "weights": ["light", "regular", "medium", "semibold"],
+        "usage": "Used for main dashboard titles, modal headers, and column names."
+      },
+      "body": {
+        "family": "Manrope",
+        "weights": ["regular", "medium"],
+        "usage": "Used for card text, dynamic forms, and chat messages."
+      },
+      "mono": {
+        "family": "JetBrains Mono",
+        "weights": ["regular"],
+        "usage": "Used for numerical data, IDs, and metrics."
+      }
+    }
+  },
+  "colors": {
+    "light_mode": {
+      "background": "#FDFCFB",
+      "surface": "#FFFFFF",
+      "foreground": "#0A0A0B",
+      "muted": "#F3F3F2",
+      "muted_foreground": "#737373",
+      "border": "#E5E5E5",
+      "primary": "#0A0A0B",
+      "primary_foreground": "#FFFFFF"
+    },
+    "dark_mode": {
+      "background": "#0C0C0D",
+      "surface": "#121214",
+      "foreground": "#FAFAFA",
+      "muted": "#1A1A1D",
+      "muted_foreground": "#A1A1AA",
+      "border": "#27272A",
+      "primary": "#FAFAFA",
+      "primary_foreground": "#0C0C0D"
+    },
+    "semantic": {
+      "temperature": {
+        "cold": {
+          "bg": "#E0F2FE",
+          "text": "#0284C7",
+          "dark_bg": "#0C4A6E",
+          "dark_text": "#7DD3FC"
+        },
+        "warm": {
+          "bg": "#FFEDD5",
+          "text": "#EA580C",
+          "dark_bg": "#7C2D12",
+          "dark_text": "#FDBA74"
+        },
+        "hot": {
+          "bg": "#FEE2E2",
+          "text": "#DC2626",
+          "dark_bg": "#7F1D1D",
+          "dark_text": "#FCA5A5"
+        }
+      }
+    }
+  },
+  "layout": {
+    "spacing": {
+      "generous": true,
+      "scale": "p-2, p-4, p-6, p-8. Ensure generous padding in side-sheets (p-8).",
+      "card_padding": "p-4"
+    },
+    "structure": {
+      "navigation": "Sidebar navigation for global menus (Dashboard, Pipeline, Tasks, Settings).",
+      "main_area": "Central area dominated by the Kanban board.",
+      "kanban_board": "Grid/Flex layout with horizontal scroll. Columns have subtle border-r or gap-4 spacing.",
+      "side_sheet": "When clicking a card, open a Shadcn Sheet (Slide-over) spanning 40-50% of the screen width for history/details.",
+      "radius": "Subtle roundness, max 8px (rounded-md/lg). Avoid overly circular 'pill' buttons unless primary."
+    }
+  },
+  "components": {
+    "kanban_card": {
+      "style": "Flat background with 1px subtle border, no shadow in rest state. On hover: slight lift (-translate-y-1) and shadow-sm.",
+      "library": "dnd-kit for drag and drop."
+    },
+    "side_sheet_modal": {
+      "style": "Glassmorphism backdrop (backdrop-blur-sm bg-black/40). Solid surface for the panel itself with sharp 1px border. Do not use glass for the readable content panel.",
+      "tabs": "Use Shadcn Tabs for Timeline, Form Fields, and WhatsApp Chat."
+    },
+    "forms": {
+      "style": "Use Shadcn inputs. Solid borders, subtle focus rings (focus:ring-primary). Never native inputs."
+    },
+    "badges": {
+      "style": "Lead temperature badges must be uppercase, tiny, wide spacing (tracking-[0.1em] text-xs font-semibold)."
+    }
+  },
+  "motion_and_interactions": {
+    "hover_states": "All buttons must define text color on hover (e.g., hover:bg-slate-900 hover:text-white).",
+    "transitions": "Use specific properties, e.g., transition-transform duration-200 ease-out.",
+    "drag_drop": "Smooth scale up (scale-105) and drop-shadow-xl when a card is being dragged."
+  },
+  "media": {
+    "icons": {
+      "library": "@phosphor-icons/react",
+      "style": "Duotone or Regular weight, strictly functional."
+    },
+    "images": [
+      {
+        "category": "product_placeholder",
+        "description": "Premium cosmetic product shot for proposal/sample reference.",
+        "url": "https://images.unsplash.com/photo-1751831798147-a8c0b2bd9464?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NDh8MHwxfHNlYXJjaHwxfHxjb3NtZXRpY3MlMjBwcm9kdWN0JTIwZWxlZ2FudHxlbnwwfHx8fDE3NzU5MjI5MTR8MA&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "category": "product_placeholder_2",
+        "description": "Perfume bottle for pipeline card thumbnail.",
+        "url": "https://images.unsplash.com/photo-1765031117402-93b2e530edec?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NDh8MHwxfHNlYXJjaHw0fHxjb3NtZXRpY3MlMjBwcm9kdWN0JTIwZWxlZ2FudHxlbnwwfHx8fDE3NzU5MjI5MTR8MA&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "category": "avatar_male",
+        "description": "Professional avatar for sales rep.",
+        "url": "https://images.pexels.com/photos/14589344/pexels-photo-14589344.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+      },
+      {
+        "category": "avatar_female",
+        "description": "Professional avatar for client/lead.",
+        "url": "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+      },
+      {
+        "category": "auth_hero_background",
+        "description": "Abstract premium cosmetics liquid texture for the multi-tenant login page.",
+        "url": "https://static.prod-images.emergentagent.com/jobs/19c57ff8-68c4-4faf-a657-3fa1c5f88325/images/5f28b7762e8cf043112e395479622397b2bf72076fc5cd0bf5186d12c784ff37.png"
+      }
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Strictly adhere to the selected fonts (Outfit for headers, Manrope for body). Install them via standard font imports.",
+    "Build the central Kanban board using dnd-kit or @hello-pangea/dnd with drag-and-drop support.",
+    "Implement the 'Card Side-sheet Modal' using the Shadcn Sheet component. Ensure it has Tabs for Timeline, Form, and WhatsApp.",
+    "Implement the Lead Temperature Badges (Cold, Warm, Hot) using the exact color tokens provided in the semantic section.",
+    "Ensure all interactive elements have data-testid attributes.",
+    "Override default generic Shadcn radii to max 8px (rounded-md).",
+    "Never use the Inter font. Apply tracking-tight to headings."
+  ]
+}

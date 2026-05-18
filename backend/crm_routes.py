@@ -1,0 +1,4902 @@
+"""
+CRM Routes - Kuryos Beauty CRM
+3-level pipeline: Clients (CRM1) → Projects (CRM2) → Samples (CRM3) → SKU
+"""
+
+from fastapi import APIRouter, HTTPException, Request, Query, File, UploadFile
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone, timedelta
+import logging
+import asyncio
+import os
+import base64
+from pathlib import Path
+from validation_utils import (
+    clean_text,
+    normalize_cnpj,
+    normalize_email,
+    normalize_phone,
+    is_valid_cnpj,
+    is_valid_email,
+    is_valid_phone,
+)
+
+from workflow_engine import (
+    audit_log,
+    create_workflow_task,
+    next_sample_number,
+    next_sku_number,
+    assert_client_exists,
+    assert_project_exists,
+    assert_sample_exists,
+    assert_no_blocking_tasks,
+    trigger_tasks_for_transition,
+    inherit,
+    INHERITED_FROM_CLIENT,
+    INHERITED_FROM_PROJECT,
+    INHERITED_FROM_SAMPLE,
+)
+from rbac import (
+    require_roles,
+    has_role,
+    COMERCIAL_FULL,
+    COMERCIAL_LEAD,
+    PD_READ,
+    PD_WRITE,
+    PD_FULL,
+    QA_APPROVERS,
+    DOC_REVIEWERS,
+    ADMIN_ONLY,
+)
+
+logger = logging.getLogger(__name__)
+
+crm_router = APIRouter(prefix="/api/crm")
+
+# ============ MODULE STATE (set via init) ============
+db = None
+_get_current_user = None
+_new_id = None
+_now_iso = None
+
+def init_crm(database, get_user_fn, new_id_fn, now_iso_fn):
+    global db, _get_current_user, _new_id, _now_iso
+    db = database
+    _get_current_user = get_user_fn
+    _new_id = new_id_fn
+    _now_iso = now_iso_fn
+    logger.info("CRM module initialized")
+
+# ============ CONSTANTS ============
+
+CLIENT_STAGES = ["prospeccao", "qualificado", "projeto_em_discussao", "negociacao", "cliente_fechado", "cliente_perdido"]
+
+CLIENT_TRANSITIONS = {
+    "prospeccao": ["qualificado", "cliente_perdido"],
+    "qualificado": ["projeto_em_discussao", "cliente_perdido"],
+    "projeto_em_discussao": ["negociacao", "cliente_perdido"],
+    "negociacao": ["cliente_fechado", "cliente_perdido"],
+    "cliente_fechado": [],
+    "cliente_perdido": [],
+}
+
+PROJECT_STAGES = [
+    "projeto_em_discussao",
+    "amostra_solicitada",
+    "amostra_em_desenvolvimento",
+    "amostra_enviada",
+    "em_negociacao",
+    "pedido_aprovado",
+    "projeto_arquivado",
+]
+
+PROJECT_TRANSITIONS = {
+    "projeto_em_discussao": ["amostra_solicitada", "projeto_arquivado"],
+    "amostra_solicitada": ["amostra_em_desenvolvimento", "projeto_arquivado"],
+    "amostra_em_desenvolvimento": ["amostra_enviada", "projeto_arquivado"],
+    "amostra_enviada": ["em_negociacao", "projeto_arquivado"],
+    "em_negociacao": ["pedido_aprovado", "projeto_arquivado"],
+    "pedido_aprovado": [],
+    "projeto_arquivado": [],
+    # legado
+    "amostras": ["amostra_em_desenvolvimento", "projeto_arquivado"],
+}
+
+SAMPLE_STAGES = ["solicitada", "em_elaboracao", "retrabalho", "enviada", "aprovada", "reprovada"]
+
+SAMPLE_TRANSITIONS = {
+    "solicitada": ["em_elaboracao"],
+    "em_elaboracao": ["enviada", "retrabalho"],
+    "retrabalho": ["em_elaboracao"],
+    "enviada": ["aprovada", "reprovada", "retrabalho"],
+    "aprovada": [],
+    "reprovada": [],
+}
+
+CANAL_ORIGEM_OPTIONS = [
+    # Prospecção Ativa — Digital
+    "linkedin_dm_outbound",
+    "linkedin_engajamento_organico",
+    "instagram_abordagem_direta",
+    "whatsapp_abordagem_fria",
+    "email_outbound_automatizado",
+    "email_outbound_manual",
+    # Prospecção Ativa — Presencial
+    "evento",
+    "feira_setor",
+    "visita_presencial Espontanea",
+    "abordagem_pdv",
+    # Indicação
+    "indicacao_cliente_ativo",
+    "indicacao_fornecedor_parceiro",
+    "indicacao_ex_cliente",
+    "indicacao_pessoal",
+    "indicacao_influenciador_parceiro_midia",
+    # Inbound — Digital
+    "formulario_site",
+    "whatsapp_receptivo",
+    "instagram_dm_receptivo",
+    "linkedin_inbound",
+    "google_organico",
+    "google_ads",
+    "meta_ads",
+    # Inbound — Conteúdo
+    "blog",
+    "seo",
+    "newsletter",
+    "youtube",
+    "webinar_live",
+    # Relacionamento Existente
+    "reativacao_lead_frio",
+    "reativacao_ex_cliente",
+    "cross_sell_cliente_ativo",
+    "upsell_cliente_ativo",
+    # Outros
+    "parceria_cobrand",
+    "consultor_agencia",
+    "licitacao_edital",
+    "outro",
+]
+
+# Categorias de Interesse 2 níveis conforme PRD
+CATEGORIA_INTERESSE_OPTIONS = {
+    "capilares": ["shampoo", "condicionador", "mascara_capilar", "leave_in_finalizador", "oleo_capilar", "ampola_tratamento", "tonico_capilar", "coloracao_tonalizante", "relaxante_alisante", "neutralizante", "botox_capilar", "progressiva_escova"],
+    "skin_care_dermocosmeticos": ["hidratante_corporal", "hidratante_facial", "serum_facial", "protetor_solar_facial", "protetor_solar_corporal", "esfoliante", "tonico_facial", "sabonete_liquido_facial", "mascara_facial", "contorno_olhos", "vitamina_c_antioxidante", "clareador", "antiacneico"],
+    "higiene_pessoal": ["sabonete_liquido_corporal", "sabonete_em_barra", "gel_banho", "desodorante_spray", "desodorante_rollon", "desodorante_creme", "talco", "antisseptico_maos"],
+    "perfumaria": ["perfume_edp", "eau_de_toilette", "body_splash_colonia", "splash_capilar", "home_spray_aromatizador", "sache_perfumado", "sabonete_perfumado"],
+    "maquiagem": ["base_liquida", "bb_cream_cc_cream", "primer", "blush_bronzer", "iluminador", "batom_gloss", "delineador", "mascara_cilios", "fixador"],
+    "corporal_spa": ["oleo_corporal", "manteiga_corporal", "esfoliante_corporal", "creme_maos_pes", "creme_estrias", "gel_redutor", "creme_pos_depilacao", "creme_massagem"],
+    "infantil": ["shampoo_infantil", "condicionador_infantil", "sabonete_infantil", "locao_infantil", "protetor_solar_infantil", "oleo_massagem_infantil"],
+    "masculino": ["shampoo_masculino", "balsamo_pos_barba", "gel_creme_barbear", "locao_pos_barba", "desodorante_masculino", "perfume_masculino", "hidratante_facial_masculino"],
+    "profissional_salao": ["tratamento_intensivo", "progressiva_escova", "coloracao_profissional", "tonalizante", "alisamento", "neutralizante_profissional"],
+    "regulatorio_grau2": ["protetor_solar_fps6", "repelente_insetos", "clareador_pele", "antiacneico", "ativo_farmacologico"],
+}
+
+# Campos que indicam produto Grau 2 ANVISA
+CATEGORIAS_GRAU2 = ["protetor_solar_facial", "protetor_solar_corporal", "protetor_solar_fps6", "protetor_solar_infantil", "repelente_insetos", "clareador", "clareador_pele", "antiacneico", "ativo_farmacologico"]
+
+ORIGEM_LEAD_OPTIONS = [
+    "indicacao_cliente_habibi",
+    "indicacao_fornecedor",
+    "indicacao_parceiro",
+    "feira_setor",
+    "evento",
+    "linkedin",
+    "instagram",
+    "google",
+    "site",
+    "outro",
+]
+
+VOLUME_ESTIMADO_OPTIONS = ["menos_1k", "1k_5k", "5k_20k", "20k_50k", "50k_100k", "mais_100k"]
+
+TEM_ANVISA_OPTIONS = ["sim", "nao", "depende"]
+
+MOTIVO_PERDA_OPTIONS = ["preco", "prazo", "qualidade", "concorrencia", "projeto_cancelado", "sem_retorno", "outro"]
+
+# Segmentos de cliente
+SEGMENTO_CLIENTE_OPTIONS = ["marca_propria", "distribuidor", "varejo", "salao", "industria", "outro"]
+
+# Porte do cliente
+PORTE_CLIENTE_OPTIONS = ["pequeno", "medio", "grande"]
+
+# Temperatura do lead
+TEMPERATURA_LEAD_OPTIONS = ["quente", "morno", "frio"]
+
+# Cargos de decisores
+CARGO_DECISOR_OPTIONS = ["ceo", "comprador", "desenvolvimento", "diretor_comercial", "gerente_produto", "outro"]
+
+UF_OPTIONS = [
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA",
+    "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN",
+    "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+]
+
+CANAL_ORIGEM_GROUPS = {
+    "prospeccao_ativa_digital": [
+        "linkedin_dm_outbound",
+        "linkedin_engajamento_organico",
+        "instagram_abordagem_direta",
+        "whatsapp_abordagem_fria",
+        "email_outbound_automatizado",
+        "email_outbound_manual",
+    ],
+    "prospeccao_ativa_presencial": [
+        "evento",
+        "feira_setor",
+        "visita_presencial Espontanea",
+        "abordagem_pdv",
+    ],
+    "indicacao": [
+        "indicacao_cliente_ativo",
+        "indicacao_fornecedor_parceiro",
+        "indicacao_ex_cliente",
+        "indicacao_pessoal",
+        "indicacao_influenciador_parceiro_midia",
+    ],
+    "inbound_digital": [
+        "formulario_site",
+        "whatsapp_receptivo",
+        "instagram_dm_receptivo",
+        "linkedin_inbound",
+        "google_organico",
+        "google_ads",
+        "meta_ads",
+    ],
+    "inbound_conteudo": [
+        "blog",
+        "seo",
+        "newsletter",
+        "youtube",
+        "webinar_live",
+    ],
+    "relacionamento_existente": [
+        "reativacao_lead_frio",
+        "reativacao_ex_cliente",
+        "cross_sell_cliente_ativo",
+        "upsell_cliente_ativo",
+    ],
+    "outros": [
+        "parceria_cobrand",
+        "consultor_agencia",
+        "licitacao_edital",
+        "outro",
+    ],
+}
+
+# Prazo de follow-up por etapa (em dias)
+FOLLOW_UP_PRAZOS = {
+    "prospeccao": 3,
+    "qualificado": 5,
+    "projeto_em_discussao": 7,
+    "negociacao": 5,
+    "cliente_fechado": 30,
+    "cliente_perdido": 90,
+}
+
+PROJECT_POSICIONAMENTO_OPTIONS = [
+    "custo_beneficio",
+    "premium",
+    "luxo",
+    "acessivel",
+    "nicho",
+    "profissional",
+]
+
+PROJECT_TIPO_SERVICO_OPTIONS = [
+    "full_service_kuryos",
+    "co_desenvolvimento",
+    "formula_do_cliente",
+]
+
+PROJECT_RESTRICAO_TECNICA_OPTIONS = [
+    "vegano",
+    "sem_parabenos",
+    "sem_sulfato",
+    "sem_silicone",
+    "hipoalergenico",
+    "natural",
+    "organico",
+    "anvisa_g2",
+    "outro",
+]
+
+TIPO_AMOSTRA_OPTIONS = [
+    "desenvolvimento_novo",
+    "portfolio_existente",
+    "adaptacao_de_formula",
+]
+
+UNIDADE_QUANTIDADE_AMOSTRA_OPTIONS = ["g", "kg", "ml", "l", "un"]
+
+SAMPLE_VARIATION_PARAM_OPTIONS = [
+    "fragrancia",
+    "cor",
+    "ativo",
+    "outro",
+]
+
+SAMPLE_RESULTADO_OPTIONS = [
+    "aprovada",
+    "reprovada",
+    "retrabalho",
+]
+
+STAGE_LABELS = {
+    "prospeccao": "Prospecção",
+    "qualificado": "Qualificado",
+    "projeto_em_discussao": "Projeto em Discussão",
+    "negociacao": "Negociação",
+    "cliente_fechado": "Cliente Fechado",
+    "cliente_perdido": "Cliente Perdido",
+    "amostras": "Amostra Solicitada",
+    "amostra_solicitada": "Amostra Solicitada",
+    "amostra_em_desenvolvimento": "Amostra em Desenvolvimento",
+    "amostra_enviada": "Amostra Enviada ao Cliente",
+    "em_negociacao": "Em NegociaÃ§Ã£o",
+    "pedido_aprovado": "Pedido Aprovado",
+    "projeto_arquivado": "Projeto Arquivado",
+    "solicitada": "Solicitada",
+    "em_elaboracao": "Em Elaboração",
+    "retrabalho": "Retrabalho",
+    "enviada": "Enviada",
+    "aprovada": "Aprovada",
+    "reprovada": "Reprovada",
+}
+
+# ============ PYDANTIC MODELS ============
+
+class ContatoPrincipal(BaseModel):
+    nome: str = ""
+    whatsapp: str = ""
+    email: str = ""
+
+class ContatoAdicional(BaseModel):
+    nome: str = ""
+    cargo: str = ""
+    whatsapp: str = ""
+    email: str = ""
+
+class Decisor(BaseModel):
+    nome: str = ""
+    cargo: str = ""
+    contato: str = ""
+
+class FornecedorAtual(BaseModel):
+    tem: bool = False
+    motivo_troca: str = ""
+
+class AnvisaInfo(BaseModel):
+    necessario: bool = False
+    status: str = ""
+
+class ClientCreate(BaseModel):
+    nome_empresa: str
+    cnpj: str = ""
+    contato_principal: Optional[ContatoPrincipal] = None
+    contatos_adicionais: List[ContatoAdicional] = []
+    canal_origem: str = ""
+    categoria_interesse: List[str] = []
+    origem_lead: str = ""
+    # Novos campos PRD
+    temperatura_lead: str = "morno"
+    responsavel_comercial: str = ""
+    segmento: str = ""
+    porte: str = ""
+    regiao: str = ""
+    site: str = ""
+    instagram: str = ""
+    observacoes: str = ""
+
+
+class ClientUpdate(BaseModel):
+    nome_empresa: Optional[str] = None
+    cnpj: Optional[str] = None
+    contato_principal: Optional[ContatoPrincipal] = None
+    contatos_adicionais: Optional[List[ContatoAdicional]] = None
+    canal_origem: Optional[str] = None
+    categoria_interesse: Optional[List[str]] = None
+    origem_lead: Optional[str] = None
+    decisores: Optional[List[Decisor]] = None
+    tem_marca_propria: Optional[bool] = None
+    tem_anvisa: Optional[str] = None
+    volume_estimado_mensal: Optional[str] = None
+    fornecedor_atual: Optional[FornecedorAtual] = None
+    prazo_urgencia: Optional[str] = None
+    amostras_aprovadas: Optional[List[str]] = None
+    valor_estimado_projeto: Optional[float] = None
+    moq_negociado: Optional[str] = None
+    condicao_pagamento: Optional[str] = None
+    anvisa_necessario: Optional[AnvisaInfo] = None
+    concorrentes_envolvidos: Optional[List[str]] = None
+    data_pedido: Optional[str] = None
+    skus_confirmados: Optional[List[str]] = None
+    valor_primeiro_pedido: Optional[float] = None
+    previsao_segundo_pedido: Optional[str] = None
+    motivo_perda: Optional[str] = None
+    # Novos campos PRD
+    temperatura_lead: Optional[str] = None
+    responsavel_comercial: Optional[str] = None
+    segmento: Optional[str] = None
+    porte: Optional[str] = None
+    regiao: Optional[str] = None
+    site: Optional[str] = None
+    instagram: Optional[str] = None
+    observacoes: Optional[str] = None
+    ultima_atualizacao_temperatura: Optional[str] = None
+
+class ClientMove(BaseModel):
+    stage: str
+    motivo_perda: Optional[str] = None
+
+class ProjectBatchItem(BaseModel):
+    nome_projeto: str
+    categoria: str = ""
+    briefing_resumido: str = ""
+    responsavel_comercial: str = ""
+    ideia_conceito: str = ""
+    referencia_mercado: str = ""
+    publico_alvo: str = ""
+    posicionamento: str = ""
+    faixa_preco_venda: Optional[float] = None
+    volume_estimado_pedido: Optional[int] = None
+    tipo_servico: str = ""
+    sensorial_desejado: str = ""
+    restricoes_tecnicas: List[str] = []
+    claims_desejados: str = ""
+    prazo_desejado_amostra: str = ""
+    observacoes_livres: str = ""
+
+class ProjectBatchCreate(BaseModel):
+    cliente_id: str
+    projects: List[ProjectBatchItem]
+
+class ProjectUpdate(BaseModel):
+    nome_projeto: Optional[str] = None
+    categoria: Optional[str] = None
+    briefing_tecnico: Optional[str] = None
+    responsavel_comercial: Optional[str] = None
+    ideia_conceito: Optional[str] = None
+    referencia_mercado: Optional[str] = None
+    publico_alvo: Optional[str] = None
+    posicionamento: Optional[str] = None
+    faixa_preco_venda: Optional[float] = None
+    volume_estimado_pedido: Optional[int] = None
+    tipo_servico: Optional[str] = None
+    sensorial_desejado: Optional[str] = None
+    restricoes_tecnicas: Optional[List[str]] = None
+    claims_desejados: Optional[str] = None
+    prazo_desejado_amostra: Optional[str] = None
+    observacoes_livres: Optional[str] = None
+    responsavel_interno: Optional[str] = None
+    data_inicio_desenvolvimento: Optional[str] = None
+    prazo_prometido_cliente: Optional[str] = None
+    numero_amostras_solicitadas: Optional[int] = None
+    motivo_arquivamento: Optional[str] = None
+
+class ProjectMove(BaseModel):
+    stage: str
+    motivo_arquivamento: Optional[str] = None
+
+class SampleBatchItem(BaseModel):
+    nome_amostra: str
+    codigo_referencia: str = ""
+    observacao_tecnica: str = ""
+    produto: str = ""
+    objetivo_projeto: str = ""
+    aplicacoes_desenvolver: str = ""
+    ativos_claims: str = ""
+    referencias: str = ""
+    referencias_fotos: List[str] = []
+    orcamento_projeto: str = ""
+    textura_esperada: str = ""
+    aplicacao: str = ""
+    sensorial: str = ""
+    ph: str = ""
+
+class SampleBatchCreate(BaseModel):
+    projeto_id: str
+    samples: List[SampleBatchItem]
+
+class SampleUpdate(BaseModel):
+    nome_amostra: Optional[str] = None
+    codigo_referencia: Optional[str] = None
+    observacao_tecnica: Optional[str] = None
+    responsavel_pd: Optional[str] = None
+    data_envio: Optional[str] = None
+    feedback_cliente: Optional[str] = None
+    direcoes_retrabalho: Optional[str] = None
+    prazo_entrega_cliente: Optional[str] = None
+    tipo_amostra: Optional[str] = None
+    referencia_formula: Optional[str] = None
+    quantidade_por_variacao: Optional[float] = None
+    unidade_quantidade: Optional[str] = None
+    briefing_especifico: Optional[str] = None
+    resultado: Optional[str] = None
+    produto: Optional[str] = None
+    objetivo_projeto: Optional[str] = None
+    aplicacoes_desenvolver: Optional[str] = None
+    ativos_claims: Optional[str] = None
+    referencias: Optional[str] = None
+    referencias_fotos: Optional[List[str]] = None
+    orcamento_projeto: Optional[str] = None
+    textura_esperada: Optional[str] = None
+    aplicacao: Optional[str] = None
+    sensorial: Optional[str] = None
+    ph: Optional[str] = None
+
+class SampleMove(BaseModel):
+    stage: str
+    motivo_retrabalho: Optional[str] = None
+    origem_retrabalho: Optional[str] = None
+    feedback_cliente: Optional[str] = None
+    direcoes_retrabalho: Optional[str] = None
+
+class VariacaoItem(BaseModel):
+    descricao_aplicacao: str
+    percentual_fragrancia: Optional[float] = None
+    referencia_fragrancia: str = ""
+    custo_fragrancia: Optional[float] = None
+    observacoes_especificas: str = ""
+    feedback_cliente: str = ""
+    direcoes_retrabalho: str = ""
+
+class SampleBatchItemV2(BaseModel):
+    """Nova versão com suporte a variações"""
+    nome_produto: str
+    categoria: str = ""
+    briefing_base: str = ""
+    responsavel_pd: str = ""
+    parametro_variacao: str = ""
+    tipo_amostra: str = ""
+    referencia_formula: str = ""
+    quantidade_por_variacao: Optional[float] = None
+    unidade_quantidade: str = "g"
+    prazo_entrega_cliente: str = ""
+    briefing_especifico: str = ""
+    feedback_cliente: str = ""
+    direcoes_retrabalho: str = ""
+    resultado: str = ""
+    # Campos de briefing herdados
+    produto: str = ""
+    objetivo_projeto: str = ""
+    aplicacoes_desenvolver: str = ""
+    ativos_claims: str = ""
+    referencias: str = ""
+    referencias_fotos: List[str] = []
+    orcamento_projeto: str = ""
+    textura_esperada: str = ""
+    aplicacao: str = ""
+    sensorial: str = ""
+    ph: str = ""
+    observacao_tecnica: str = ""
+    # Variações
+    variacoes: List[VariacaoItem] = []
+
+class SampleBatchCreateV2(BaseModel):
+    projeto_id: str
+    samples: List[SampleBatchItemV2]
+
+class VariacaoUpdate(BaseModel):
+    descricao_aplicacao: Optional[str] = None
+    percentual_fragrancia: Optional[float] = None
+    referencia_fragrancia: Optional[str] = None
+    custo_fragrancia: Optional[float] = None
+    observacoes_especificas: Optional[str] = None
+    feedback_cliente: Optional[str] = None
+
+class VariacaoMove(BaseModel):
+    status: str
+    motivo_retrabalho: Optional[str] = None
+    origem_retrabalho: Optional[str] = None
+
+class SKUUpdate(BaseModel):
+    preco_unitario: Optional[float] = None
+    moq: Optional[int] = None
+    anvisa_numero: Optional[str] = None
+    anvisa_validade: Optional[str] = None
+    status: Optional[str] = None
+
+class OrderAdd(BaseModel):
+    data_pedido: str
+    quantidade: int
+    valor_total: float
+    observacao: str = ""
+
+class AlertResolve(BaseModel):
+    comment: str = ""
+
+class FollowUpSchedule(BaseModel):
+    """Agendamento de follow-up manual (RN-FU-03)"""
+    client_id: str
+    data_follow_up: str  # ISO datetime
+    observacao: str = ""
+
+# ============ HELPER ============
+
+def _serialize(doc: dict) -> dict:
+    """Remove MongoDB _id from doc"""
+    if doc:
+        doc.pop("_id", None)
+    return doc
+
+async def _get_next_sample_number(projeto_id: str, tenant_id: str) -> int:
+    """Retorna o próximo número de amostra GLOBAL do tenant (ERP v3.0).
+    Mantém compat de assinatura: aceita projeto_id mas ignora — numeração é global."""
+    return await next_sample_number(tenant_id)
+
+def _generate_variacao_letra(index: int) -> str:
+    """Gera letra da variação (A, B, C, ..., Z, AA, AB, ...)"""
+    result = ""
+    while index >= 0:
+        result = chr(65 + (index % 26)) + result
+        index = index // 26 - 1
+    return result
+
+LEGACY_PROJECT_STAGE_ALIASES = {
+    "amostras": "amostra_solicitada",
+}
+
+def _normalize_project_stage(stage: Optional[str]) -> Optional[str]:
+    if not stage:
+        return stage
+    return LEGACY_PROJECT_STAGE_ALIASES.get(stage, stage)
+
+def _project_stage_rank(stage: Optional[str]) -> int:
+    normalized = _normalize_project_stage(stage)
+    order = [
+        "projeto_em_discussao",
+        "amostra_solicitada",
+        "amostra_em_desenvolvimento",
+        "amostra_enviada",
+        "em_negociacao",
+        "pedido_aprovado",
+        "projeto_arquivado",
+    ]
+    try:
+        return order.index(normalized)
+    except ValueError:
+        return -1
+
+def _business_days_before(date_str: str, days: int) -> Optional[datetime]:
+    if not date_str:
+        return None
+    raw = clean_text(date_str)
+    if not raw:
+        return None
+    try:
+        target = datetime.fromisoformat(raw)
+    except ValueError:
+        try:
+            target = datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            return None
+    current = target
+    remaining = max(days, 0)
+    while remaining > 0:
+        current -= timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+def _days_until(target: Optional[datetime]) -> Optional[int]:
+    if not target:
+        return None
+    now = datetime.now()
+    delta = target - now
+    return max(delta.days, 0)
+
+async def _create_project_deadline_alert_task(project: dict, user: dict):
+    prazo = clean_text(project.get("prazo_desejado_amostra", ""))
+    if not prazo:
+        return None
+    alert_date = _business_days_before(prazo, 3)
+    if not alert_date:
+        return None
+    due_in_days = _days_until(alert_date)
+    existing = await db.workflow_tasks.find_one(
+        {
+            "tenant_id": user["tenant_id"],
+            "entity_type": "project",
+            "entity_id": project["id"],
+            "title": "Prazo-alvo da amostra em 3 dias uteis",
+            "status": {"$in": ["pendente", "em_andamento"]},
+        },
+        {"_id": 0},
+    )
+    if existing:
+        return existing
+    return await create_workflow_task(
+        tenant_id=user["tenant_id"],
+        entity_type="project",
+        entity_id=project["id"],
+        title="Prazo-alvo da amostra em 3 dias uteis",
+        description=f"Alerta automatico para o prazo desejado de amostra ({prazo}).",
+        category="projeto",
+        blocking=False,
+        due_in_days=due_in_days if due_in_days is not None else 0,
+        responsible_id=project.get("responsavel_comercial") or project.get("created_by"),
+        created_by=user,
+        metadata={
+            "trigger": "prazo_desejado_amostra",
+            "prazo_desejado_amostra": prazo,
+            "alerta_para": alert_date.date().isoformat(),
+        },
+    )
+
+async def _advance_project_stage_if_needed(
+    project_id: str,
+    target_stage: str,
+    user: dict,
+    *,
+    movement_source: str,
+    extra_set: Optional[dict] = None,
+):
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        return None
+
+    old_stage = _normalize_project_stage(project.get("stage"))
+    new_stage = _normalize_project_stage(target_stage)
+    if not old_stage or not new_stage or old_stage == new_stage:
+        return project
+
+    allowed = [_normalize_project_stage(stage) for stage in PROJECT_TRANSITIONS.get(old_stage, [])]
+    if new_stage not in allowed:
+        return project
+
+    now = _now_iso()
+    movement = {
+        "de": old_stage,
+        "para": new_stage,
+        "data": now,
+        "usuario": user["name"],
+        "usuario_id": user["id"],
+        "origem": movement_source,
+    }
+
+    update_fields = {"stage": new_stage, "updated_at": now}
+    if extra_set:
+        update_fields.update(extra_set)
+
+    await db.crm_projects.update_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]},
+        {
+            "$set": update_fields,
+            "$push": {"historico_movimentacoes": movement},
+        },
+    )
+    updated = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="project",
+        entity_id=project_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_stage,
+        new_stage=new_stage,
+        user=user,
+    )
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="project_auto_moved",
+        entity_type="project",
+        entity_id=project_id,
+        before={"stage": old_stage},
+        after={"stage": new_stage},
+        metadata={
+            "source": movement_source,
+            "tasks_generated": [task["id"] for task in new_tasks],
+        },
+    )
+    return updated
+
+def _normalize_contact_payload(contact: Optional[dict]) -> dict:
+    payload = contact or {}
+    return {
+        "nome": clean_text(payload.get("nome", "")),
+        "whatsapp": normalize_phone(payload.get("whatsapp", "")),
+        "email": normalize_email(payload.get("email", "")),
+    }
+
+
+def _normalize_additional_contacts_payload(contacts: Optional[List[dict]]) -> List[dict]:
+    normalized = []
+    for item in contacts or []:
+        payload = item or {}
+        contact = {
+            "nome": clean_text(payload.get("nome", "")),
+            "cargo": clean_text(payload.get("cargo", "")).lower(),
+            "whatsapp": normalize_phone(payload.get("whatsapp", "")),
+            "email": normalize_email(payload.get("email", "")),
+        }
+        if any(contact.values()):
+            normalized.append(contact)
+    return normalized
+
+
+async def _validate_client_payload(
+    tenant_id: str,
+    payload: dict,
+    exclude_id: Optional[str] = None,
+    require_required_fields: bool = False,
+) -> dict:
+    payload["nome_empresa"] = clean_text(payload.get("nome_empresa", ""))
+    if not payload["nome_empresa"]:
+        raise HTTPException(status_code=400, detail="Nome da empresa Ã© obrigatÃ³rio")
+
+    payload["canal_origem"] = clean_text(payload.get("canal_origem", ""))
+    payload["origem_lead"] = clean_text(payload.get("origem_lead", ""))
+    payload["categoria_interesse"] = [clean_text(item) for item in (payload.get("categoria_interesse") or []) if clean_text(item)]
+    payload["contato_principal"] = _normalize_contact_payload(payload.get("contato_principal"))
+    payload["contatos_adicionais"] = _normalize_additional_contacts_payload(payload.get("contatos_adicionais"))
+    payload["temperatura_lead"] = clean_text(payload.get("temperatura_lead", "morno")).lower() or "morno"
+    payload["responsavel_comercial"] = clean_text(payload.get("responsavel_comercial", ""))
+    payload["segmento"] = clean_text(payload.get("segmento", "")).lower()
+    payload["porte"] = clean_text(payload.get("porte", "")).lower()
+    payload["regiao"] = clean_text(payload.get("regiao", "")).upper()
+    payload["site"] = clean_text(payload.get("site", ""))
+    payload["instagram"] = clean_text(payload.get("instagram", ""))
+    payload["observacoes"] = clean_text(payload.get("observacoes", ""))
+    for contact in payload["contatos_adicionais"]:
+        if contact["email"] and not is_valid_email(contact["email"]):
+            raise HTTPException(status_code=400, detail=f"E-mail invÃ¡lido em contato adicional: {contact['nome'] or contact['email']}")
+        if contact["whatsapp"] and not is_valid_phone(contact["whatsapp"]):
+            raise HTTPException(status_code=400, detail=f"WhatsApp invÃ¡lido em contato adicional: {contact['nome'] or contact['whatsapp']}")
+        if contact["cargo"] and contact["cargo"] not in CARGO_DECISOR_OPTIONS:
+            raise HTTPException(status_code=400, detail="Cargo invÃ¡lido em contato adicional")
+
+    cnpj_normalized = normalize_cnpj(payload.get("cnpj", ""))
+    payload["cnpj"] = clean_text(payload.get("cnpj", ""))
+    payload["cnpj_normalized"] = cnpj_normalized
+    if cnpj_normalized:
+        if not is_valid_cnpj(cnpj_normalized):
+            raise HTTPException(status_code=400, detail="CNPJ invÃ¡lido")
+        query = {"tenant_id": tenant_id, "cnpj_normalized": cnpj_normalized}
+        if exclude_id:
+            query["id"] = {"$ne": exclude_id}
+        existing = await db.crm_clients.find_one(query, {"_id": 0, "nome_empresa": 1})
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"CNPJ jÃ¡ cadastrado para o cliente '{existing.get('nome_empresa', '')}'.",
+            )
+
+    email = payload["contato_principal"].get("email")
+    whatsapp = payload["contato_principal"].get("whatsapp")
+    if email and not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="E-mail do contato principal invÃ¡lido")
+    if whatsapp and not is_valid_phone(whatsapp):
+        raise HTTPException(status_code=400, detail="Telefone/WhatsApp do contato principal invÃ¡lido")
+
+    if payload["canal_origem"] and payload["canal_origem"] not in CANAL_ORIGEM_OPTIONS:
+        raise HTTPException(status_code=400, detail="Canal de origem inválido")
+
+    # Validar categorias de interesse (2 níveis)
+    all_valid_categories = []
+    for category, subcategories in CATEGORIA_INTERESSE_OPTIONS.items():
+        all_valid_categories.append(category)
+        all_valid_categories.extend(subcategories)
+    
+    invalid_categories = [item for item in payload["categoria_interesse"] if item not in all_valid_categories]
+    if invalid_categories:
+        raise HTTPException(status_code=400, detail=f"Categoria(s) inválida(s): {', '.join(invalid_categories)}")
+
+    # Validar temperatura do lead
+    temperatura = payload.get("temperatura_lead", "morno")
+    if temperatura and temperatura not in TEMPERATURA_LEAD_OPTIONS:
+        raise HTTPException(status_code=400, detail="Temperatura do lead inválida")
+
+    # Validar segmento
+    segmento = payload.get("segmento", "")
+    if segmento and segmento not in SEGMENTO_CLIENTE_OPTIONS:
+        raise HTTPException(status_code=400, detail="Segmento inválido")
+
+    # Validar porte
+    porte = payload.get("porte", "")
+    if porte and porte not in PORTE_CLIENTE_OPTIONS:
+        raise HTTPException(status_code=400, detail="Porte inválido")
+
+    # Verificar se há categorias Grau 2 ANVISA e alertar
+    has_grau2 = any(cat in CATEGORIAS_GRAU2 for cat in payload["categoria_interesse"])
+    payload["has_grau2_anvisa"] = has_grau2
+
+    if payload["regiao"] and payload["regiao"] not in UF_OPTIONS:
+        raise HTTPException(status_code=400, detail="UF invÃ¡lida")
+
+    if payload["responsavel_comercial"]:
+        responsible = await db.users.find_one(
+            {"id": payload["responsavel_comercial"], "tenant_id": tenant_id},
+            {"_id": 0, "id": 1},
+        )
+        if not responsible:
+            raise HTTPException(status_code=400, detail="ResponsÃ¡vel comercial invÃ¡lido")
+
+    if require_required_fields:
+        missing = []
+        contact = payload["contato_principal"]
+        if not payload["cnpj"]:
+            missing.append("cnpj")
+        if not clean_text(contact.get("nome", "")):
+            missing.append("contato_principal.nome")
+        if not clean_text(contact.get("whatsapp", "")):
+            missing.append("contato_principal.whatsapp")
+        if not payload["canal_origem"]:
+            missing.append("canal_origem")
+        if not payload["categoria_interesse"]:
+            missing.append("categoria_interesse")
+        if not payload["temperatura_lead"]:
+            missing.append("temperatura_lead")
+        if not payload["responsavel_comercial"]:
+            missing.append("responsavel_comercial")
+        if not payload["segmento"]:
+            missing.append("segmento")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Campos obrigatÃ³rios ausentes: {', '.join(missing)}",
+            )
+
+    return payload
+
+
+def _validate_client_transition_requirements(client: dict, target_stage: str):
+    if target_stage != "qualificado":
+        return
+    missing = []
+    contact = client.get("contato_principal") or {}
+    if not client.get("canal_origem"):
+        missing.append("canal_origem")
+    if not client.get("categoria_interesse"):
+        missing.append("categoria_interesse")
+    if not clean_text(contact.get("nome", "")):
+        missing.append("contato_principal.nome")
+    if not contact.get("whatsapp"):
+        missing.append("contato_principal.whatsapp")
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Preencha os campos obrigatÃ³rios antes de avanÃ§ar: {', '.join(missing)}",
+        )
+
+
+def _validate_project_transition_requirements(project: dict, target_stage: str):
+    normalized_stage = _normalize_project_stage(target_stage)
+    if normalized_stage != "amostra_solicitada":
+        return
+    missing = []
+    if not clean_text(project.get("nome_projeto", "")):
+        missing.append("nome_projeto")
+    if not clean_text(project.get("categoria", "")):
+        missing.append("categoria")
+    if not clean_text(project.get("responsavel_comercial", "")):
+        missing.append("responsavel_comercial")
+    if not clean_text(project.get("ideia_conceito", "")) and not clean_text(project.get("briefing_tecnico", "")):
+        missing.append("ideia_conceito")
+    if not clean_text(project.get("posicionamento", "")):
+        missing.append("posicionamento")
+    if not project.get("volume_estimado_pedido"):
+        missing.append("volume_estimado_pedido")
+    if not clean_text(project.get("tipo_servico", "")):
+        missing.append("tipo_servico")
+    if not clean_text(project.get("prazo_desejado_amostra", "")) and not clean_text(project.get("prazo_prometido_cliente", "")):
+        missing.append("prazo_desejado_amostra")
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Preencha o prÃ©-briefing antes de avanÃ§ar: {', '.join(missing)}",
+        )
+
+# ======================================================================
+#  CRM 1 — CLIENTS (Pipeline Comercial)
+# ======================================================================
+
+@crm_router.post("/clients")
+async def create_client(data: ClientCreate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+    client_id = _new_id()
+
+    now = _now_iso()
+    create_payload = await _validate_client_payload(
+        user["tenant_id"],
+        {
+            "nome_empresa": data.nome_empresa,
+            "cnpj": data.cnpj,
+            "contato_principal": data.contato_principal.model_dump() if data.contato_principal else {"nome": "", "whatsapp": "", "email": ""},
+            "contatos_adicionais": [item.model_dump() for item in data.contatos_adicionais],
+            "canal_origem": data.canal_origem,
+            "categoria_interesse": data.categoria_interesse,
+            "origem_lead": data.origem_lead,
+            # Novos campos PRD
+            "temperatura_lead": data.temperatura_lead or "morno",
+            "responsavel_comercial": data.responsavel_comercial or user["id"],
+            "segmento": data.segmento or "outro",
+            "porte": data.porte,
+            "regiao": data.regiao,
+            "site": data.site,
+            "instagram": data.instagram,
+            "observacoes": data.observacoes,
+        },
+        require_required_fields=True,
+    )
+
+    client = {
+        "id": client_id,
+        "tenant_id": user["tenant_id"],
+        "stage": "prospeccao",
+        # Prospecção fields
+        "nome_empresa": create_payload["nome_empresa"],
+        "cnpj": create_payload["cnpj"],
+        "cnpj_normalized": create_payload["cnpj_normalized"],
+        "contato_principal": create_payload["contato_principal"],
+        "contatos_adicionais": create_payload["contatos_adicionais"],
+        "canal_origem": create_payload["canal_origem"],
+        "categoria_interesse": create_payload["categoria_interesse"],
+        "origem_lead": create_payload["origem_lead"],
+        # Novos campos PRD
+        "temperatura_lead": create_payload["temperatura_lead"],
+        "responsavel_comercial": create_payload["responsavel_comercial"],
+        "segmento": create_payload["segmento"],
+        "porte": create_payload["porte"],
+        "regiao": create_payload["regiao"],
+        "site": create_payload["site"],
+        "instagram": create_payload["instagram"],
+        "observacoes": create_payload["observacoes"],
+        "has_grau2_anvisa": create_payload.get("has_grau2_anvisa", False),
+        "ultima_atualizacao_temperatura": now,
+        # Qualificado fields (empty initially)
+        "decisores": [],
+        "tem_marca_propria": None,
+        "tem_anvisa": "",
+        "volume_estimado_mensal": "",
+        "fornecedor_atual": {"tem": False, "motivo_troca": ""},
+        "prazo_urgencia": None,
+        # Negociação fields (empty initially)
+        "amostras_aprovadas": [],
+        "valor_estimado_projeto": None,
+        "moq_negociado": "",
+        "condicao_pagamento": "",
+        "anvisa_necessario": {"necessario": False, "status": ""},
+        "concorrentes_envolvidos": [],
+        # Fechado fields (empty initially)
+        "data_pedido": None,
+        "skus_confirmados": [],
+        "valor_primeiro_pedido": None,
+        "previsao_segundo_pedido": None,
+        # Perdido
+        "motivo_perda": "",
+        # Meta
+        "historico_movimentacoes": [],
+        "created_by": user["id"],
+        "created_by_name": user["name"],
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db.crm_clients.insert_one(client)
+    initial_task = await create_workflow_task(
+        tenant_id=user["tenant_id"],
+        entity_type="client",
+        entity_id=client_id,
+        title="Realizar primeiro contato comercial",
+        description="Tarefa gerada automaticamente ao entrar em ProspecÃ§Ã£o.",
+        category="comercial",
+        blocking=False,
+        due_in_days=3,
+        responsible_id=client["responsavel_comercial"],
+        created_by=user,
+        metadata={"trigger": "client_created", "stage": "prospeccao"},
+    )
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="client_created",
+        entity_type="client",
+        entity_id=client_id,
+        after={"nome_empresa": client["nome_empresa"], "stage": client["stage"]},
+        metadata={"tasks_generated": [initial_task["id"]]},
+    )
+    return _serialize(client)
+
+
+@crm_router.get("/clients")
+async def list_clients(
+    request: Request,
+    stage: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    user = await _get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    if stage:
+        query["stage"] = stage
+    if search:
+        search = clean_text(search)
+        digits = normalize_phone(search)
+        query["$or"] = [
+            {"nome_empresa": {"$regex": search, "$options": "i"}},
+            {"cnpj": {"$regex": search, "$options": "i"}},
+            {"contato_principal.nome": {"$regex": search, "$options": "i"}},
+            {"contato_principal.email": {"$regex": search, "$options": "i"}},
+            {"categoria_interesse": {"$regex": search, "$options": "i"}},
+        ]
+        if digits:
+            query["$or"].extend([
+                {"cnpj_normalized": {"$regex": digits}},
+                {"contato_principal.whatsapp": {"$regex": digits}},
+            ])
+
+    clients = await db.crm_clients.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return clients
+
+
+@crm_router.get("/clients/{client_id}")
+async def get_client(client_id: str, request: Request):
+    user = await _get_current_user(request)
+    client = await db.crm_clients.find_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    return client
+
+
+@crm_router.put("/clients/{client_id}")
+async def update_client(client_id: str, data: ClientUpdate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+    existing = await db.crm_clients.find_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    update_fields = {}
+    for k, v in data.model_dump(exclude_unset=True).items():
+        if v is not None:
+            if isinstance(v, BaseModel):
+                update_fields[k] = v.model_dump()
+            else:
+                update_fields[k] = v
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    # RN-CL-04: Registrar data de atualização de temperatura
+    if "temperatura_lead" in update_fields:
+        update_fields["ultima_atualizacao_temperatura"] = _now_iso()
+
+    payload = dict(existing)
+    payload.update(update_fields)
+    payload = await _validate_client_payload(user["tenant_id"], payload, exclude_id=client_id)
+    for field in (
+        "nome_empresa",
+        "cnpj",
+        "cnpj_normalized",
+        "contato_principal",
+        "contatos_adicionais",
+        "canal_origem",
+        "categoria_interesse",
+        "origem_lead",
+        "temperatura_lead",
+        "responsavel_comercial",
+        "segmento",
+        "porte",
+        "regiao",
+        "site",
+        "instagram",
+        "observacoes",
+        "has_grau2_anvisa",
+    ):
+        if field in update_fields or field == "cnpj_normalized":
+            update_fields[field] = payload[field]
+
+    update_fields["updated_at"] = _now_iso()
+
+    result = await db.crm_clients.update_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]},
+        {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+
+    client = await db.crm_clients.find_one({"id": client_id}, {"_id": 0})
+    return client
+
+
+@crm_router.put("/clients/{client_id}/move")
+async def move_client(client_id: str, data: ClientMove, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+    client = await db.crm_clients.find_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+
+    old_stage = client["stage"]
+    new_stage = data.stage
+
+    if new_stage not in CLIENT_STAGES:
+        raise HTTPException(status_code=400, detail=f"Estágio inválido: {new_stage}")
+
+    allowed = CLIENT_TRANSITIONS.get(old_stage, [])
+    if new_stage not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transição não permitida: {STAGE_LABELS.get(old_stage)} → {STAGE_LABELS.get(new_stage)}"
+        )
+
+    # ERP v3.0: bloquear avanço se houver tarefas obrigatórias pendentes
+    _validate_client_transition_requirements(client, new_stage)
+    await assert_no_blocking_tasks(
+        tenant_id=user["tenant_id"],
+        entity_type="client",
+        entity_id=client_id,
+        target_stage=new_stage,
+    )
+
+    # Validate motivo_perda for cliente_perdido
+    if new_stage == "cliente_perdido" and not data.motivo_perda:
+        raise HTTPException(status_code=400, detail="Motivo da perda é obrigatório")
+
+    now = _now_iso()
+    if new_stage == "cliente_perdido" and clean_text(data.motivo_perda).lower() not in MOTIVO_PERDA_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Motivo da perda invÃ¡lido. Use: {', '.join(MOTIVO_PERDA_OPTIONS)}",
+        )
+
+    update_data = {
+        "stage": new_stage,
+        "updated_at": now,
+    }
+
+    if new_stage == "cliente_perdido" and data.motivo_perda:
+        update_data["motivo_perda"] = clean_text(data.motivo_perda).lower()
+
+    # Add to historico_movimentacoes
+    movement = {
+        "de": old_stage,
+        "para": new_stage,
+        "data": now,
+        "usuario": user["name"],
+        "usuario_id": user["id"],
+    }
+
+    await db.crm_clients.update_one(
+        {"id": client_id},
+        {
+            "$set": update_data,
+            "$push": {"historico_movimentacoes": movement}
+        }
+    )
+
+    updated = await db.crm_clients.find_one({"id": client_id}, {"_id": 0})
+
+    # ERP v3.0: trigger workflow tasks for the new stage
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="client",
+        entity_id=client_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_stage,
+        new_stage=new_stage,
+        user=user,
+    )
+
+    # ERP v3.0: immutable audit log of stage change
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="client_moved",
+        entity_type="client",
+        entity_id=client_id,
+        before={"stage": old_stage},
+        after={"stage": new_stage, "motivo_perda": update_data.get("motivo_perda")},
+        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+    )
+
+    # Determine if batch project creation is triggered
+    trigger_batch_projects = (new_stage == "projeto_em_discussao")
+
+    return {
+        "client": updated,
+        "trigger_batch_projects": trigger_batch_projects,
+        "from_stage": STAGE_LABELS.get(old_stage, old_stage),
+        "to_stage": STAGE_LABELS.get(new_stage, new_stage),
+        "tasks_generated": new_tasks,
+    }
+
+
+@crm_router.get("/clients/{client_id}/full")
+async def get_client_full(client_id: str, request: Request):
+    user = await _get_current_user(request)
+    client = await db.crm_clients.find_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+
+    projects = await db.crm_projects.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    samples = await db.crm_samples.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    skus = await db.skus.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    alerts = await db.crm_alerts.find(
+        {"tenant_id": user["tenant_id"], "entidade_ref": client_id, "status": {"$ne": "resolvido"}},
+        {"_id": 0}
+    ).to_list(100)
+
+    return {
+        "client": client,
+        "projects": projects,
+        "samples": samples,
+        "skus": skus,
+        "alerts": alerts,
+    }
+
+
+# ======================================================================
+#  CRM 2 — PROJECTS (Pipeline de Projetos)
+# ======================================================================
+
+@crm_router.post("/projects/batch")
+async def batch_create_projects(data: ProjectBatchCreate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+
+    # ERP v3.0: hierarchy lock — child cannot exist without parent
+    client = await assert_client_exists(user["tenant_id"], data.cliente_id)
+
+    if not data.projects:
+        raise HTTPException(status_code=400, detail="Nenhum projeto fornecido")
+
+    now = _now_iso()
+    created = []
+
+    for item in data.projects:
+        project_id = _new_id()
+        project = {
+            "id": project_id,
+            "tenant_id": user["tenant_id"],
+            "cliente_id": data.cliente_id,
+            "cliente_nome": client["nome_empresa"],
+            "stage": "projeto_em_discussao",
+            "nome_projeto": item.nome_projeto,
+            "categoria": item.categoria,
+            "briefing_tecnico": item.briefing_resumido,
+            "responsavel_comercial": item.responsavel_comercial or client.get("responsavel_comercial", ""),
+            "ideia_conceito": item.ideia_conceito,
+            "referencia_mercado": item.referencia_mercado,
+            "publico_alvo": item.publico_alvo,
+            "posicionamento": item.posicionamento,
+            "faixa_preco_venda": item.faixa_preco_venda,
+            "volume_estimado_pedido": item.volume_estimado_pedido,
+            "tipo_servico": item.tipo_servico,
+            "sensorial_desejado": item.sensorial_desejado,
+            "restricoes_tecnicas": item.restricoes_tecnicas,
+            "claims_desejados": item.claims_desejados,
+            "prazo_desejado_amostra": item.prazo_desejado_amostra,
+            "observacoes_livres": item.observacoes_livres,
+            "responsavel_interno": "",
+            "data_inicio_desenvolvimento": None,
+            "prazo_prometido_cliente": item.prazo_desejado_amostra or None,
+            "data_ultima_amostra_enviada": None,
+            "numero_amostras_solicitadas": 0,
+            "motivo_arquivamento": "",
+            "historico_movimentacoes": [],
+            "created_by": user["id"],
+            "created_by_name": user["name"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        # ERP v3.0: automatic inheritance from client
+        inherit(project, client, INHERITED_FROM_CLIENT)
+        await db.crm_projects.insert_one(project)
+        project.pop("_id", None)
+        viability_task = await create_workflow_task(
+            tenant_id=user["tenant_id"],
+            entity_type="project",
+            entity_id=project_id,
+            title="Validar viabilidade tecnica do pre-briefing",
+            description="Tarefa automatica ao criar projeto em discussao.",
+            category="pd_dev",
+            blocking=False,
+            due_in_days=2,
+            created_by=user,
+        )
+        deadline_task = await _create_project_deadline_alert_task(project, user)
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="project_created",
+            entity_type="project",
+            entity_id=project_id,
+            after={
+                "nome_projeto": project["nome_projeto"],
+                "cliente_id": data.cliente_id,
+                "stage": project["stage"],
+            },
+            metadata={
+                "tasks_generated": [
+                    task_id for task_id in [
+                        viability_task.get("id") if viability_task else None,
+                        deadline_task.get("id") if deadline_task else None,
+                    ] if task_id
+                ]
+            },
+        )
+        created.append(project)
+
+    logger.info(f"Batch created {len(created)} projects for client {data.cliente_id}")
+    return {"created": created, "count": len(created)}
+
+
+@crm_router.get("/projects")
+async def list_projects(
+    request: Request,
+    cliente_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    user = await _get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    if cliente_id:
+        query["cliente_id"] = cliente_id
+    if stage:
+        query["stage"] = _normalize_project_stage(stage)
+    if search:
+        query["$or"] = [
+            {"nome_projeto": {"$regex": search, "$options": "i"}},
+            {"cliente_nome": {"$regex": search, "$options": "i"}},
+            {"categoria": {"$regex": search, "$options": "i"}},
+            {"briefing_tecnico": {"$regex": search, "$options": "i"}},
+            {"ideia_conceito": {"$regex": search, "$options": "i"}},
+            {"publico_alvo": {"$regex": search, "$options": "i"}},
+            {"claims_desejados": {"$regex": search, "$options": "i"}},
+        ]
+
+    projects = await db.crm_projects.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return projects
+
+
+@crm_router.get("/projects/{project_id}")
+async def get_project(project_id: str, request: Request):
+    user = await _get_current_user(request)
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+    return project
+
+
+@crm_router.put("/projects/{project_id}")
+async def update_project(project_id: str, data: ProjectUpdate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+    update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    update_fields["updated_at"] = _now_iso()
+
+    result = await db.crm_projects.update_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]},
+        {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if project and update_fields.get("prazo_desejado_amostra"):
+        await _create_project_deadline_alert_task(project, user)
+    return project
+
+
+@crm_router.put("/projects/{project_id}/move")
+async def move_project(project_id: str, data: ProjectMove, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL)
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+    old_stage = _normalize_project_stage(project["stage"])
+    new_stage = _normalize_project_stage(data.stage)
+
+    if new_stage not in PROJECT_STAGES:
+        raise HTTPException(status_code=400, detail=f"Estágio inválido: {new_stage}")
+
+    allowed = [_normalize_project_stage(stage) for stage in PROJECT_TRANSITIONS.get(old_stage, [])]
+    if new_stage not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transição não permitida: {STAGE_LABELS.get(old_stage)} → {STAGE_LABELS.get(new_stage)}"
+        )
+    if new_stage == "pedido_aprovado":
+        from kickoff_routes import _resolve_registered_formula_for_project
+
+        await _resolve_registered_formula_for_project(project_id, user["tenant_id"])
+
+    _validate_project_transition_requirements(project, new_stage)
+    if new_stage == "projeto_arquivado" and not clean_text(data.motivo_arquivamento or ""):
+        raise HTTPException(status_code=400, detail="Motivo do arquivamento Ã© obrigatÃ³rio")
+    await assert_no_blocking_tasks(
+        tenant_id=user["tenant_id"],
+        entity_type="project",
+        entity_id=project_id,
+        target_stage=new_stage,
+    )
+
+    now = _now_iso()
+    movement = {
+        "de": old_stage,
+        "para": new_stage,
+        "data": now,
+        "usuario": user["name"],
+        "usuario_id": user["id"],
+    }
+
+    update_fields = {"stage": new_stage, "updated_at": now}
+    if new_stage == "amostra_em_desenvolvimento" and not project.get("data_inicio_desenvolvimento"):
+        update_fields["data_inicio_desenvolvimento"] = now
+    if new_stage == "amostra_enviada":
+        update_fields["data_ultima_amostra_enviada"] = now
+    if new_stage == "projeto_arquivado":
+        update_fields["motivo_arquivamento"] = clean_text(data.motivo_arquivamento or "")
+
+    await db.crm_projects.update_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]},
+        {
+            "$set": update_fields,
+            "$push": {"historico_movimentacoes": movement}
+        }
+    )
+
+    updated = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if new_stage == "amostra_solicitada":
+        await _create_project_deadline_alert_task(updated, user)
+
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="project",
+        entity_id=project_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_stage,
+        new_stage=new_stage,
+        user=user,
+    )
+    kickoff_created = None
+    kickoff_tasks = []
+    if new_stage == "pedido_aprovado":
+        from kickoff_routes import create_kickoff_for_project
+
+        kickoff = await create_kickoff_for_project(project_id, user)
+        kickoff_created = {
+            "kickoff_id": kickoff["id"],
+            "numero_kickoff": kickoff["numero_kickoff"],
+        }
+        kickoff_tasks.append({"tipo": "preencher_kickoff_bloco2", "responsavel": "comercial"})
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="project_moved",
+        entity_type="project",
+        entity_id=project_id,
+        before={"stage": old_stage},
+        after={"stage": new_stage, "motivo_arquivamento": update_fields.get("motivo_arquivamento")},
+        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+    )
+
+    trigger_batch_samples = (new_stage == "amostra_solicitada")
+
+    return {
+        "project": updated,
+        "trigger_batch_samples": trigger_batch_samples,
+        "from_stage": STAGE_LABELS.get(old_stage, old_stage),
+        "to_stage": STAGE_LABELS.get(new_stage, new_stage),
+        "tasks_generated": new_tasks,
+        "kickoff_criado": kickoff_created,
+        "tarefas_criadas": kickoff_tasks,
+    }
+
+
+@crm_router.get("/projects/{project_id}/full")
+async def get_project_full(project_id: str, request: Request):
+    user = await _get_current_user(request)
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+    client = await db.crm_clients.find_one(
+        {"id": project["cliente_id"]}, {"_id": 0}
+    )
+
+    samples = await db.crm_samples.find(
+        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    skus = await db.skus.find(
+        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    # Enrich each variation with live P&D status
+    all_card_ids = []
+    for s in samples:
+        for v in s.get("variacoes", []) or []:
+            if v.get("pd_card_id"):
+                all_card_ids.append(v["pd_card_id"])
+
+    if all_card_ids:
+        pd_cards_docs = await db.pd_cards.find(
+            {"id": {"$in": all_card_ids}, "tenant_id": user["tenant_id"]},
+            {"_id": 0, "id": 1, "pd_request_id": 1, "status_pd": 1}
+        ).to_list(1000)
+        cards_map = {c["id"]: c for c in pd_cards_docs}
+
+        req_ids = list({c["pd_request_id"] for c in pd_cards_docs if c.get("pd_request_id")})
+        reqs_map: Dict[str, Any] = {}
+        if req_ids:
+            reqs_docs = await db.pd_requests.find(
+                {"id": {"$in": req_ids}, "tenant_id": user["tenant_id"]},
+                {"_id": 0, "id": 1, "status": 1, "updated_at": 1, "project_name": 1}
+            ).to_list(500)
+            reqs_map = {r["id"]: r for r in reqs_docs}
+
+        for s in samples:
+            for v in s.get("variacoes", []) or []:
+                card = cards_map.get(v.get("pd_card_id"))
+                if card:
+                    req = reqs_map.get(card.get("pd_request_id"), {})
+                    v["pd_request_id"] = card.get("pd_request_id")
+                    v["pd_status"] = req.get("status")
+                    v["pd_status_pd"] = card.get("status_pd")
+                    v["pd_updated_at"] = req.get("updated_at")
+
+    return {
+        "project": project,
+        "client": client,
+        "samples": samples,
+        "skus": skus,
+    }
+
+
+@crm_router.delete("/projects/{project_id}")
+async def delete_project(project_id: str, request: Request):
+    """Deleta um projeto em cascata (samples + variações + pd_cards).
+    Bloqueia se houver SKU já gerado a partir deste projeto."""
+    user = await _get_current_user(request)
+    require_roles(user, ADMIN_ONLY | {"sales_ops"})
+    project = await db.crm_projects.find_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+    # Bloquear se houver SKU vinculado
+    sku_count = await db.skus.count_documents(
+        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}
+    )
+    if sku_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não é possível excluir: existem {sku_count} SKU(s) gerados a partir deste projeto."
+        )
+
+    # Coletar samples e pd_cards para deletar
+    samples = await db.crm_samples.find(
+        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0, "id": 1, "variacoes": 1}
+    ).to_list(5000)
+
+    sample_ids = [s["id"] for s in samples]
+    pd_card_ids = []
+    for s in samples:
+        for v in s.get("variacoes", []) or []:
+            if v.get("pd_card_id"):
+                pd_card_ids.append(v["pd_card_id"])
+
+    # Apagar pd_cards vinculados
+    if pd_card_ids:
+        await db.pd_cards.delete_many(
+            {"id": {"$in": pd_card_ids}, "tenant_id": user["tenant_id"]}
+        )
+    # Apagar samples
+    if sample_ids:
+        await db.crm_samples.delete_many(
+            {"id": {"$in": sample_ids}, "tenant_id": user["tenant_id"]}
+        )
+    # Apagar projeto
+    await db.crm_projects.delete_one(
+        {"id": project_id, "tenant_id": user["tenant_id"]}
+    )
+
+    logger.info(f"Deleted project {project_id} (samples={len(sample_ids)}, pd_cards={len(pd_card_ids)})")
+    return {
+        "deleted_project": project_id,
+        "deleted_samples": len(sample_ids),
+        "deleted_pd_cards": len(pd_card_ids),
+    }
+
+
+# ======================================================================
+#  CRM 3 — SAMPLES (Pipeline de Amostras)
+# ======================================================================
+
+@crm_router.post("/samples/batch")
+async def batch_create_samples(data: SampleBatchCreate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
+
+    # Verify project exists
+    project = await db.crm_projects.find_one(
+        {"id": data.projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+
+    if not data.samples:
+        raise HTTPException(status_code=400, detail="Nenhuma amostra fornecida")
+
+    now = _now_iso()
+    created = []
+
+    for item in data.samples:
+        if item.tipo_amostra == "adaptacao_de_formula" and not clean_text(item.referencia_formula):
+            raise HTTPException(status_code=400, detail="referencia_formula Ã© obrigatÃ³ria para adaptaÃ§Ã£o de fÃ³rmula")
+        sample_id = _new_id()
+        sample = {
+            "id": sample_id,
+            "tenant_id": user["tenant_id"],
+            "projeto_id": data.projeto_id,
+            "projeto_nome": project["nome_projeto"],
+            "cliente_id": project["cliente_id"],
+            "cliente_nome": project.get("cliente_nome", ""),
+            "stage": "solicitada",
+            "nome_amostra": item.nome_amostra,
+            "codigo_referencia": item.codigo_referencia,
+            "observacao_tecnica": item.observacao_tecnica,
+            "responsavel_pd": "",
+            "data_envio": None,
+            "motivo_retrabalho": "",
+            "historico_retrabalhos": [],
+            "feedback_cliente": "",
+            # Novos campos de briefing
+            "produto": item.produto,
+            "objetivo_projeto": item.objetivo_projeto,
+            "aplicacoes_desenvolver": item.aplicacoes_desenvolver,
+            "ativos_claims": item.ativos_claims,
+            "referencias": item.referencias,
+            "referencias_fotos": item.referencias_fotos,
+            "orcamento_projeto": item.orcamento_projeto,
+            "textura_esperada": item.textura_esperada,
+            "aplicacao": item.aplicacao,
+            "sensorial": item.sensorial,
+            "ph": item.ph,
+            "historico_movimentacoes": [],
+            "created_by": user["id"],
+            "created_by_name": user["name"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        await db.crm_samples.insert_one(sample)
+        sample.pop("_id", None)
+        created.append(sample)
+
+    logger.info(f"Batch created {len(created)} samples for project {data.projeto_id}")
+    return {"created": created, "count": len(created)}
+
+
+@crm_router.post("/samples/upload-image")
+async def upload_sample_image(request: Request, file: UploadFile = File(...)):
+    """Upload image for sample reference"""
+    user = await _get_current_user(request)
+    
+    # Validate file type
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido. Use: JPG, PNG ou WEBP")
+    
+    # Create upload directory if not exists
+    upload_dir = Path("/app/uploads/sample_images")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate unique filename
+    file_ext = file.filename.split(".")[-1]
+    unique_filename = f"{_new_id()}.{file_ext}"
+    file_path = upload_dir / unique_filename
+    
+    # Save file
+    try:
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        # Return URL path
+        file_url = f"/uploads/sample_images/{unique_filename}"
+        return {"url": file_url, "filename": unique_filename}
+    except Exception as e:
+        logger.error(f"Error uploading image: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao fazer upload da imagem")
+
+
+@crm_router.post("/samples/batch/v2")
+async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
+    """Criar amostras em lote com suporte a variações (ERP v3.0: numeração GLOBAL)."""
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
+
+    # ERP v3.0: hierarchy lock
+    project = await assert_project_exists(user["tenant_id"], data.projeto_id)
+
+    if not data.samples:
+        raise HTTPException(status_code=400, detail="Nenhuma amostra fornecida")
+
+    now = _now_iso()
+    created_samples = []
+
+    for item in data.samples:
+        # ERP v3.0: numeração GLOBAL sequencial (counter atômico no tenant)
+        numero_amostra = await _get_next_sample_number(data.projeto_id, user["tenant_id"])
+        
+        # Criar amostra pai
+        sample_id = _new_id()
+        
+        # Criar variações
+        variacoes_data = []
+        for idx, var in enumerate(item.variacoes):
+            letra = _generate_variacao_letra(idx)
+            codigo = f"{numero_amostra}/{letra}"
+            variacao_id = _new_id()
+            
+            variacao = {
+                "id": variacao_id,
+                "codigo": codigo,
+                "letra": letra,
+                "descricao_aplicacao": var.descricao_aplicacao,
+                "percentual_fragrancia": var.percentual_fragrancia,
+                "referencia_fragrancia": var.referencia_fragrancia,
+                "custo_fragrancia": var.custo_fragrancia,
+                "observacoes_especificas": var.observacoes_especificas,
+                "status": "solicitada",
+                "historico_status": [{
+                    "de": "",
+                    "para": "solicitada",
+                    "data": now,
+                    "usuario": user["name"],
+                    "usuario_id": user["id"]
+                }],
+                "motivo_retrabalho": "",
+                "historico_retrabalhos": [],
+                "feedback_cliente": "",
+                "direcoes_retrabalho": "",
+                "resultado": "",
+                "gera_sku": False,
+                "sku_id": None,
+                "pd_card_id": None  # Será preenchido quando criar o card no P&D
+            }
+            variacoes_data.append(variacao)
+        
+        # Se não houver variações, criar uma padrão
+        if not variacoes_data:
+            letra = "A"
+            codigo = f"{numero_amostra}/{letra}"
+            variacao_id = _new_id()
+            variacao = {
+                "id": variacao_id,
+                "codigo": codigo,
+                "letra": letra,
+                "descricao_aplicacao": "",
+                "percentual_fragrancia": None,
+                "referencia_fragrancia": "",
+                "custo_fragrancia": None,
+                "observacoes_especificas": "",
+                "status": "solicitada",
+                "historico_status": [{
+                    "de": "",
+                    "para": "solicitada",
+                    "data": now,
+                    "usuario": user["name"],
+                    "usuario_id": user["id"]
+                }],
+                "motivo_retrabalho": "",
+                "historico_retrabalhos": [],
+                "feedback_cliente": "",
+                "direcoes_retrabalho": "",
+                "resultado": "",
+                "gera_sku": False,
+                "sku_id": None,
+                "pd_card_id": None
+            }
+            variacoes_data.append(variacao)
+        
+        sample = {
+            "id": sample_id,
+            "tenant_id": user["tenant_id"],
+            "projeto_id": data.projeto_id,
+            "projeto_nome": project["nome_projeto"],
+            "cliente_id": project["cliente_id"],
+            "cliente_nome": project.get("cliente_nome", ""),
+            "numero_amostra": str(numero_amostra),
+            "nome_produto": item.nome_produto,
+            "categoria": item.categoria,
+            "briefing_base": item.briefing_base,
+            "responsavel_pd": item.responsavel_pd,
+            "parametro_variacao": item.parametro_variacao,
+            "tipo_amostra": item.tipo_amostra,
+            "referencia_formula": item.referencia_formula,
+            "quantidade_por_variacao": item.quantidade_por_variacao,
+            "unidade_quantidade": item.unidade_quantidade,
+            "prazo_entrega_cliente": item.prazo_entrega_cliente,
+            "briefing_especifico": item.briefing_especifico,
+            "feedback_cliente": item.feedback_cliente,
+            "direcoes_retrabalho": item.direcoes_retrabalho,
+            "resultado": item.resultado,
+            "data_envio": None,
+            "tem_variacoes": len(variacoes_data) > 1,
+            "variacoes": variacoes_data,
+            # Campos de briefing (herdados pelas variações)
+            "produto": item.produto,
+            "objetivo_projeto": item.objetivo_projeto,
+            "aplicacoes_desenvolver": item.aplicacoes_desenvolver,
+            "ativos_claims": item.ativos_claims,
+            "referencias": item.referencias,
+            "referencias_fotos": item.referencias_fotos,
+            "orcamento_projeto": item.orcamento_projeto,
+            "textura_esperada": item.textura_esperada,
+            "aplicacao": item.aplicacao,
+            "sensorial": item.sensorial,
+            "ph": item.ph,
+            "observacao_tecnica": item.observacao_tecnica,
+            "stage": "solicitada",
+            "rework_de_amostra_id": None,
+            "rework_motivo": "",
+            "created_by": user["id"],
+            "created_by_name": user["name"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        # ERP v3.0: inheritance from project (categoria, briefing if missing)
+        inherit(sample, project, INHERITED_FROM_PROJECT)
+
+        await db.crm_samples.insert_one(sample)
+        sample.pop("_id", None)
+
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="sample_created",
+            entity_type="sample",
+            entity_id=sample_id,
+            after={
+                "numero_amostra": sample["numero_amostra"],
+                "projeto_id": data.projeto_id,
+                "cliente_id": project["cliente_id"],
+                "nome_produto": sample["nome_produto"],
+                "variacoes": [v["codigo"] for v in variacoes_data],
+            },
+        )
+
+        created_samples.append(sample)
+
+        # Criar cards no P&D para cada variação
+        for variacao in variacoes_data:
+            await _create_pd_card_for_variacao(sample, variacao, user)
+
+    if _project_stage_rank(project.get("stage")) < _project_stage_rank("amostra_solicitada"):
+        await _advance_project_stage_if_needed(
+            data.projeto_id,
+            "amostra_solicitada",
+            user,
+            movement_source="sample_batch_created",
+        )
+
+    logger.info(f"Batch created {len(created_samples)} samples (v2) with variations for project {data.projeto_id}")
+    return {"created": created_samples, "count": len(created_samples)}
+
+
+async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
+    """Garante que existe um pd_request linkado ao pd_card. Retorna o pd_request_id.
+    Cria sob demanda quando o card é proveniente de variação CRM (sem pd_request prévio).
+    Permite que o clique no card P&D abra a tela completa de PDDetail (/pd/{id}).
+    """
+    existing_id = card.get("pd_request_id")
+    if existing_id:
+        # Backfill: garantir que development + fórmula inicial existem
+        # (cards criados antes do bootstrap automático ainda podem estar sem dev)
+        try:
+            existing_dev = await db.pd_developments.find_one(
+                {"pd_request_id": existing_id, "tenant_id": user["tenant_id"]}
+            )
+            if not existing_dev and card.get("amostra_id") and card.get("amostra_variacao_id"):
+                await _bootstrap_pd_development_for_variacao(
+                    pd_request_id=existing_id, card=card, user=user
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Backfill bootstrap failed for pd_request {existing_id}: {exc}")
+        return existing_id
+
+    now = _now_iso()
+    req_id = _new_id()
+
+    sample_id = card.get("amostra_id")
+    variacao_id = card.get("amostra_variacao_id")
+    cliente_id = card.get("cliente_id")
+
+    # Build a description from briefing data so the operator sees everything
+    desc_parts = []
+    if card.get("objetivo_projeto"):
+        desc_parts.append(f"Objetivo: {card['objetivo_projeto']}")
+    if card.get("textura_esperada"):
+        desc_parts.append(f"Textura: {card['textura_esperada']}")
+    if card.get("aplicacao"):
+        desc_parts.append(f"Aplicação: {card['aplicacao']}")
+    if card.get("sensorial"):
+        desc_parts.append(f"Sensorial: {card['sensorial']}")
+    if card.get("ph"):
+        desc_parts.append(f"pH: {card['ph']}")
+    if card.get("ativos_claims"):
+        desc_parts.append(f"Ativos/Claims: {card['ativos_claims']}")
+    if card.get("aplicacoes_desenvolver"):
+        desc_parts.append(f"Aplicações a desenvolver: {card['aplicacoes_desenvolver']}")
+    if card.get("briefing_base"):
+        desc_parts.append(f"\nBriefing base:\n{card['briefing_base']}")
+    if card.get("briefing_especifico"):
+        desc_parts.append(f"\nBriefing específico:\n{card['briefing_especifico']}")
+    if card.get("descricao_aplicacao"):
+        desc_parts.append(f"\nDescrição da aplicação (variação): {card['descricao_aplicacao']}")
+    if card.get("observacoes_especificas"):
+        desc_parts.append(f"Observações específicas: {card['observacoes_especificas']}")
+
+    description = "\n".join(desc_parts).strip()
+
+    # Volume from sample
+    volume_str = ""
+    if card.get("quantidade_por_variacao"):
+        volume_str = f"{card['quantidade_por_variacao']}{card.get('unidade_quantidade', 'g')}"
+
+    pd_request = {
+        "id": req_id,
+        "tenant_id": user["tenant_id"],
+        "client_card_id": None,  # CRM v3 uses crm_clients (not cards). Set null.
+        "client_name": card.get("cliente", ""),
+        "project_name": card.get("projeto_nome") or card.get("produto") or variacao_id or req_id,
+        "technical_name": f"{card.get('produto', '')} - {card.get('numero_completo', '')}".strip(" -"),
+        "commercial_name": card.get("produto", ""),
+        "internal_code": card.get("numero_completo", ""),
+        "request_type": "Amostra",
+        "category": card.get("tipo_amostra", ""),
+        "description": description,
+        "references": card.get("referencias", ""),
+        "restrictions": "",
+        "volume": volume_str,
+        "packaging": "",
+        "priority": "Normal",
+        "deadline": card.get("prazo_entrega_cliente") or None,
+        "status": "OPEN",
+        "is_internal_research": False,
+        "kickoff_completed": False,
+        # Link back to CRM source
+        "linked_amostra_id": sample_id,
+        "linked_variacao_id": variacao_id,
+        "linked_cliente_id": cliente_id,
+        "linked_projeto_id": card.get("projeto_id"),
+        "linked_pd_card_id": card.get("id"),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db.pd_requests.insert_one(pd_request)
+    await db.pd_request_status_history.insert_one({
+        "id": _new_id(),
+        "pd_request_id": req_id,
+        "from_status": None,
+        "to_status": "OPEN",
+        "changed_by": user["id"],
+        "changed_by_name": user.get("name", ""),
+        "comment": "Criado automaticamente a partir de variação CRM",
+        "created_at": now,
+    })
+
+    # Link card -> pd_request
+    await db.pd_cards.update_one(
+        {"id": card["id"], "tenant_id": user["tenant_id"]},
+        {"$set": {"pd_request_id": req_id, "updated_at": now}},
+    )
+    card["pd_request_id"] = req_id
+
+    # Auto-create development + initial formula pre-filled with briefing data
+    # so the operator only needs to add raw materials/ingredients
+    try:
+        await _bootstrap_pd_development_for_variacao(
+            pd_request_id=req_id, card=card, user=user
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f"Failed to bootstrap dev/formula for pd_request {req_id}: {exc}")
+
+    logger.info(f"Auto-created pd_request {req_id} for pd_card {card.get('id')} (variação {card.get('numero_completo')})")
+    return req_id
+
+
+async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict, user: dict):
+    """Cria development + fórmula v1 pré-preenchida a partir da variação CRM.
+    Inclui a fragrância da variação como primeiro item (P&D só adiciona MPs/insumos).
+    """
+    sample_id = card.get("amostra_id")
+    variacao_id = card.get("amostra_variacao_id")
+    if not sample_id or not variacao_id:
+        return
+
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        return
+    variacao = next(
+        (v for v in sample.get("variacoes", []) if v.get("id") == variacao_id), None
+    )
+    if not variacao:
+        return
+
+    now = _now_iso()
+
+    # Move pd_request to IN_PROGRESS so the dev/formula appear active
+    await db.pd_requests.update_one(
+        {"id": pd_request_id, "tenant_id": user["tenant_id"]},
+        {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+    )
+    await db.pd_request_status_history.insert_one({
+        "id": _new_id(),
+        "pd_request_id": pd_request_id,
+        "from_status": "OPEN",
+        "to_status": "IN_PROGRESS",
+        "changed_by": user["id"],
+        "changed_by_name": user.get("name", ""),
+        "comment": "Bootstrap automático: desenvolvimento + fórmula inicial criados a partir do briefing CRM",
+        "created_at": now,
+    })
+
+    # 1) Development
+    dev_id = _new_id()
+    await db.pd_developments.insert_one({
+        "id": dev_id,
+        "pd_request_id": pd_request_id,
+        "tenant_id": user["tenant_id"],
+        "assigned_to": user["id"],
+        "assigned_to_name": user.get("name", ""),
+        "lab_responsible": None,
+        "current_version": 1,
+        "status": "active",
+        "started_at": now,
+        "completed_at": None,
+    })
+
+    # 2) Initial formula pre-filled
+    quantidade = sample.get("quantidade_por_variacao") or 0.0
+    unidade = (sample.get("unidade_quantidade") or "g").lower()
+    if unidade in ("ml", "l"):
+        volume_unit = "mL" if unidade == "ml" else "L"
+    elif unidade in ("g", "kg"):
+        volume_unit = unidade
+    else:
+        volume_unit = "g"
+
+    notes_lines = [
+        "Pré-preenchido automaticamente a partir do briefing CRM.",
+        "→ P&D: adicionar MPs/insumos/ingredientes. Fragrância já está como item nº 1.",
+        "",
+    ]
+    if sample.get("ph"):
+        notes_lines.append(f"pH alvo: {sample['ph']}")
+    if sample.get("textura_esperada"):
+        notes_lines.append(f"Textura esperada: {sample['textura_esperada']}")
+    if sample.get("sensorial"):
+        notes_lines.append(f"Sensorial: {sample['sensorial']}")
+    if sample.get("aplicacao"):
+        notes_lines.append(f"Aplicação: {sample['aplicacao']}")
+    if sample.get("ativos_claims"):
+        notes_lines.append(f"Ativos/Claims obrigatórios: {sample['ativos_claims']}")
+    if sample.get("orcamento_projeto"):
+        notes_lines.append(f"Orçamento alvo: {sample['orcamento_projeto']}")
+    if variacao.get("descricao_aplicacao"):
+        notes_lines.append("")
+        notes_lines.append(f"Variação {variacao.get('codigo', '')}: {variacao['descricao_aplicacao']}")
+    if variacao.get("observacoes_especificas"):
+        notes_lines.append(f"Observações específicas: {variacao['observacoes_especificas']}")
+
+    formula_id = _new_id()
+    formula_name = f"Manipulação {variacao.get('codigo', '')} — {sample.get('nome_produto', '')} v1".strip()
+    await db.pd_formulas.insert_one({
+        "id": formula_id,
+        "tenant_id": user["tenant_id"],
+        "development_id": dev_id,
+        "version": 1,
+        "name": formula_name,
+        "notes": "\n".join(notes_lines).strip(),
+        "volume": float(quantidade or 0.0),
+        "volume_unit": volume_unit,
+        "indice_perdas": 0.0,
+        "cotacao_usd": 6.00,
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "created_at": now,
+    })
+
+    # 3) Fragrance pre-filled as first item (if available)
+    if variacao.get("percentual_fragrancia") is not None and float(variacao.get("percentual_fragrancia") or 0) > 0:
+        ref_frag = variacao.get("referencia_fragrancia") or "Fragrância da variação"
+        pct = float(variacao.get("percentual_fragrancia") or 0)
+        custo_kg = float(variacao.get("custo_fragrancia") or 0)
+        cotacao = 6.00
+        cost_brl = round((pct / 100.0) * custo_kg, 4)
+        cost_kg_usd = round((custo_kg / cotacao) if cotacao else 0.0, 4)
+        item_id = _new_id()
+        await db.pd_formula_items.insert_one({
+            "id": item_id,
+            "formula_id": formula_id,
+            "ingredient_name": ref_frag,
+            "percentage": pct,
+            "price_per_kg": custo_kg,
+            "cost_brl": cost_brl,
+            "cost_kg_usd": cost_kg_usd,
+            "fornecedor": "",
+            "phase": "Fragrância",
+            "function": "Fragrância",
+            "catalog_id": None,
+        })
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="pd_dev_bootstrap_from_variacao",
+        entity_type="pd_request",
+        entity_id=pd_request_id,
+        after={
+            "development_id": dev_id,
+            "formula_id": formula_id,
+            "variacao_codigo": variacao.get("codigo"),
+            "amostra_id": sample_id,
+        },
+    )
+
+
+async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict):
+    """Cria um card no Pipeline P&D para uma variação de amostra (ERP v3.0)."""
+    now = _now_iso()
+    card_id = _new_id()
+    
+    card = {
+        "id": card_id,
+        "tenant_id": user["tenant_id"],
+        "tipo": "amostra",
+        "numero_completo": variacao["codigo"],
+        "produto": sample.get("nome_produto", sample.get("produto", "")),
+        "cliente": sample.get("cliente_nome", ""),
+        "cliente_id": sample.get("cliente_id"),
+        "projeto_id": sample.get("projeto_id"),
+        "projeto_nome": sample.get("projeto_nome", ""),
+        "amostra_id": sample["id"],
+        "amostra_numero": sample.get("numero_amostra", ""),
+        "amostra_variacao_id": variacao["id"],
+        "descricao_aplicacao": variacao.get("descricao_aplicacao", ""),
+        "briefing_base": sample.get("briefing_base", ""),
+        "parametro_variacao": sample.get("parametro_variacao", ""),
+        "tipo_amostra": sample.get("tipo_amostra", ""),
+        "referencia_formula": sample.get("referencia_formula", ""),
+        "quantidade_por_variacao": sample.get("quantidade_por_variacao"),
+        "unidade_quantidade": sample.get("unidade_quantidade", ""),
+        "prazo_entrega_cliente": sample.get("prazo_entrega_cliente", ""),
+        "briefing_especifico": sample.get("briefing_especifico", ""),
+        "feedback_cliente": variacao.get("feedback_cliente") or sample.get("feedback_cliente", ""),
+        "direcoes_retrabalho": variacao.get("direcoes_retrabalho") or sample.get("direcoes_retrabalho", ""),
+        # ERP v3.0: inheritance from sample (briefing técnico, ph, sensorial, etc.)
+        "objetivo_projeto": sample.get("objetivo_projeto", ""),
+        "aplicacoes_desenvolver": sample.get("aplicacoes_desenvolver", ""),
+        "ativos_claims": sample.get("ativos_claims", ""),
+        "referencias": sample.get("referencias", ""),
+        "textura_esperada": sample.get("textura_esperada", ""),
+        "aplicacao": sample.get("aplicacao", ""),
+        "sensorial": sample.get("sensorial", ""),
+        "ph": sample.get("ph", ""),
+        "observacoes_especificas": variacao.get("observacoes_especificas", ""),
+        "responsavel_pd": sample.get("responsavel_pd", ""),
+        "data_solicitacao": now,
+        "prazo_prometido": None,
+        "status_pd": "solicitado",
+        "historico_movimentacoes": [{
+            "de": "",
+            "para": "solicitado",
+            "data": now,
+            "usuario": user["name"],
+            "usuario_id": user["id"]
+        }],
+        "created_by": user["id"],
+        "created_by_name": user["name"],
+        "created_at": now,
+        "updated_at": now,
+    }
+    
+    await db.pd_cards.insert_one(card)
+    
+    # Atualizar variação com o card_id
+    await db.crm_samples.update_one(
+        {"id": sample["id"], "variacoes.id": variacao["id"]},
+        {"$set": {"variacoes.$.pd_card_id": card_id}}
+    )
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="pd_card_auto_created",
+        entity_type="pd_card",
+        entity_id=card_id,
+        after={
+            "numero_completo": variacao["codigo"],
+            "amostra_id": sample["id"],
+            "variacao_id": variacao["id"],
+            "trigger": "sample_creation",
+        },
+    )
+
+    logger.info(f"Created P&D card {card_id} for variação {variacao['codigo']}")
+    # pd_request é criado sob demanda quando o formulador abre o card (GET /pd/cards/{id}).
+    # Não criamos aqui para evitar o log "Auto-created pd_request" em toda variação CRM.
+
+
+@crm_router.get("/samples")
+async def list_samples(
+    request: Request,
+    projeto_id: Optional[str] = None,
+    cliente_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    user = await _get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    if projeto_id:
+        query["projeto_id"] = projeto_id
+    if cliente_id:
+        query["cliente_id"] = cliente_id
+    if stage:
+        query["stage"] = stage
+    if search:
+        query["$or"] = [
+            {"nome_amostra": {"$regex": search, "$options": "i"}},
+            {"nome_produto": {"$regex": search, "$options": "i"}},
+            {"numero_amostra": {"$regex": search, "$options": "i"}},
+            {"projeto_nome": {"$regex": search, "$options": "i"}},
+            {"cliente_nome": {"$regex": search, "$options": "i"}},
+            {"variacoes.codigo": {"$regex": search, "$options": "i"}},
+            {"variacoes.descricao_aplicacao": {"$regex": search, "$options": "i"}},
+        ]
+
+    samples = await db.crm_samples.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return samples
+
+
+@crm_router.get("/samples/{sample_id}")
+async def get_sample(sample_id: str, request: Request):
+    user = await _get_current_user(request)
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+    return sample
+
+
+@crm_router.put("/samples/{sample_id}")
+async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
+    update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    update_fields["updated_at"] = _now_iso()
+
+    result = await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]},
+        {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    return sample
+
+
+@crm_router.put("/samples/{sample_id}/move")
+async def move_sample(sample_id: str, data: SampleMove, request: Request):
+    user = await _get_current_user(request)
+    require_roles(user, COMERCIAL_FULL | PD_FULL)
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    old_stage = sample.get("stage", "solicitada")
+    new_stage = data.stage
+
+    if new_stage not in SAMPLE_STAGES:
+        raise HTTPException(status_code=400, detail=f"Estágio inválido: {new_stage}")
+
+    # ERP v3.0: Retrabalho NÃO é uma transição de estágio simples — exige criar NOVA amostra.
+    if new_stage == "retrabalho":
+        raise HTTPException(
+            status_code=400,
+            detail="Retrabalho deve gerar nova amostra (use POST /samples/{id}/rework). "
+                   "Variações usam #N/letra; retrabalho gera novo número global."
+        )
+
+    allowed = SAMPLE_TRANSITIONS.get(old_stage, [])
+    if new_stage not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transição não permitida: {STAGE_LABELS.get(old_stage)} → {STAGE_LABELS.get(new_stage)}"
+        )
+
+    # Blocking tasks
+    await assert_no_blocking_tasks(
+        tenant_id=user["tenant_id"],
+        entity_type="sample",
+        entity_id=sample_id,
+        target_stage=new_stage,
+    )
+
+    # Validate motivo for reprovada
+    if new_stage == "reprovada" and not data.motivo_retrabalho:
+        raise HTTPException(status_code=400, detail="Motivo da reprovação é obrigatório")
+
+    now = _now_iso()
+    update_data = {
+        "stage": new_stage,
+        "updated_at": now,
+    }
+    if new_stage == "enviada":
+        update_data["data_envio"] = now
+    if new_stage == "aprovada":
+        update_data["resultado"] = "aprovada"
+    if new_stage == "reprovada":
+        update_data["resultado"] = "reprovada"
+        if data.feedback_cliente:
+            update_data["feedback_cliente"] = data.feedback_cliente
+    if data.direcoes_retrabalho:
+        update_data["direcoes_retrabalho"] = data.direcoes_retrabalho
+
+    push_ops = {
+        "historico_movimentacoes": {
+            "de": old_stage,
+            "para": new_stage,
+            "data": now,
+            "usuario": user["name"],
+            "usuario_id": user["id"],
+        }
+    }
+
+    if new_stage == "reprovada" and data.motivo_retrabalho:
+        update_data["motivo_retrabalho"] = data.motivo_retrabalho
+
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]},
+        {
+            "$set": update_data,
+            "$push": push_ops,
+        }
+    )
+
+    updated = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="sample",
+        entity_id=sample_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_stage,
+        new_stage=new_stage,
+        user=user,
+    )
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="sample_moved",
+        entity_type="sample",
+        entity_id=sample_id,
+        before={"stage": old_stage},
+        after={"stage": new_stage, "motivo": update_data.get("motivo_retrabalho")},
+        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+    )
+
+    # TRIGGER: Auto-create SKU when sample is approved
+    sku_created = None
+    if new_stage == "aprovada":
+        sku_created = await _create_sku_from_sample(updated, user)
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "em_negociacao",
+            user,
+            movement_source="sample_approved",
+        )
+    elif new_stage == "em_elaboracao":
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "amostra_em_desenvolvimento",
+            user,
+            movement_source="sample_in_development",
+            extra_set={"data_inicio_desenvolvimento": now},
+        )
+    elif new_stage == "enviada":
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "amostra_enviada",
+            user,
+            movement_source="sample_sent",
+            extra_set={"data_ultima_amostra_enviada": now},
+        )
+
+    return {
+        "sample": updated,
+        "from_stage": STAGE_LABELS.get(old_stage, old_stage),
+        "to_stage": STAGE_LABELS.get(new_stage, new_stage),
+        "sku_created": sku_created,
+        "tasks_generated": new_tasks,
+    }
+
+
+# ======================================================================
+#  ERP v3.0 — REWORK = NEW SAMPLE WITH NEW GLOBAL NUMBER
+# ======================================================================
+
+class SampleReworkInput(BaseModel):
+    motivo: str
+    origem: str = "interna"  # interna | cliente
+    variacao_id: Optional[str] = None  # se referencia uma variação específica
+    nome_produto: Optional[str] = None
+    observacoes_especificas: str = ""
+    feedback_cliente: str = ""
+    direcoes_retrabalho: str = ""
+
+
+@crm_router.post("/samples/{sample_id}/rework")
+async def create_rework_sample(sample_id: str, data: SampleReworkInput, request: Request):
+    """ERP v3.0: Retrabalho gera NOVA amostra com NOVO número global.
+    A amostra original permanece imutável (mas registra o retrabalho no histórico)."""
+    user = await _get_current_user(request)
+
+    original = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not original:
+        raise HTTPException(status_code=404, detail="Amostra original não encontrada")
+
+    if not data.motivo:
+        raise HTTPException(status_code=400, detail="Motivo do retrabalho é obrigatório")
+
+    if not clean_text(data.feedback_cliente) or not clean_text(data.direcoes_retrabalho):
+        raise HTTPException(status_code=400, detail="Retrabalho exige feedback_cliente e direcoes_retrabalho")
+
+    project = await assert_project_exists(user["tenant_id"], original["projeto_id"])
+
+    now = _now_iso()
+    novo_numero = await next_sample_number(user["tenant_id"])
+
+    # Determinar variação base para herança (se especificada)
+    base_variacao = None
+    if data.variacao_id:
+        base_variacao = next(
+            (v for v in original.get("variacoes", []) if v["id"] == data.variacao_id), None
+        )
+
+    nova_letra = "A"
+    nova_var_id = _new_id()
+    nova_variacao = {
+        "id": nova_var_id,
+        "codigo": f"{novo_numero}/{nova_letra}",
+        "letra": nova_letra,
+        "descricao_aplicacao": (base_variacao or {}).get("descricao_aplicacao", ""),
+        "percentual_fragrancia": (base_variacao or {}).get("percentual_fragrancia"),
+        "referencia_fragrancia": (base_variacao or {}).get("referencia_fragrancia", ""),
+        "custo_fragrancia": (base_variacao or {}).get("custo_fragrancia"),
+        "observacoes_especificas": data.observacoes_especificas
+            or (base_variacao or {}).get("observacoes_especificas", ""),
+        "status": "solicitada",
+        "historico_status": [{
+            "de": "",
+            "para": "solicitada",
+            "data": now,
+            "usuario": user["name"],
+            "usuario_id": user["id"],
+            "trigger": "retrabalho",
+        }],
+        "motivo_retrabalho": "",
+        "historico_retrabalhos": [],
+        "feedback_cliente": data.feedback_cliente or (base_variacao or {}).get("feedback_cliente", ""),
+        "direcoes_retrabalho": data.direcoes_retrabalho,
+        "resultado": "",
+        "gera_sku": False,
+        "sku_id": None,
+        "pd_card_id": None,
+    }
+
+    nova_sample_id = _new_id()
+    nova_sample = {
+        "id": nova_sample_id,
+        "tenant_id": user["tenant_id"],
+        "projeto_id": original["projeto_id"],
+        "projeto_nome": original.get("projeto_nome", ""),
+        "cliente_id": original["cliente_id"],
+        "cliente_nome": original.get("cliente_nome", ""),
+        "numero_amostra": str(novo_numero),
+        "nome_produto": data.nome_produto or original.get("nome_produto", ""),
+        "categoria": original.get("categoria", ""),
+        "briefing_base": original.get("briefing_base", ""),
+        "responsavel_pd": original.get("responsavel_pd", ""),
+        "parametro_variacao": original.get("parametro_variacao", ""),
+        "tipo_amostra": original.get("tipo_amostra", ""),
+        "referencia_formula": original.get("referencia_formula", ""),
+        "quantidade_por_variacao": original.get("quantidade_por_variacao"),
+        "unidade_quantidade": original.get("unidade_quantidade", ""),
+        "prazo_entrega_cliente": original.get("prazo_entrega_cliente", ""),
+        "briefing_especifico": original.get("briefing_especifico", ""),
+        "feedback_cliente": data.feedback_cliente,
+        "direcoes_retrabalho": data.direcoes_retrabalho,
+        "resultado": "",
+        "data_envio": None,
+        "tem_variacoes": False,
+        "variacoes": [nova_variacao],
+        "produto": original.get("produto", ""),
+        "objetivo_projeto": original.get("objetivo_projeto", ""),
+        "aplicacoes_desenvolver": original.get("aplicacoes_desenvolver", ""),
+        "ativos_claims": original.get("ativos_claims", ""),
+        "referencias": original.get("referencias", ""),
+        "referencias_fotos": original.get("referencias_fotos", []),
+        "orcamento_projeto": original.get("orcamento_projeto", ""),
+        "textura_esperada": original.get("textura_esperada", ""),
+        "aplicacao": original.get("aplicacao", ""),
+        "sensorial": original.get("sensorial", ""),
+        "ph": original.get("ph", ""),
+        "observacao_tecnica": original.get("observacao_tecnica", ""),
+        "stage": "solicitada",
+        "rework_de_amostra_id": original["id"],
+        "rework_de_numero": original.get("numero_amostra", ""),
+        "rework_motivo": data.motivo,
+        "rework_origem": data.origem,
+        "created_by": user["id"],
+        "created_by_name": user["name"],
+        "created_at": now,
+        "updated_at": now,
+    }
+    inherit(nova_sample, project, INHERITED_FROM_PROJECT)
+    await db.crm_samples.insert_one(nova_sample)
+    nova_sample.pop("_id", None)
+
+    # Marcar a original com referência ao retrabalho gerado
+    await db.crm_samples.update_one(
+        {"id": original["id"], "tenant_id": user["tenant_id"]},
+        {
+            "$push": {
+                "historico_retrabalhos": {
+                    "data": now,
+                    "motivo": data.motivo,
+                    "origem": data.origem,
+                    "nova_amostra_id": nova_sample_id,
+                    "novo_numero": str(novo_numero),
+                    "usuario": user["name"],
+                    "usuario_id": user["id"],
+                }
+            },
+            "$set": {
+                "updated_at": now,
+                "feedback_cliente": data.feedback_cliente,
+                "direcoes_retrabalho": data.direcoes_retrabalho,
+                "resultado": "retrabalho",
+            },
+        },
+    )
+    if data.variacao_id:
+        await db.crm_samples.update_one(
+            {"id": original["id"], "tenant_id": user["tenant_id"], "variacoes.id": data.variacao_id},
+            {
+                "$set": {
+                    "variacoes.$.motivo_retrabalho": data.motivo,
+                    "variacoes.$.feedback_cliente": data.feedback_cliente,
+                    "variacoes.$.direcoes_retrabalho": data.direcoes_retrabalho,
+                    "variacoes.$.resultado": "retrabalho",
+                },
+                "$push": {
+                    "variacoes.$.historico_retrabalhos": {
+                        "data": now,
+                        "motivo": data.motivo,
+                        "origem": data.origem,
+                        "nova_amostra_id": nova_sample_id,
+                        "novo_numero": str(novo_numero),
+                        "usuario": user["name"],
+                        "usuario_id": user["id"],
+                    }
+                },
+            },
+        )
+
+    # Criar P&D card para a nova variação
+    await _create_pd_card_for_variacao(nova_sample, nova_variacao, user)
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="sample_rework_created",
+        entity_type="sample",
+        entity_id=nova_sample_id,
+        before={"original_id": original["id"], "original_numero": original.get("numero_amostra")},
+        after={"novo_numero": str(novo_numero), "motivo": data.motivo, "origem": data.origem},
+        metadata={"projeto_id": original["projeto_id"], "cliente_id": original["cliente_id"]},
+    )
+
+    return {
+        "rework_sample": nova_sample,
+        "original_id": original["id"],
+        "novo_numero": str(novo_numero),
+    }
+
+
+@crm_router.put("/samples/{sample_id}/variacoes/{variacao_id}")
+async def update_variacao(sample_id: str, variacao_id: str, data: VariacaoUpdate, request: Request):
+    """Atualizar uma variação específica de uma amostra"""
+    user = await _get_current_user(request)
+    
+    update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+    
+    # Montar update com dot notation para variação específica
+    set_fields = {f"variacoes.$.{k}": v for k, v in update_fields.items()}
+    set_fields["updated_at"] = _now_iso()
+    
+    result = await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"], "variacoes.id": variacao_id},
+        {"$set": set_fields}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Amostra ou variação não encontrada")
+    
+    sample = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    return sample
+
+
+@crm_router.put("/samples/{sample_id}/variacoes/{variacao_id}/move")
+async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, request: Request):
+    """Mover uma variação entre status — bloqueado para perfis comerciais (CRM é read-only)."""
+    user = await _get_current_user(request)
+
+    # REGRA DE NEGÓCIO: status da variação é controlado exclusivamente pelo P&D.
+    # Perfis comerciais não podem mover variações; apenas registram resultado do cliente
+    # via POST /samples/{id}/variacoes/{vid}/resultado-cliente.
+    _COMERCIAL_ROLES = {"vendedor", "sales_ops", "sucesso_cliente"}
+    from rbac import normalize_role
+    if normalize_role(user.get("role", "")) in _COMERCIAL_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "sem_permissao",
+                "message": "O status da variação é controlado pelo setor P&D. "
+                           "Para atualizar, o formulador deve mover o card no Pipeline P&D.",
+                "instrucao": "Acesse Pipeline P&D para ver o progresso desta amostra.",
+            },
+        )
+
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+    
+    # Encontrar a variação
+    variacao = next((v for v in sample.get("variacoes", []) if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+    
+    old_status = variacao["status"]
+    new_status = data.status
+    
+    # Validar transição
+    if new_status not in SAMPLE_STAGES:
+        raise HTTPException(status_code=400, detail=f"Status inválido: {new_status}")
+
+    # ERP v3.0: Retrabalho exige uso do endpoint /samples/{id}/rework (gera novo nº global)
+    if new_status == "retrabalho":
+        raise HTTPException(
+            status_code=400,
+            detail="Retrabalho não move variação — gera nova amostra. Use POST /api/crm/samples/{sample_id}/rework",
+        )
+
+    allowed = SAMPLE_TRANSITIONS.get(old_status, [])
+    if new_status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transição não permitida: {STAGE_LABELS.get(old_status)} → {STAGE_LABELS.get(new_status)}"
+        )
+
+    # ERP v3.0: blocking tasks
+    await assert_no_blocking_tasks(
+        tenant_id=user["tenant_id"],
+        entity_type="variacao",
+        entity_id=variacao_id,
+        target_stage=new_status,
+    )
+
+    # Validar motivo de reprovação
+    if new_status == "reprovada" and not data.motivo_retrabalho:
+        raise HTTPException(status_code=400, detail="Motivo da reprovação é obrigatório")
+    
+    now = _now_iso()
+    
+    # Atualizar status da variação
+    set_ops = {
+        "variacoes.$.status": new_status,
+        "variacoes.$.updated_at": now,
+        "updated_at": now
+    }
+    if new_status == "enviada":
+        set_ops["data_envio"] = now
+    if new_status == "aprovada":
+        set_ops["variacoes.$.resultado"] = "aprovada"
+    if new_status == "reprovada":
+        set_ops["variacoes.$.resultado"] = "reprovada"
+    
+    push_ops = {
+        "variacoes.$.historico_status": {
+            "de": old_status,
+            "para": new_status,
+            "data": now,
+            "usuario": user["name"],
+            "usuario_id": user["id"]
+        }
+    }
+    
+    if new_status == "reprovada" and data.motivo_retrabalho:
+        set_ops["variacoes.$.motivo_retrabalho"] = data.motivo_retrabalho
+    if data.origem_retrabalho:
+        set_ops["variacoes.$.origem_retrabalho"] = data.origem_retrabalho
+    
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"], "variacoes.id": variacao_id},
+        {
+            "$set": set_ops,
+            "$push": push_ops
+        }
+    )
+    
+    updated = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="variacao",
+        entity_id=variacao_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_status,
+        new_stage=new_status,
+        user=user,
+    )
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="variacao_moved",
+        entity_type="variacao",
+        entity_id=variacao_id,
+        before={"status": old_status},
+        after={"status": new_status},
+        metadata={"sample_id": sample_id, "tasks_generated": [t["id"] for t in new_tasks]},
+    )
+
+    # TRIGGER: Auto-create SKU when variação is approved
+    sku_created = None
+    if new_status == "aprovada":
+        # Encontrar a variação atualizada
+        updated_variacao = next((v for v in updated.get("variacoes", []) if v["id"] == variacao_id), None)
+        if updated_variacao:
+            sku_created = await _create_sku_from_variacao(updated, updated_variacao, user)
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "em_negociacao",
+            user,
+            movement_source="variacao_approved",
+        )
+    elif new_status == "em_elaboracao":
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "amostra_em_desenvolvimento",
+            user,
+            movement_source="variacao_in_development",
+            extra_set={"data_inicio_desenvolvimento": now},
+        )
+    elif new_status == "enviada":
+        await _advance_project_stage_if_needed(
+            updated["projeto_id"],
+            "amostra_enviada",
+            user,
+            movement_source="variacao_sent",
+            extra_set={"data_ultima_amostra_enviada": now},
+        )
+    
+    return {
+        "sample": updated,
+        "variacao_id": variacao_id,
+        "from_status": STAGE_LABELS.get(old_status, old_status),
+        "to_status": STAGE_LABELS.get(new_status, new_status),
+        "sku_created": sku_created,
+        "tasks_generated": new_tasks,
+    }
+
+
+# ======================================================================
+#  VARIAÇÃO — RESULTADO DO CLIENTE (único ponto de escrita comercial pós-envio)
+# ======================================================================
+
+class ResultadoClienteRequest(BaseModel):
+    resultado: str  # "aprovada" | "reprovada" | "retrabalho"
+    feedback_cliente: Optional[str] = None
+    direcoes_retrabalho: Optional[str] = None
+
+
+@crm_router.post("/samples/{sample_id}/variacoes/{variacao_id}/resultado-cliente")
+async def resultado_cliente(
+    sample_id: str, variacao_id: str, data: ResultadoClienteRequest, request: Request
+):
+    """Único ponto onde o Comercial pode registrar algo sobre a variação:
+    o resultado que o cliente deu (aprovada/reprovada/retrabalho).
+    Só permitido quando o status está em 'enviada' (amostra já no cliente).
+    """
+    user = await _get_current_user(request)
+
+    if data.resultado not in ("aprovada", "reprovada", "retrabalho"):
+        raise HTTPException(
+            status_code=422,
+            detail="resultado deve ser: aprovada, reprovada ou retrabalho",
+        )
+    if data.resultado == "retrabalho" and not (data.feedback_cliente or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="feedback_cliente é obrigatório quando resultado='retrabalho'",
+        )
+
+    tenant_id = user["tenant_id"]
+    sample = await db.crm_samples.find_one({"id": sample_id, "tenant_id": tenant_id}, {"_id": 0})
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    variacao = next((v for v in sample.get("variacoes", []) if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+
+    status_atual = variacao.get("status")
+    if status_atual != "enviada":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "status_invalido",
+                "message": (
+                    f"Resultado só pode ser registrado quando status='enviada'. "
+                    f"Status atual: '{status_atual}'"
+                ),
+                "status_atual": status_atual,
+            },
+        )
+
+    now = _now_iso()
+    novo_status_crm = data.resultado  # aprovada | reprovada | retrabalho
+    pd_label = {
+        "aprovada":    "Aprovado pelo Cliente",
+        "reprovada":   "Reprovado pelo Cliente",
+        "retrabalho":  "Retrabalho Solicitado",
+    }[data.resultado]
+
+    set_ops = {
+        "variacoes.$.status": novo_status_crm,
+        "variacoes.$.status_pd_label": pd_label,
+        "variacoes.$.feedback_cliente": data.feedback_cliente or "",
+        "variacoes.$.resultado_cliente_registrado_por": user["id"],
+        "variacoes.$.resultado_cliente_registrado_em": now,
+        "variacoes.$.updated_at": now,
+    }
+    if data.direcoes_retrabalho:
+        set_ops["variacoes.$.direcoes_retrabalho"] = data.direcoes_retrabalho
+    if data.resultado == "aprovada":
+        set_ops["variacoes.$.resultado"] = "aprovada"
+    if data.resultado == "reprovada":
+        set_ops["variacoes.$.resultado"] = "reprovada"
+
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": tenant_id, "variacoes.id": variacao_id},
+        {
+            "$set": set_ops,
+            "$push": {
+                "variacoes.$.historico_status": {
+                    "de": "enviada",
+                    "para": novo_status_crm,
+                    "data": now,
+                    "usuario": user["name"],
+                    "usuario_id": user["id"],
+                    "origem": "resultado_cliente",
+                }
+            },
+        },
+    )
+
+    # Notificar pd_card vinculado
+    pd_card = await db.pd_cards.find_one({"amostra_variacao_id": variacao_id, "tenant_id": tenant_id}, {"_id": 0})
+    pd_card_notificado = False
+    if pd_card:
+        novo_status_pd = {
+            "aprovada":   "aprovado_cliente",
+            "reprovada":  "reprovado_cliente",
+            "retrabalho": "retrabalho_solicitado_cliente",
+        }[data.resultado]
+        await db.pd_cards.update_one(
+            {"id": pd_card["id"], "tenant_id": tenant_id},
+            {
+                "$set": {
+                    "status_pd": novo_status_pd,
+                    "feedback_cliente": data.feedback_cliente or "",
+                    "direcoes_retrabalho": data.direcoes_retrabalho or "",
+                    "resultado_cliente": data.resultado,
+                    "updated_at": now,
+                },
+                "$push": {
+                    "historico_movimentacoes": {
+                        "de": pd_card.get("status_pd", ""),
+                        "para": novo_status_pd,
+                        "data": now,
+                        "usuario": user["name"],
+                        "usuario_id": user["id"],
+                        "observacao": f"Resultado do cliente: {pd_label}",
+                    }
+                },
+            },
+        )
+        pd_card_notificado = True
+        logger.info(f"Resultado cliente: variação {variacao_id} → {novo_status_crm} / pd_card {pd_card['id']} → {novo_status_pd}")
+
+    await audit_log(
+        tenant_id=tenant_id,
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="resultado_cliente_registrado",
+        entity_type="variacao",
+        entity_id=variacao_id,
+        before={"status": "enviada"},
+        after={"status": novo_status_crm, "resultado": data.resultado},
+        metadata={"sample_id": sample_id, "pd_card_id": pd_card["id"] if pd_card else None},
+    )
+
+    return {
+        "success": True,
+        "variacao_id": variacao_id,
+        "resultado": data.resultado,
+        "status_atualizado": novo_status_crm,
+        "pd_card_notificado": pd_card_notificado,
+    }
+
+
+# ======================================================================
+#  SAMPLE / VARIAÇÃO — DELETE & ADD VARIAÇÕES (pós-envio)
+# ======================================================================
+
+class AddVariacoesRequest(BaseModel):
+    variacoes: List[VariacaoItem]
+
+
+@crm_router.delete("/samples/{sample_id}")
+async def delete_sample(sample_id: str, request: Request):
+    """Deleta uma amostra completa (todas variações + pd_cards).
+    Bloqueia se alguma variação já gerou SKU."""
+    user = await _get_current_user(request)
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    # Bloquear se alguma variação tiver SKU
+    for v in sample.get("variacoes", []) or []:
+        if v.get("sku_id"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Não é possível excluir: variação {v.get('codigo')} já gerou SKU."
+            )
+
+    # Coletar pd_cards vinculados
+    pd_card_ids = [v["pd_card_id"] for v in (sample.get("variacoes") or []) if v.get("pd_card_id")]
+
+    if pd_card_ids:
+        await db.pd_cards.delete_many(
+            {"id": {"$in": pd_card_ids}, "tenant_id": user["tenant_id"]}
+        )
+    await db.crm_samples.delete_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}
+    )
+
+    logger.info(f"Deleted sample {sample_id} with {len(pd_card_ids)} pd_cards")
+    return {
+        "deleted_sample": sample_id,
+        "deleted_pd_cards": len(pd_card_ids),
+    }
+
+
+@crm_router.delete("/samples/{sample_id}/variacoes/{variacao_id}")
+async def delete_variacao(sample_id: str, variacao_id: str, request: Request):
+    """Deleta uma variação específica (e seu pd_card).
+    Bloqueia se a variação já gerou SKU ou se é a última variação."""
+    user = await _get_current_user(request)
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    variacoes = sample.get("variacoes") or []
+    variacao = next((v for v in variacoes if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+
+    if variacao.get("sku_id"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não é possível excluir: variação {variacao.get('codigo')} já gerou SKU."
+        )
+
+    if len(variacoes) <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Não é possível excluir a última variação. Exclua a amostra inteira."
+        )
+
+    # Remover pd_card vinculado
+    if variacao.get("pd_card_id"):
+        await db.pd_cards.delete_one(
+            {"id": variacao["pd_card_id"], "tenant_id": user["tenant_id"]}
+        )
+
+    # Remover variação do array
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]},
+        {
+            "$pull": {"variacoes": {"id": variacao_id}},
+            "$set": {"updated_at": _now_iso()}
+        }
+    )
+
+    # Recalcular tem_variacoes
+    updated = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    tem_variacoes = len(updated.get("variacoes") or []) > 1
+    await db.crm_samples.update_one(
+        {"id": sample_id},
+        {"$set": {"tem_variacoes": tem_variacoes}}
+    )
+
+    logger.info(f"Deleted variação {variacao_id} from sample {sample_id}")
+    return {"deleted_variacao": variacao_id, "sample_id": sample_id}
+
+
+@crm_router.post("/samples/{sample_id}/variacoes")
+async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, request: Request):
+    """Adiciona novas variações a uma amostra existente.
+    Gera automaticamente próximas letras (se tem A,B,C → adiciona D, E...)."""
+    user = await _get_current_user(request)
+    sample = await db.crm_samples.find_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    if not data.variacoes:
+        raise HTTPException(status_code=400, detail="Nenhuma variação fornecida")
+
+    now = _now_iso()
+    existing = sample.get("variacoes") or []
+    # Próximo índice baseado no número de variações existentes (mesmo deletadas no passado o usuario cria sequencia)
+    start_index = len(existing)
+    numero_amostra = sample.get("numero_amostra", "?")
+
+    new_variacoes = []
+    for offset, var in enumerate(data.variacoes):
+        idx = start_index + offset
+        letra = _generate_variacao_letra(idx)
+        codigo = f"{numero_amostra}/{letra}"
+        variacao_id = _new_id()
+        variacao = {
+            "id": variacao_id,
+            "codigo": codigo,
+            "letra": letra,
+            "descricao_aplicacao": var.descricao_aplicacao,
+            "percentual_fragrancia": var.percentual_fragrancia,
+            "referencia_fragrancia": var.referencia_fragrancia,
+            "custo_fragrancia": var.custo_fragrancia,
+            "observacoes_especificas": var.observacoes_especificas,
+            "status": "solicitada",
+            "historico_status": [{
+                "de": "",
+                "para": "solicitada",
+                "data": now,
+                "usuario": user["name"],
+                "usuario_id": user["id"]
+            }],
+            "motivo_retrabalho": "",
+            "historico_retrabalhos": [],
+            "feedback_cliente": "",
+            "gera_sku": False,
+            "sku_id": None,
+            "pd_card_id": None,
+        }
+        new_variacoes.append(variacao)
+
+    # Inserir no array
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": user["tenant_id"]},
+        {
+            "$push": {"variacoes": {"$each": new_variacoes}},
+            "$set": {"tem_variacoes": True, "updated_at": now},
+        }
+    )
+
+    # Criar pd_cards para cada nova variação
+    updated = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    for new_var in new_variacoes:
+        # Recuperar a variação recém-persistida para linkar pd_card
+        await _create_pd_card_for_variacao(updated, new_var, user)
+
+    final = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    logger.info(f"Added {len(new_variacoes)} variações to sample {sample_id}")
+    return {
+        "sample": final,
+        "added": len(new_variacoes),
+        "new_variacoes": new_variacoes,
+    }
+
+
+async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) -> dict:
+    """Auto-create SKU entity when a variação is approved"""
+    tenant_id = sample["tenant_id"]
+
+    # Generate auto-incremented code
+    count = await db.skus.count_documents({"tenant_id": tenant_id})
+    codigo = f"KRY-{str(count + 1).zfill(3)}"
+
+    now = _now_iso()
+    sku_id = _new_id()
+
+    sku = {
+        "id": sku_id,
+        "tenant_id": tenant_id,
+        "codigo_interno": codigo,
+        "nome_produto": f"{sample['nome_produto']} - {variacao['codigo']}",
+        "categoria": sample.get("categoria", ""),
+        "formula_vinculada": "",
+        "cliente_id": sample["cliente_id"],
+        "cliente_nome": sample.get("cliente_nome", ""),
+        "projeto_id": sample["projeto_id"],
+        "projeto_nome": sample.get("projeto_nome", ""),
+        "amostra_id": sample["id"],
+        "amostra_variacao_id": variacao["id"],
+        "descricao_aplicacao": variacao.get("descricao_aplicacao", ""),
+        "preco_unitario": variacao.get("custo_fragrancia", 0.0),
+        "moq": 0,
+        "anvisa": {"numero": "", "validade": None},
+        "status": "ativo",
+        "historico_pedidos": [],
+        "data_ultimo_pedido": None,
+        "frequencia_media_recompra_dias": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db.skus.insert_one(sku)
+    sku.pop("_id", None)
+    
+    # Atualizar variação com SKU ID
+    await db.crm_samples.update_one(
+        {"id": sample["id"], "variacoes.id": variacao["id"]},
+        {"$set": {"variacoes.$.sku_id": sku_id, "variacoes.$.gera_sku": True}}
+    )
+    
+    logger.info(f"Auto-created SKU {codigo} from variação {variacao['codigo']}")
+    return sku
+
+
+# ======================================================================
+#  SKU (auto-generated from approved samples)
+# ======================================================================
+
+async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
+    """Auto-create SKU entity when a sample is approved"""
+    tenant_id = sample["tenant_id"]
+
+    # Generate auto-incremented code
+    count = await db.skus.count_documents({"tenant_id": tenant_id})
+    codigo = f"KRY-{str(count + 1).zfill(3)}"
+
+    now = _now_iso()
+    sku_id = _new_id()
+
+    sku = {
+        "id": sku_id,
+        "tenant_id": tenant_id,
+        "codigo_interno": codigo,
+        "nome_produto": sample["nome_amostra"],
+        "categoria": "",
+        "formula_vinculada": "",
+        "cliente_id": sample["cliente_id"],
+        "cliente_nome": sample.get("cliente_nome", ""),
+        "projeto_id": sample["projeto_id"],
+        "projeto_nome": sample.get("projeto_nome", ""),
+        "amostra_id": sample["id"],
+        "preco_unitario": 0.0,
+        "moq": 0,
+        "anvisa": {"numero": "", "validade": None},
+        "status": "ativo",
+        "historico_pedidos": [],
+        "data_ultimo_pedido": None,
+        "frequencia_media_recompra_dias": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db.skus.insert_one(sku)
+    sku.pop("_id", None)
+
+    # Also try to get project category
+    project = await db.crm_projects.find_one({"id": sample["projeto_id"]}, {"_id": 0})
+    if project and project.get("categoria"):
+        await db.skus.update_one({"id": sku_id}, {"$set": {"categoria": project["categoria"]}})
+        sku["categoria"] = project["categoria"]
+
+    logger.info(f"Auto-created SKU {codigo} from sample {sample['id']}")
+    return sku
+
+
+@crm_router.get("/skus")
+async def list_skus(
+    request: Request,
+    cliente_id: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    user = await _get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    if cliente_id:
+        query["cliente_id"] = cliente_id
+    if status:
+        query["status"] = status
+    if search:
+        query["$or"] = [
+            {"nome_produto": {"$regex": search, "$options": "i"}},
+            {"codigo_interno": {"$regex": search, "$options": "i"}},
+        ]
+
+    skus = await db.skus.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return skus
+
+
+@crm_router.get("/skus/{sku_id}")
+async def get_sku(sku_id: str, request: Request):
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one(
+        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+    return sku
+
+
+@crm_router.put("/skus/{sku_id}")
+async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
+    """Limited update — SKU is mostly immutable after creation"""
+    user = await _get_current_user(request)
+    update_fields = {}
+
+    if data.preco_unitario is not None:
+        update_fields["preco_unitario"] = data.preco_unitario
+    if data.moq is not None:
+        update_fields["moq"] = data.moq
+    if data.status is not None:
+        if data.status not in ("ativo", "suspenso", "descontinuado"):
+            raise HTTPException(status_code=400, detail="Status inválido")
+        update_fields["status"] = data.status
+    if data.anvisa_numero is not None:
+        update_fields["anvisa.numero"] = data.anvisa_numero
+    if data.anvisa_validade is not None:
+        update_fields["anvisa.validade"] = data.anvisa_validade
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    update_fields["updated_at"] = _now_iso()
+
+    result = await db.skus.update_one(
+        {"id": sku_id, "tenant_id": user["tenant_id"]},
+        {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+
+    sku = await db.skus.find_one({"id": sku_id}, {"_id": 0})
+    return sku
+
+
+@crm_router.post("/skus/{sku_id}/orders")
+async def add_order_to_sku(sku_id: str, data: OrderAdd, request: Request):
+    """Add an order to SKU history and recalculate metrics"""
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one(
+        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+
+    now = _now_iso()
+    order = {
+        "id": _new_id(),
+        "data_pedido": data.data_pedido,
+        "quantidade": data.quantidade,
+        "valor_total": data.valor_total,
+        "observacao": data.observacao,
+        "registrado_por": user["name"],
+        "registrado_em": now,
+    }
+
+    # Calculate reorder frequency
+    historico = sku.get("historico_pedidos", [])
+    historico.append(order)
+
+    freq = 0
+    if len(historico) >= 2:
+        dates = sorted([h["data_pedido"] for h in historico])
+        try:
+            date_objs = [datetime.fromisoformat(d.replace("Z", "+00:00")) if isinstance(d, str) else d for d in dates]
+            if len(date_objs) >= 2:
+                diffs = [(date_objs[i+1] - date_objs[i]).days for i in range(len(date_objs)-1)]
+                freq = sum(diffs) / len(diffs) if diffs else 0
+        except Exception:
+            freq = 0
+
+    await db.skus.update_one(
+        {"id": sku_id},
+        {
+            "$push": {"historico_pedidos": order},
+            "$set": {
+                "data_ultimo_pedido": data.data_pedido,
+                "frequencia_media_recompra_dias": round(freq),
+                "updated_at": now,
+            }
+        }
+    )
+
+    updated = await db.skus.find_one({"id": sku_id}, {"_id": 0})
+    return updated
+
+
+# ======================================================================
+#  PIPELINE P&D (Cards de desenvolvimento)
+# ======================================================================
+
+PD_STATUSES = [
+    "solicitado",
+    "em_desenvolvimento",
+    "em_testes",
+    "aguardando_aprovacao",
+    "aprovado_internamente",
+    "entregue_ao_comercial",
+    "retrabalho_interno",
+]
+
+PD_STATUS_LABELS = {
+    "solicitado": "Aberto",
+    "em_desenvolvimento": "Em Desenvolvimento",
+    "em_testes": "Em Testes",
+    "aguardando_aprovacao": "Aguardando Aprovação CQ",
+    "aprovado_internamente": "Aprovado Internamente — Aguardando Entrega",
+    "entregue_ao_comercial": "Entregue ao Comercial",
+    "retrabalho_interno": "Retrabalho Interno"
+}
+
+# Item 6 — Transições válidas para frente. Retroceder usa endpoint específico com justificativa.
+PD_CARD_TRANSICOES_VALIDAS = {
+    "solicitado":             ["em_desenvolvimento"],
+    "em_desenvolvimento":     ["em_testes", "aguardando_aprovacao", "retrabalho_interno"],
+    "em_testes":              ["aguardando_aprovacao", "retrabalho_interno"],
+    "aguardando_aprovacao":   ["aprovado_internamente", "retrabalho_interno"],
+    "aprovado_internamente":  ["entregue_ao_comercial"],
+    "entregue_ao_comercial":  [],  # Terminal para P&D — daqui o Comercial controla
+    "retrabalho_interno":     ["em_desenvolvimento"],
+}
+
+# Mapeamento: Status P&D → Status CRM3 Variação (simplificado, retrocompatível)
+PD_TO_CRM_STATUS_MAP = {
+    "solicitado": "solicitada",
+    "em_desenvolvimento": "em_elaboracao",
+    "em_testes": None,  # Não muda CRM3, só adiciona ao histórico
+    "aguardando_aprovacao": "em_elaboracao",
+    "aprovado_internamente": "em_elaboracao",
+    "entregue_ao_comercial": "aguardando_envio_cliente",
+    "retrabalho_interno": "retrabalho"
+}
+
+# Mapeamento rico: Status P&D → (status_CRM_simplificado, label_visível_ao_comercial)
+PD_CARD_STATUS_TO_CRM_DISPLAY = {
+    "solicitado":            ("solicitada",                "Aguardando P&D"),
+    "em_desenvolvimento":    ("em_elaboracao",             "Em Desenvolvimento"),
+    "em_testes":             ("em_elaboracao",             "Em Testes"),
+    "aguardando_aprovacao":  ("em_elaboracao",             "Aguardando Aprovação CQ"),
+    "aprovado_internamente": ("em_elaboracao",             "Aprovado Internamente"),
+    "entregue_ao_comercial": ("aguardando_envio_cliente",  "Entregue ao Comercial"),
+    "retrabalho_interno":    ("retrabalho",                "Em Retrabalho"),
+}
+
+@crm_router.get("/pd/cards")
+async def list_pd_cards(
+    request: Request,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    """Listar cards do Pipeline P&D"""
+    user = await _get_current_user(request)
+    require_roles(user, PD_READ | COMERCIAL_FULL)
+    query = {"tenant_id": user["tenant_id"]}
+    
+    if status:
+        query["status_pd"] = status
+    if search:
+        query["$or"] = [
+            {"numero_completo": {"$regex": search, "$options": "i"}},
+            {"produto": {"$regex": search, "$options": "i"}},
+            {"cliente": {"$regex": search, "$options": "i"}},
+        ]
+    
+    cards = await db.pd_cards.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return cards
+
+
+@crm_router.get("/pd/cards/{card_id}")
+async def get_pd_card(card_id: str, request: Request):
+    """Obter detalhes de um card P&D"""
+    user = await _get_current_user(request)
+    require_roles(user, PD_READ | COMERCIAL_FULL)
+    card = await db.pd_cards.find_one(
+        {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not card:
+        raise HTTPException(status_code=404, detail="Card não encontrado")
+
+    # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
+    if not card.get("pd_request_id"):
+        try:
+            await _ensure_pd_request_for_card(card, user)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
+
+    # Buscar amostra e variação relacionadas
+    if card.get("amostra_id"):
+        sample = await db.crm_samples.find_one(
+            {"id": card["amostra_id"]}, {"_id": 0}
+        )
+        if sample:
+            card["amostra_completa"] = sample
+            # Encontrar variação específica
+            variacao = next((v for v in sample.get("variacoes", []) if v["id"] == card.get("amostra_variacao_id")), None)
+            if variacao:
+                card["variacao"] = variacao
+    
+    return card
+
+
+@crm_router.post("/pd/cards/sync-all-to-crm")
+async def sync_all_pd_cards_to_crm(request: Request):
+    """Admin/lider_pd: re-sincroniza todos os pd_cards com suas variações CRM.
+    Usar uma vez para corrigir dados inconsistentes já no banco.
+    """
+    user = await _get_current_user(request)
+    require_roles(user, {"admin", "lider_pd"})
+
+    tenant_id = user["tenant_id"]
+    pd_cards = await db.pd_cards.find(
+        {"tenant_id": tenant_id, "amostra_variacao_id": {"$exists": True}},
+        {"_id": 0},
+    ).to_list(5000)
+
+    synced = 0
+    errors = 0
+    now = _now_iso()
+
+    for card in pd_cards:
+        try:
+            status_pd = card.get("status_pd", "solicitado")
+            crm_status, crm_label = PD_CARD_STATUS_TO_CRM_DISPLAY.get(
+                status_pd,
+                (PD_TO_CRM_STATUS_MAP.get(status_pd), PD_STATUS_LABELS.get(status_pd, status_pd)),
+            )
+            if not crm_status:
+                continue
+            result = await db.crm_samples.update_one(
+                {
+                    "id": card["amostra_id"],
+                    "tenant_id": tenant_id,
+                    "variacoes.id": card["amostra_variacao_id"],
+                },
+                {
+                    "$set": {
+                        "variacoes.$.status": crm_status,
+                        "variacoes.$.status_pd_label": crm_label,
+                        "variacoes.$.status_pd_raw": status_pd,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                    }
+                },
+            )
+            if result.matched_count:
+                synced += 1
+        except Exception as exc:
+            logger.error(f"sync-all error card {card.get('id')}: {exc}")
+            errors += 1
+
+    logger.info(f"sync-all-to-crm: {synced} synced, {errors} errors (tenant={tenant_id})")
+    return {
+        "synced": synced,
+        "errors": errors,
+        "total": len(pd_cards),
+        "message": f"Sincronizados {synced} de {len(pd_cards)} cards",
+    }
+
+
+class PDCardMove(BaseModel):
+    status: str
+    observacao: str = ""
+
+@crm_router.put("/pd/cards/{card_id}/move")
+async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
+    """Mover card no Pipeline P&D e sincronizar com CRM (ERP v3.0: gera tasks de CQ)."""
+    user = await _get_current_user(request)
+    require_roles(user, PD_WRITE | QA_APPROVERS)
+    
+    card = await db.pd_cards.find_one(
+        {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not card:
+        raise HTTPException(status_code=404, detail="Card não encontrado")
+    
+    old_status = card["status_pd"]
+    new_status = data.status
+    
+    if new_status not in PD_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Status inválido: {new_status}")
+
+    # Item 6 — Validar transição (P&D só anda para frente; retrocesso usa /retroceder)
+    transicoes_permitidas = PD_CARD_TRANSICOES_VALIDAS.get(old_status, [])
+    if new_status != old_status and new_status not in transicoes_permitidas:
+        # Admin/lider_pd podem pular validação (mantêm flexibilidade operacional)
+        if not has_role(user, {"admin", "lider_pd"}):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "transicao_invalida",
+                    "message": f"De '{old_status}' só é possível ir para: {transicoes_permitidas}. Use /retroceder com justificativa para voltar.",
+                    "status_atual": old_status,
+                    "tentativa": new_status,
+                    "transicoes_permitidas": transicoes_permitidas,
+                },
+            )
+
+    # ERP v3.0: blocking tasks (e.g., CQ approval before closing)
+    await assert_no_blocking_tasks(
+        tenant_id=user["tenant_id"],
+        entity_type="pd_card",
+        entity_id=card_id,
+        target_stage=new_status,
+    )
+
+    # Bloqueio por insumos nao homologados / suspensos antes de aprovacao
+    if new_status in ("aguardando_aprovacao",):
+        from pd_routes import assert_pd_card_ready_for_approval
+        await assert_pd_card_ready_for_approval(card_id, user["tenant_id"])
+
+    now = _now_iso()
+    
+    # Atualizar card P&D
+    await db.pd_cards.update_one(
+        {"id": card_id},
+        {
+            "$set": {
+                "status_pd": new_status,
+                "updated_at": now
+            },
+            "$push": {
+                "historico_movimentacoes": {
+                    "de": old_status,
+                    "para": new_status,
+                    "data": now,
+                    "usuario": user["name"],
+                    "usuario_id": user["id"],
+                    "observacao": data.observacao
+                }
+            }
+        }
+    )
+
+    # ERP v3.0: trigger tasks (CQ approval, lab tests)
+    new_tasks = await trigger_tasks_for_transition(
+        entity_type="pd_card",
+        entity_id=card_id,
+        tenant_id=user["tenant_id"],
+        old_stage=old_status,
+        new_stage=new_status,
+        user=user,
+    )
+
+    stability_study = None
+    if new_status == "em_testes":
+        from pd_routes import _ensure_stability_study_for_pd_card
+        stability_study = await _ensure_stability_study_for_pd_card(
+            {
+                **card,
+                "status_pd": new_status,
+                "updated_at": now,
+            },
+            user,
+        )
+
+    # SINCRONIZAÇÃO: Atualizar status da variação no CRM (sentido único P&D → CRM)
+    if card.get("amostra_id") and card.get("amostra_variacao_id"):
+        crm_status, crm_label = PD_CARD_STATUS_TO_CRM_DISPLAY.get(
+            new_status,
+            (PD_TO_CRM_STATUS_MAP.get(new_status), PD_STATUS_LABELS.get(new_status, new_status))
+        )
+
+        if crm_status:
+            # Atualiza status, label rico e histórico
+            await db.crm_samples.update_one(
+                {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
+                {
+                    "$set": {
+                        "variacoes.$.status": crm_status,
+                        "variacoes.$.status_pd_label": crm_label,
+                        "variacoes.$.status_pd_raw": new_status,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                        "variacoes.$.updated_at": now,
+                    },
+                    "$push": {
+                        "variacoes.$.historico_status": {
+                            "de": "",
+                            "para": crm_status,
+                            "data": now,
+                            "usuario": user["name"],
+                            "usuario_id": user["id"],
+                            "sincronizado_pd": True,
+                            "status_pd": new_status,
+                            "label_pd": crm_label,
+                        }
+                    }
+                }
+            )
+            logger.info(f"Sincronizado P&D→CRM: Card {card_id} ({new_status}) → Variação {card['amostra_variacao_id']} ({crm_status} / {crm_label})")
+        else:
+            # Apenas adiciona ao histórico sem mudar status (ex: em_testes sem mapeamento direto)
+            crm_label_obs = PD_CARD_STATUS_TO_CRM_DISPLAY.get(new_status, (None, PD_STATUS_LABELS.get(new_status, new_status)))[1]
+            await db.crm_samples.update_one(
+                {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
+                {
+                    "$set": {
+                        "variacoes.$.status_pd_label": crm_label_obs,
+                        "variacoes.$.status_pd_raw": new_status,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                        "variacoes.$.updated_at": now,
+                    },
+                    "$push": {
+                        "variacoes.$.historico_status": {
+                            "de": "",
+                            "para": "",
+                            "data": now,
+                            "usuario": user["name"],
+                            "usuario_id": user["id"],
+                            "sincronizado_pd": True,
+                            "status_pd": new_status,
+                            "observacao": f"P&D movido para: {crm_label_obs}",
+                        }
+                    }
+                }
+            )
+            logger.info(f"Histórico P&D→CRM: Card {card_id} ({new_status} / {crm_label_obs}) registrado na variação {card['amostra_variacao_id']}")
+    
+    updated = await db.pd_cards.find_one({"id": card_id}, {"_id": 0})
+
+    await audit_log(
+        tenant_id=user["tenant_id"],
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="pd_card_moved",
+        entity_type="pd_card",
+        entity_id=card_id,
+        before={"status_pd": old_status},
+        after={"status_pd": new_status, "observacao": data.observacao},
+        metadata={
+            "amostra_variacao_id": card.get("amostra_variacao_id"),
+            "tasks_generated": [t["id"] for t in new_tasks],
+        },
+    )
+
+    return {
+        "card": updated,
+        "from_status": PD_STATUS_LABELS.get(old_status, old_status),
+        "to_status": PD_STATUS_LABELS.get(new_status, new_status),
+        "synced_to_crm": True,
+        "stability_study": stability_study,
+        "tasks_generated": new_tasks,
+    }
+
+
+class PDCardUpdate(BaseModel):
+    responsavel_pd: Optional[str] = None
+    prazo_prometido: Optional[str] = None
+    observacoes_especificas: Optional[str] = None
+
+@crm_router.put("/pd/cards/{card_id}")
+async def update_pd_card(card_id: str, data: PDCardUpdate, request: Request):
+    """Atualizar informações de um card P&D"""
+    user = await _get_current_user(request)
+    require_roles(user, PD_WRITE)
+    
+    update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+    
+    update_fields["updated_at"] = _now_iso()
+    
+    result = await db.pd_cards.update_one(
+        {"id": card_id, "tenant_id": user["tenant_id"]},
+        {"$set": update_fields}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Card não encontrado")
+    
+    card = await db.pd_cards.find_one({"id": card_id}, {"_id": 0})
+    return card
+
+
+# ======================================================================
+#  ALERTS
+# ======================================================================
+
+@crm_router.get("/alerts")
+async def list_alerts(
+    request: Request,
+    status: Optional[str] = None,
+    tipo: Optional[str] = None,
+):
+    user = await _get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    if status:
+        query["status"] = status
+    if tipo:
+        query["tipo"] = tipo
+
+    alerts = await db.crm_alerts.find(query, {"_id": 0}).sort("data_criacao", -1).to_list(500)
+    return alerts
+
+
+@crm_router.put("/alerts/{alert_id}/read")
+async def mark_alert_read(alert_id: str, request: Request):
+    user = await _get_current_user(request)
+    result = await db.crm_alerts.update_one(
+        {"id": alert_id, "tenant_id": user["tenant_id"]},
+        {"$set": {"status": "lido"}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alerta não encontrado")
+    return {"message": "Alerta marcado como lido"}
+
+
+@crm_router.put("/alerts/{alert_id}/resolve")
+async def resolve_alert(alert_id: str, data: AlertResolve, request: Request):
+    user = await _get_current_user(request)
+    now = _now_iso()
+    result = await db.crm_alerts.update_one(
+        {"id": alert_id, "tenant_id": user["tenant_id"]},
+        {"$set": {
+            "status": "resolvido",
+            "resolved_at": now,
+            "resolved_by": user["id"],
+            "resolved_comment": data.comment,
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alerta não encontrado")
+    return {"message": "Alerta resolvido"}
+
+
+@crm_router.post("/alerts/check")
+async def trigger_alert_check(request: Request):
+    """Manual trigger for alert check"""
+    user = await _get_current_user(request)
+    count = await check_alerts_for_tenant(user["tenant_id"])
+    return {"message": f"{count} alerta(s) gerado(s)", "count": count}
+
+
+@crm_router.post("/follow-up/schedule")
+async def schedule_follow_up(data: FollowUpSchedule, request: Request):
+    """RN-FU-03: Agendamento de follow-up manual com data/hora"""
+    user = await _get_current_user(request)
+    
+    # Validar que o cliente existe
+    client = await db.crm_clients.find_one(
+        {"id": data.client_id, "tenant_id": user["tenant_id"]},
+        {"_id": 0, "nome_empresa": 1}
+    )
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    
+    # Validar data
+    try:
+        follow_up_date = datetime.fromisoformat(data.data_follow_up.replace("Z", "+00:00"))
+        if follow_up_date < datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="Data de follow-up deve ser futura")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Data inválida. Use formato ISO 8601")
+    
+    # Criar tarefa pendente de follow-up
+    task_id = _new_id()
+    task = {
+        "id": task_id,
+        "tenant_id": user["tenant_id"],
+        "tipo": "follow_up_manual",
+        "entidade_tipo": "client",
+        "entidade_ref": data.client_id,
+        "entidade_nome": client.get("nome_empresa", ""),
+        "titulo": f"Follow-up agendado: {client.get('nome_empresa', '')}",
+        "descricao": data.observacao or "Follow-up manual agendado",
+        "data_agendada": data.data_follow_up,
+        "status": "pendente",
+        "responsavel": user["id"],
+        "criado_por": user["id"],
+        "criado_por_nome": user.get("name", ""),
+        "data_criacao": _now_iso(),
+    }
+    
+    await db.crm_tasks.insert_one(task)
+    
+    return {
+        "message": "Follow-up agendado com sucesso",
+        "task": task
+    }
+
+
+@crm_router.get("/follow-up/scheduled")
+async def list_scheduled_follow_ups(request: Request):
+    """Listar follow-ups agendados"""
+    user = await _get_current_user(request)
+    
+    tasks = await db.crm_tasks.find(
+        {"tenant_id": user["tenant_id"], "tipo": "follow_up_manual", "status": "pendente"},
+        {"_id": 0}
+    ).sort("data_agendada", 1).to_list(500)
+    
+    return tasks
+
+
+async def check_alerts_for_tenant(tenant_id: str) -> int:
+    """Check and generate alerts for a tenant"""
+    now = datetime.now(timezone.utc)
+    created_count = 0
+
+    try:
+        # ALERT_001: Sample in "enviada" > 7 days
+        samples_enviadas = await db.crm_samples.find(
+            {"tenant_id": tenant_id, "stage": "enviada"}, {"_id": 0}
+        ).to_list(1000)
+        for s in samples_enviadas:
+            updated = s.get("updated_at") or s.get("created_at", "")
+            try:
+                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                if (now - dt).days > 7:
+                    exists = await db.crm_alerts.find_one({
+                        "tenant_id": tenant_id, "tipo": "ALERT_001",
+                        "entidade_ref": s["id"], "status": {"$ne": "resolvido"}
+                    })
+                    if not exists:
+                        await db.crm_alerts.insert_one({
+                            "id": _new_id(), "tenant_id": tenant_id,
+                            "tipo": "ALERT_001",
+                            "entidade_ref": s["id"],
+                            "entidade_tipo": "sample",
+                            "entidade_nome": s.get("nome_amostra", ""),
+                            "mensagem": f"Amostra '{s.get('nome_amostra', '')}' está em 'Enviada' há mais de 7 dias sem movimentação.",
+                            "data_criacao": _now_iso(),
+                            "status": "pendente",
+                            "responsavel": s.get("responsavel_pd") or s.get("created_by", ""),
+                        })
+                        created_count += 1
+            except Exception:
+                pass
+
+        # ALERT_002: Client in "negociacao" > 30 days
+        clients_neg = await db.crm_clients.find(
+            {"tenant_id": tenant_id, "stage": "negociacao"}, {"_id": 0}
+        ).to_list(1000)
+        for c in clients_neg:
+            updated = c.get("updated_at") or c.get("created_at", "")
+            try:
+                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                if (now - dt).days > 30:
+                    exists = await db.crm_alerts.find_one({
+                        "tenant_id": tenant_id, "tipo": "ALERT_002",
+                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
+                    })
+                    if not exists:
+                        await db.crm_alerts.insert_one({
+                            "id": _new_id(), "tenant_id": tenant_id,
+                            "tipo": "ALERT_002",
+                            "entidade_ref": c["id"],
+                            "entidade_tipo": "client",
+                            "entidade_nome": c.get("nome_empresa", ""),
+                            "mensagem": f"Cliente '{c.get('nome_empresa', '')}' está em 'Negociação' há mais de 30 dias.",
+                            "data_criacao": _now_iso(),
+                            "status": "pendente",
+                            "responsavel": c.get("created_by", ""),
+                        })
+                        created_count += 1
+            except Exception:
+                pass
+
+        # ALERT_003: Active SKU without order > 60 days
+        active_skus = await db.skus.find(
+            {"tenant_id": tenant_id, "status": "ativo"}, {"_id": 0}
+        ).to_list(1000)
+        clients_perdidos = await db.crm_clients.find(
+            {"tenant_id": tenant_id, "stage": "cliente_perdido"}, {"_id": 0}
+        ).to_list(1000)
+        for c in clients_perdidos:
+            ref_date = c.get("updated_at") or c.get("created_at", "")
+            try:
+                dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
+                if (now - dt).days >= 90:
+                    exists = await db.crm_alerts.find_one({
+                        "tenant_id": tenant_id, "tipo": "ALERT_008",
+                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
+                    })
+                    if not exists:
+                        await db.crm_alerts.insert_one({
+                            "id": _new_id(), "tenant_id": tenant_id,
+                            "tipo": "ALERT_008",
+                            "entidade_ref": c["id"],
+                            "entidade_tipo": "client",
+                            "entidade_nome": c.get("nome_empresa", ""),
+                            "mensagem": f"Cliente perdido '{c.get('nome_empresa', '')}' pode ser reativado apÃ³s 90 dias.",
+                            "data_criacao": _now_iso(),
+                            "status": "pendente",
+                            "responsavel": c.get("created_by", ""),
+                        })
+                        created_count += 1
+            except Exception:
+                pass
+
+        for sku in active_skus:
+            last_order = sku.get("data_ultimo_pedido")
+            ref_date = sku.get("created_at", "")
+            if last_order:
+                ref_date = last_order
+            try:
+                dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
+                if (now - dt).days > 60:
+                    exists = await db.crm_alerts.find_one({
+                        "tenant_id": tenant_id, "tipo": "ALERT_003",
+                        "entidade_ref": sku["id"], "status": {"$ne": "resolvido"}
+                    })
+                    if not exists:
+                        await db.crm_alerts.insert_one({
+                            "id": _new_id(), "tenant_id": tenant_id,
+                            "tipo": "ALERT_003",
+                            "entidade_ref": sku["id"],
+                            "entidade_tipo": "sku",
+                            "entidade_nome": f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
+                            "mensagem": f"SKU '{sku.get('codigo_interno', '')}' ativo sem pedido registrado há mais de 60 dias.",
+                            "data_criacao": _now_iso(),
+                            "status": "pendente",
+                            "responsavel": "",
+                        })
+                        created_count += 1
+            except Exception:
+                pass
+
+        # ALERT_004: Client in "cliente_fechado" without new project > 90 days
+        clients_fechado = await db.crm_clients.find(
+            {"tenant_id": tenant_id, "stage": "cliente_fechado"}, {"_id": 0}
+        ).to_list(1000)
+        for c in clients_fechado:
+            # Check last project creation date
+            last_proj = await db.crm_projects.find_one(
+                {"cliente_id": c["id"], "tenant_id": tenant_id},
+                sort=[("created_at", -1)]
+            )
+            ref_date = c.get("updated_at") or c.get("created_at", "")
+            if last_proj:
+                ref_date = last_proj.get("created_at", ref_date)
+            try:
+                dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
+                if (now - dt).days > 90:
+                    exists = await db.crm_alerts.find_one({
+                        "tenant_id": tenant_id, "tipo": "ALERT_004",
+                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
+                    })
+                    if not exists:
+                        await db.crm_alerts.insert_one({
+                            "id": _new_id(), "tenant_id": tenant_id,
+                            "tipo": "ALERT_004",
+                            "entidade_ref": c["id"],
+                            "entidade_tipo": "client",
+                            "entidade_nome": c.get("nome_empresa", ""),
+                            "mensagem": f"Cliente fechado '{c.get('nome_empresa', '')}' sem novo projeto há mais de 90 dias.",
+                            "data_criacao": _now_iso(),
+                            "status": "pendente",
+                            "responsavel": c.get("created_by", ""),
+                        })
+                        created_count += 1
+            except Exception:
+                pass
+
+        # ALERT_005: SKU ANVISA expiring in ≤ 60 days
+        for sku in active_skus:
+            anvisa_val = sku.get("anvisa", {}).get("validade")
+            if anvisa_val:
+                try:
+                    dt = datetime.fromisoformat(str(anvisa_val).replace("Z", "+00:00"))
+                    if 0 <= (dt - now).days <= 60:
+                        exists = await db.crm_alerts.find_one({
+                            "tenant_id": tenant_id, "tipo": "ALERT_005",
+                            "entidade_ref": sku["id"], "status": {"$ne": "resolvido"}
+                        })
+                        if not exists:
+                            await db.crm_alerts.insert_one({
+                                "id": _new_id(), "tenant_id": tenant_id,
+                                "tipo": "ALERT_005",
+                                "entidade_ref": sku["id"],
+                                "entidade_tipo": "sku",
+                                "entidade_nome": f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
+                                "mensagem": f"ANVISA do SKU '{sku.get('codigo_interno', '')}' vence em {(dt - now).days} dias.",
+                                "data_criacao": _now_iso(),
+                                "status": "pendente",
+                                "responsavel": "",
+                            })
+                            created_count += 1
+                except Exception:
+                    pass
+
+        # ALERT_006: previsao_segundo_pedido D-7
+        clients_with_previsao = await db.crm_clients.find(
+            {"tenant_id": tenant_id, "previsao_segundo_pedido": {"$ne": None}},
+            {"_id": 0}
+        ).to_list(1000)
+        for c in clients_with_previsao:
+            previsao = c.get("previsao_segundo_pedido")
+            if previsao:
+                try:
+                    dt = datetime.fromisoformat(str(previsao).replace("Z", "+00:00"))
+                    days_until = (dt - now).days
+                    if 0 <= days_until <= 7:
+                        exists = await db.crm_alerts.find_one({
+                            "tenant_id": tenant_id, "tipo": "ALERT_006",
+                            "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
+                        })
+                        if not exists:
+                            await db.crm_alerts.insert_one({
+                                "id": _new_id(), "tenant_id": tenant_id,
+                                "tipo": "ALERT_006",
+                                "entidade_ref": c["id"],
+                                "entidade_tipo": "client",
+                                "entidade_nome": c.get("nome_empresa", ""),
+                                "mensagem": f"Previsão de segundo pedido de '{c.get('nome_empresa', '')}' em {days_until} dia(s).",
+                                "data_criacao": _now_iso(),
+                                "status": "pendente",
+                                "responsavel": c.get("created_by", ""),
+                            })
+                            created_count += 1
+                except Exception:
+                    pass
+
+        # ALERT_007: Variação em "solicitada" sem P&D aceitar > 2 dias úteis
+        samples_with_variacoes = await db.crm_samples.find(
+            {"tenant_id": tenant_id, "variacoes": {"$exists": True, "$ne": []}},
+            {"_id": 0}
+        ).to_list(1000)
+        
+        for sample in samples_with_variacoes:
+            for variacao in sample.get("variacoes", []):
+                if variacao.get("status") == "solicitada":
+                    # Verificar se tem card P&D associado
+                    pd_card = await db.pd_cards.find_one({
+                        "amostra_variacao_id": variacao["id"],
+                        "status_pd": "solicitado"
+                    })
+                    
+                    if pd_card:
+                        created = pd_card.get("created_at", "")
+                        try:
+                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            # Calcular dias úteis (aproximação simples: dias corridos * 0.7)
+                            days_elapsed = (now - dt).days
+                            if days_elapsed > 2:
+                                exists = await db.crm_alerts.find_one({
+                                    "tenant_id": tenant_id,
+                                    "tipo": "ALERT_007",
+                                    "entidade_ref": variacao["id"],
+                                    "status": {"$ne": "resolvido"}
+                                })
+                                if not exists:
+                                    await db.crm_alerts.insert_one({
+                                        "id": _new_id(),
+                                        "tenant_id": tenant_id,
+                                        "tipo": "ALERT_007",
+                                        "entidade_ref": variacao["id"],
+                                        "entidade_tipo": "variacao",
+                                        "entidade_nome": f"{sample.get('nome_produto', '')} - {variacao.get('codigo', '')}",
+                                        "mensagem": f"Variação '{variacao.get('codigo', '')}' está em 'Solicitada' há {days_elapsed} dias sem aceite do P&D.",
+                                        "data_criacao": _now_iso(),
+                                        "status": "pendente",
+                                        "responsavel": sample.get("responsavel_pd", ""),
+                                    })
+                                    created_count += 1
+                        except Exception:
+                            pass
+
+        # RN-FU-01: Follow-up automático por etapa (alerta quando cliente sem interação por X dias)
+        # Prazo configurável: Prospecção 3d / Qualificado 5d / Projeto em Discussão 7d / Negociação 5d
+        for stage, prazo_dias in FOLLOW_UP_PRAZOS.items():
+            if stage in ["cliente_fechado", "cliente_perdido"]:
+                continue  # Não gera follow-up para etapas finais
+            
+            clients_in_stage = await db.crm_clients.find(
+                {"tenant_id": tenant_id, "stage": stage}, {"_id": 0}
+            ).to_list(1000)
+            
+            for c in clients_in_stage:
+                # Usar a data da última interação (updated_at ou última movimentação)
+                last_interaction = c.get("updated_at") or c.get("created_at", "")
+                historico = c.get("historico_movimentacoes", [])
+                if historico:
+                    last_interaction = historico[-1].get("data", last_interaction)
+                
+                try:
+                    dt = datetime.fromisoformat(str(last_interaction).replace("Z", "+00:00"))
+                    days_without_interaction = (now - dt).days
+                    
+                    if days_without_interaction > prazo_dias:
+                        exists = await db.crm_alerts.find_one({
+                            "tenant_id": tenant_id,
+                            "tipo": "FOLLOW_UP",
+                            "entidade_ref": c["id"],
+                            "status": {"$ne": "resolvido"}
+                        })
+                        if not exists:
+                            stage_label = STAGE_LABELS.get(stage, stage)
+                            await db.crm_alerts.insert_one({
+                                "id": _new_id(),
+                                "tenant_id": tenant_id,
+                                "tipo": "FOLLOW_UP",
+                                "entidade_ref": c["id"],
+                                "entidade_tipo": "client",
+                                "entidade_nome": c.get("nome_empresa", ""),
+                                "mensagem": f"Cliente '{c.get('nome_empresa', '')}' está em '{stage_label}' há {days_without_interaction} dias sem interação (prazo: {prazo_dias} dias).",
+                                "data_criacao": _now_iso(),
+                                "status": "pendente",
+                                "responsavel": c.get("responsavel_comercial") or c.get("created_by", ""),
+                            })
+                            created_count += 1
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.error(f"Alert check error for tenant {tenant_id}: {e}")
+
+    return created_count
+
+
+async def run_alert_scheduler():
+    """Background task that checks alerts every hour for all tenants"""
+    await asyncio.sleep(30)  # Wait 30s after startup
+    while True:
+        try:
+            tenants = await db.tenants.find({}, {"_id": 0, "id": 1}).to_list(500)
+            total = 0
+            for t in tenants:
+                count = await check_alerts_for_tenant(t["id"])
+                total += count
+            if total > 0:
+                logger.info(f"Alert scheduler: created {total} alerts across {len(tenants)} tenants")
+        except Exception as e:
+            logger.error(f"Alert scheduler error: {e}")
+        await asyncio.sleep(3600)  # Every hour
+
+
+# ======================================================================
+#  DASHBOARD & REPORTS
+# ======================================================================
+
+@crm_router.get("/dashboard")
+async def crm_dashboard(request: Request):
+    user = await _get_current_user(request)
+    tid = user["tenant_id"]
+
+    # Funnel: count per stage
+    funnel = []
+    for stage in CLIENT_STAGES:
+        count = await db.crm_clients.count_documents({"tenant_id": tid, "stage": stage})
+        funnel.append({"stage": stage, "label": STAGE_LABELS.get(stage, stage), "count": count})
+
+    # Conversion rates
+    total_clients = sum(s["count"] for s in funnel)
+    for s in funnel:
+        s["percentage"] = round((s["count"] / total_clients * 100), 1) if total_clients > 0 else 0
+
+    # Metrics
+    active_clients = await db.crm_clients.count_documents({
+        "tenant_id": tid,
+        "stage": {"$nin": ["cliente_perdido"]}
+    })
+    samples_in_progress = await db.crm_samples.count_documents({
+        "tenant_id": tid,
+        "stage": {"$in": ["solicitada", "em_elaboracao", "retrabalho", "enviada"]}
+    })
+    active_skus = await db.skus.count_documents({"tenant_id": tid, "status": "ativo"})
+    pending_alerts = await db.crm_alerts.count_documents({"tenant_id": tid, "status": "pendente"})
+    total_projects = await db.crm_projects.count_documents({"tenant_id": tid})
+
+    # Today's alerts
+    today_alerts = await db.crm_alerts.find(
+        {"tenant_id": tid, "status": "pendente"},
+        {"_id": 0}
+    ).sort("data_criacao", -1).to_list(20)
+
+    return {
+        "funnel": funnel,
+        "metrics": {
+            "total_clients": total_clients,
+            "active_clients": active_clients,
+            "total_projects": total_projects,
+            "samples_in_progress": samples_in_progress,
+            "active_skus": active_skus,
+            "pending_alerts": pending_alerts,
+        },
+        "today_alerts": today_alerts,
+    }
+
+
+@crm_router.get("/reports/client/{client_id}")
+async def client_report(client_id: str, request: Request):
+    user = await _get_current_user(request)
+    client = await db.crm_clients.find_one(
+        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+
+    # SKUs linked to this client
+    skus = await db.skus.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).to_list(500)
+
+    # Aggregate orders across all SKUs
+    all_orders = []
+    for sku in skus:
+        for order in sku.get("historico_pedidos", []):
+            order["sku_codigo"] = sku["codigo_interno"]
+            order["sku_nome"] = sku["nome_produto"]
+            all_orders.append(order)
+
+    total_orders = len(all_orders)
+    total_value = sum(o.get("valor_total", 0) for o in all_orders)
+    quantities = [o.get("quantidade", 0) for o in all_orders]
+
+    avg_quantity = sum(quantities) / len(quantities) if quantities else 0
+    max_quantity = max(quantities) if quantities else 0
+    min_quantity = min(quantities) if quantities else 0
+
+    # Last order
+    last_order = None
+    if all_orders:
+        sorted_orders = sorted(all_orders, key=lambda x: x.get("data_pedido", ""), reverse=True)
+        last_order = sorted_orders[0]
+
+    # Reorder frequency (average across SKUs)
+    freqs = [s.get("frequencia_media_recompra_dias", 0) for s in skus if s.get("frequencia_media_recompra_dias", 0) > 0]
+    avg_freq = sum(freqs) / len(freqs) if freqs else 0
+
+    # Projects
+    projects = await db.crm_projects.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    # Samples
+    samples = await db.crm_samples.find(
+        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(500)
+
+    return {
+        "client": client,
+        "orders": {
+            "total_orders": total_orders,
+            "total_value": total_value,
+            "last_order": last_order,
+            "avg_quantity": round(avg_quantity, 1),
+            "max_quantity": max_quantity,
+            "min_quantity": min_quantity,
+            "avg_reorder_frequency_days": round(avg_freq),
+        },
+        "skus_ativos": [s for s in skus if s.get("status") == "ativo"],
+        "all_skus": skus,
+        "projects": projects,
+        "samples": samples,
+        "timeline": client.get("historico_movimentacoes", []),
+    }
+
+
+@crm_router.get("/reports/sku/{sku_id}")
+async def sku_report(sku_id: str, request: Request):
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one(
+        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+
+    orders = sku.get("historico_pedidos", [])
+    total_produced = sum(o.get("quantidade", 0) for o in orders)
+    total_orders = len(orders)
+
+    # Last production date
+    last_production = None
+    if orders:
+        sorted_orders = sorted(orders, key=lambda x: x.get("data_pedido", ""), reverse=True)
+        last_production = sorted_orders[0].get("data_pedido")
+
+    # Find all clients that have this SKU (via amostras_aprovadas or skus_confirmados)
+    clients_with_sku = await db.crm_clients.find(
+        {
+            "tenant_id": user["tenant_id"],
+            "$or": [
+                {"amostras_aprovadas": sku_id},
+                {"skus_confirmados": sku_id},
+            ]
+        },
+        {"_id": 0, "id": 1, "nome_empresa": 1}
+    ).to_list(100)
+
+    # Also check via the direct cliente_id
+    main_client = await db.crm_clients.find_one(
+        {"id": sku["cliente_id"]}, {"_id": 0, "id": 1, "nome_empresa": 1}
+    )
+
+    all_client_ids = set(c["id"] for c in clients_with_sku)
+    if main_client and main_client["id"] not in all_client_ids:
+        clients_with_sku.append(main_client)
+
+    # ANVISA status
+    anvisa = sku.get("anvisa", {})
+    anvisa_status = "N/A"
+    if anvisa.get("numero"):
+        if anvisa.get("validade"):
+            try:
+                val_dt = datetime.fromisoformat(str(anvisa["validade"]).replace("Z", "+00:00"))
+                days_left = (val_dt - datetime.now(timezone.utc)).days
+                if days_left < 0:
+                    anvisa_status = "Vencido"
+                elif days_left <= 60:
+                    anvisa_status = f"Vence em {days_left} dias"
+                else:
+                    anvisa_status = "Válido"
+            except Exception:
+                anvisa_status = "Válido"
+        else:
+            anvisa_status = "Sem validade"
+
+    return {
+        "sku": sku,
+        "last_production_date": last_production,
+        "total_produced": total_produced,
+        "total_orders": total_orders,
+        "order_frequency_days": sku.get("frequencia_media_recompra_dias", 0),
+        "clients": clients_with_sku,
+        "anvisa_status": anvisa_status,
+        "orders": orders,
+    }
+
+
+# ======================================================================
+#  CRM CONFIG — Customizable Columns & Fields (Pipefy-style)
+# ======================================================================
+
+DEFAULT_CRM_COLUMNS = {
+    "clients": [
+        {"key": "prospeccao", "label": "Prospecção", "color": "bg-blue-500", "order": 0, "is_system": True},
+        {"key": "qualificado", "label": "Qualificado", "color": "bg-cyan-500", "order": 1, "is_system": True},
+        {"key": "projeto_em_discussao", "label": "Projeto em Discussão", "color": "bg-violet-500", "order": 2, "is_system": True},
+        {"key": "negociacao", "label": "Negociação", "color": "bg-amber-500", "order": 3, "is_system": True},
+        {"key": "cliente_fechado", "label": "Cliente Fechado", "color": "bg-emerald-500", "order": 4, "is_system": True},
+        {"key": "cliente_perdido", "label": "Cliente Perdido", "color": "bg-red-500", "order": 5, "is_system": True},
+    ],
+    "projects": [
+        {"key": "projeto_em_discussao", "label": "Projeto em Discussão", "color": "bg-violet-500", "order": 0, "is_system": True},
+        {"key": "amostras", "label": "Amostras", "color": "bg-emerald-500", "order": 1, "is_system": True},
+    ],
+    "samples": [
+        {"key": "solicitada", "label": "Solicitada", "color": "bg-slate-400", "order": 0, "is_system": True},
+        {"key": "em_elaboracao", "label": "Em Elaboração", "color": "bg-blue-500", "order": 1, "is_system": True},
+        {"key": "retrabalho", "label": "Retrabalho", "color": "bg-amber-500", "order": 2, "is_system": True},
+        {"key": "enviada", "label": "Enviada", "color": "bg-cyan-500", "order": 3, "is_system": True},
+        {"key": "aprovada", "label": "Aprovada", "color": "bg-emerald-500", "order": 4, "is_system": True},
+        {"key": "reprovada", "label": "Reprovada", "color": "bg-red-500", "order": 5, "is_system": True},
+    ],
+}
+
+FIELD_TYPES = ["text", "number", "date", "select", "textarea", "boolean", "email", "phone"]
+
+
+class CRMColumnCreate(BaseModel):
+    crm_type: str
+    label: str
+    color: str = "bg-gray-500"
+
+class CRMColumnUpdate(BaseModel):
+    label: Optional[str] = None
+    color: Optional[str] = None
+
+class CRMColumnReorder(BaseModel):
+    column_ids: List[str]
+
+class CRMFieldCreate(BaseModel):
+    column_id: str
+    label: str
+    type: str = "text"
+    required: bool = False
+    options: List[str] = []
+
+class CRMFieldUpdate(BaseModel):
+    label: Optional[str] = None
+    type: Optional[str] = None
+    required: Optional[bool] = None
+    options: Optional[List[str]] = None
+
+
+async def _ensure_crm_config(tenant_id: str, crm_type: str):
+    """Seed default CRM config if not exists"""
+    existing = await db.crm_column_configs.find_one({"tenant_id": tenant_id, "crm_type": crm_type})
+    if existing:
+        return
+
+    defaults = DEFAULT_CRM_COLUMNS.get(crm_type, [])
+    for col_def in defaults:
+        col_id = _new_id()
+        await db.crm_column_configs.insert_one({
+            "id": col_id,
+            "tenant_id": tenant_id,
+            "crm_type": crm_type,
+            "key": col_def["key"],
+            "label": col_def["label"],
+            "color": col_def["color"],
+            "order": col_def["order"],
+            "is_system": col_def.get("is_system", False),
+            "created_at": _now_iso(),
+        })
+    logger.info(f"Seeded CRM config for {crm_type} tenant {tenant_id}")
+
+
+# ======================================================================
+#  CONSTANTS ENDPOINT (PRD Lists)
+# ======================================================================
+
+@crm_router.get("/constants")
+async def get_crm_constants(request: Request):
+    """Retorna todas as constantes do PRD para o frontend"""
+    user = await _get_current_user(request)
+    
+    return {
+        "canal_origem": CANAL_ORIGEM_OPTIONS,
+        "canal_origem_grupos": CANAL_ORIGEM_GROUPS,
+        "categoria_interesse": CATEGORIA_INTERESSE_OPTIONS,
+        "categorias_grau2": CATEGORIAS_GRAU2,
+        "origem_lead": ORIGEM_LEAD_OPTIONS,
+        "volume_estimado": VOLUME_ESTIMADO_OPTIONS,
+        "tem_anvisa": TEM_ANVISA_OPTIONS,
+        "motivo_perda": MOTIVO_PERDA_OPTIONS,
+        "segmento": SEGMENTO_CLIENTE_OPTIONS,
+        "porte": PORTE_CLIENTE_OPTIONS,
+        "temperatura_lead": TEMPERATURA_LEAD_OPTIONS,
+        "cargo_decisor": CARGO_DECISOR_OPTIONS,
+        "ufs": UF_OPTIONS,
+        "project_posicionamento": PROJECT_POSICIONAMENTO_OPTIONS,
+        "project_tipo_servico": PROJECT_TIPO_SERVICO_OPTIONS,
+        "project_restricoes_tecnicas": PROJECT_RESTRICAO_TECNICA_OPTIONS,
+        "sample_tipos": TIPO_AMOSTRA_OPTIONS,
+        "sample_unidades": UNIDADE_QUANTIDADE_AMOSTRA_OPTIONS,
+        "sample_parametros_variacao": SAMPLE_VARIATION_PARAM_OPTIONS,
+        "sample_resultados": SAMPLE_RESULTADO_OPTIONS,
+        "follow_up_prazos": FOLLOW_UP_PRAZOS,
+        "client_stages": CLIENT_STAGES,
+        "project_stages": PROJECT_STAGES,
+        "sample_stages": SAMPLE_STAGES,
+        "stage_labels": STAGE_LABELS,
+    }
+
+
+@crm_router.get("/config/{crm_type}/columns")
+async def get_crm_columns(crm_type: str, request: Request):
+    user = await _get_current_user(request)
+    if crm_type not in ("clients", "projects", "samples"):
+        raise HTTPException(status_code=400, detail="Tipo de CRM inválido")
+
+    await _ensure_crm_config(user["tenant_id"], crm_type)
+
+    columns = await db.crm_column_configs.find(
+        {"tenant_id": user["tenant_id"], "crm_type": crm_type}, {"_id": 0}
+    ).sort("order", 1).to_list(100)
+
+    # Load fields for each column
+    col_ids = [c["id"] for c in columns]
+    fields = await db.crm_field_configs.find(
+        {"column_id": {"$in": col_ids}, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("order", 1).to_list(500)
+
+    fields_by_col = {}
+    for f in fields:
+        fields_by_col.setdefault(f["column_id"], []).append(f)
+
+    for col in columns:
+        col["fields"] = fields_by_col.get(col["id"], [])
+
+    return {"columns": columns, "field_types": FIELD_TYPES}
+
+
+@crm_router.post("/config/columns")
+async def create_crm_column(data: CRMColumnCreate, request: Request):
+    user = await _get_current_user(request)
+    if data.crm_type not in ("clients", "projects", "samples"):
+        raise HTTPException(status_code=400, detail="Tipo de CRM inválido")
+
+    await _ensure_crm_config(user["tenant_id"], data.crm_type)
+
+    # Get next order
+    max_order_docs = await db.crm_column_configs.find(
+        {"tenant_id": user["tenant_id"], "crm_type": data.crm_type}
+    ).sort("order", -1).to_list(1)
+    next_order = (max_order_docs[0]["order"] + 1) if max_order_docs else 0
+
+    col_id = _new_id()
+    key = data.label.lower().replace(" ", "_").replace("/", "_")
+    col = {
+        "id": col_id,
+        "tenant_id": user["tenant_id"],
+        "crm_type": data.crm_type,
+        "key": key,
+        "label": data.label,
+        "color": data.color,
+        "order": next_order,
+        "is_system": False,
+        "created_at": _now_iso(),
+    }
+    await db.crm_column_configs.insert_one(col)
+    col.pop("_id", None)
+    col["fields"] = []
+
+    # Add key to allowed stages and transitions
+    _update_stage_config(data.crm_type, key)
+
+    return col
+
+
+@crm_router.put("/config/columns/{column_id}")
+async def update_crm_column(column_id: str, data: CRMColumnUpdate, request: Request):
+    user = await _get_current_user(request)
+    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nada para atualizar")
+
+    result = await db.crm_column_configs.update_one(
+        {"id": column_id, "tenant_id": user["tenant_id"]},
+        {"$set": updates}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Coluna não encontrada")
+    updated = await db.crm_column_configs.find_one({"id": column_id}, {"_id": 0})
+    return updated
+
+
+@crm_router.delete("/config/columns/{column_id}")
+async def delete_crm_column(column_id: str, request: Request):
+    user = await _get_current_user(request)
+    col = await db.crm_column_configs.find_one(
+        {"id": column_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not col:
+        raise HTTPException(status_code=404, detail="Coluna não encontrada")
+
+    if col.get("is_system"):
+        raise HTTPException(status_code=400, detail="Não é possível excluir coluna do sistema")
+
+    # Check for items in this column
+    crm_type = col["crm_type"]
+    collection_map = {"clients": "crm_clients", "projects": "crm_projects", "samples": "crm_samples"}
+    coll_name = collection_map.get(crm_type)
+    if coll_name:
+        coll = db[coll_name]
+        count = await coll.count_documents({"stage": col["key"], "tenant_id": user["tenant_id"]})
+        if count > 0:
+            raise HTTPException(status_code=400, detail=f"Não é possível excluir: {count} item(ns) nesta coluna")
+
+    await db.crm_field_configs.delete_many({"column_id": column_id})
+    await db.crm_column_configs.delete_one({"id": column_id})
+    return {"message": "Coluna removida"}
+
+
+@crm_router.put("/config/columns/reorder")
+async def reorder_crm_columns(data: CRMColumnReorder, request: Request):
+    user = await _get_current_user(request)
+    for i, cid in enumerate(data.column_ids):
+        await db.crm_column_configs.update_one(
+            {"id": cid, "tenant_id": user["tenant_id"]},
+            {"$set": {"order": i}}
+        )
+    return {"message": "Colunas reordenadas"}
+
+
+@crm_router.post("/config/fields")
+async def create_crm_field(data: CRMFieldCreate, request: Request):
+    user = await _get_current_user(request)
+    col = await db.crm_column_configs.find_one({"id": data.column_id, "tenant_id": user["tenant_id"]})
+    if not col:
+        raise HTTPException(status_code=404, detail="Coluna não encontrada")
+
+    if data.type not in FIELD_TYPES:
+        raise HTTPException(status_code=400, detail=f"Tipo de campo inválido: {data.type}")
+
+    max_order_docs = await db.crm_field_configs.find(
+        {"column_id": data.column_id}
+    ).sort("order", -1).to_list(1)
+    next_order = (max_order_docs[0]["order"] + 1) if max_order_docs else 0
+
+    field_id = _new_id()
+    field = {
+        "id": field_id,
+        "tenant_id": user["tenant_id"],
+        "column_id": data.column_id,
+        "label": data.label,
+        "type": data.type,
+        "required": data.required,
+        "options": data.options,
+        "order": next_order,
+        "created_at": _now_iso(),
+    }
+    await db.crm_field_configs.insert_one(field)
+    field.pop("_id", None)
+    return field
+
+
+@crm_router.put("/config/fields/{field_id}")
+async def update_crm_field(field_id: str, data: CRMFieldUpdate, request: Request):
+    user = await _get_current_user(request)
+    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nada para atualizar")
+
+    result = await db.crm_field_configs.update_one(
+        {"id": field_id, "tenant_id": user["tenant_id"]},
+        {"$set": updates}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Campo não encontrado")
+    return await db.crm_field_configs.find_one({"id": field_id}, {"_id": 0})
+
+
+@crm_router.delete("/config/fields/{field_id}")
+async def delete_crm_field(field_id: str, request: Request):
+    user = await _get_current_user(request)
+    result = await db.crm_field_configs.delete_one({"id": field_id, "tenant_id": user["tenant_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Campo não encontrado")
+    return {"message": "Campo removido"}
+
+
+def _update_stage_config(crm_type: str, new_key: str):
+    """Add new custom key to runtime stage/transition configs"""
+    global CLIENT_STAGES, CLIENT_TRANSITIONS, PROJECT_STAGES, PROJECT_TRANSITIONS, SAMPLE_STAGES, SAMPLE_TRANSITIONS
+    if crm_type == "clients":
+        if new_key not in CLIENT_STAGES:
+            # Insert before last 2 (fechado, perdido)
+            idx = max(0, len(CLIENT_STAGES) - 2)
+            CLIENT_STAGES.insert(idx, new_key)
+            CLIENT_TRANSITIONS[new_key] = [CLIENT_STAGES[idx + 1] if idx + 1 < len(CLIENT_STAGES) else "cliente_perdido", "cliente_perdido"]
+            # Allow previous stage to transition to new stage
+            if idx > 0:
+                prev = CLIENT_STAGES[idx - 1]
+                if new_key not in CLIENT_TRANSITIONS.get(prev, []):
+                    CLIENT_TRANSITIONS[prev].insert(0, new_key)
+    elif crm_type == "projects":
+        if new_key not in PROJECT_STAGES:
+            PROJECT_STAGES.insert(-1, new_key)
+            PROJECT_TRANSITIONS[new_key] = [PROJECT_STAGES[-1]]
+    elif crm_type == "samples":
+        if new_key not in SAMPLE_STAGES:
+            idx = max(0, len(SAMPLE_STAGES) - 2)
+            SAMPLE_STAGES.insert(idx, new_key)
+            SAMPLE_TRANSITIONS[new_key] = [SAMPLE_STAGES[idx + 1] if idx + 1 < len(SAMPLE_STAGES) else "reprovada"]
+
+
+# ======================================================================
+#  ENUM OPTIONS (for frontend forms)
+# ======================================================================
+
+@crm_router.get("/options")
+async def get_options(request: Request):
+    """Return all enum options for frontend forms"""
+    await _get_current_user(request)
+    return {
+        "canal_origem": CANAL_ORIGEM_OPTIONS,
+        "canal_origem_grupos": CANAL_ORIGEM_GROUPS,
+        "categoria_interesse": CATEGORIA_INTERESSE_OPTIONS,
+        "origem_lead": ORIGEM_LEAD_OPTIONS,
+        "volume_estimado_mensal": VOLUME_ESTIMADO_OPTIONS,
+        "tem_anvisa": TEM_ANVISA_OPTIONS,
+        "segmento": SEGMENTO_CLIENTE_OPTIONS,
+        "porte": PORTE_CLIENTE_OPTIONS,
+        "temperatura_lead": TEMPERATURA_LEAD_OPTIONS,
+        "cargo_decisor": CARGO_DECISOR_OPTIONS,
+        "ufs": UF_OPTIONS,
+        "client_stages": [{"value": s, "label": STAGE_LABELS.get(s, s)} for s in CLIENT_STAGES],
+        "project_stages": [{"value": s, "label": STAGE_LABELS.get(s, s)} for s in PROJECT_STAGES],
+        "sample_stages": [{"value": s, "label": STAGE_LABELS.get(s, s)} for s in SAMPLE_STAGES],
+    }
+
+
+@crm_router.get("/users-list")
+async def list_crm_users(request: Request):
+    """List users for assignment dropdowns"""
+    user = await _get_current_user(request)
+    users = await db.users.find(
+        {"tenant_id": user["tenant_id"]},
+        {"_id": 0, "id": 1, "name": 1, "email": 1, "role": 1}
+    ).to_list(100)
+    return users

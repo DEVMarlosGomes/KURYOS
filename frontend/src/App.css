@@ -1,0 +1,123 @@
+/* Scrollbar always visible */
+.scrollbar-visible {
+    scrollbar-width: auto;
+    scrollbar-color: #999 #e8e8e8;
+    overflow-y: scroll !important;
+}
+.scrollbar-visible::-webkit-scrollbar {
+    width: 10px;
+    display: block;
+}
+.scrollbar-visible::-webkit-scrollbar-track {
+    background: #e8e8e8;
+    border-radius: 5px;
+}
+.scrollbar-visible::-webkit-scrollbar-thumb {
+    background: #999;
+    border-radius: 5px;
+    min-height: 40px;
+}
+.scrollbar-visible::-webkit-scrollbar-thumb:hover {
+    background: #666;
+}
+.dark .scrollbar-visible {
+    scrollbar-color: #666 #333;
+}
+.dark .scrollbar-visible::-webkit-scrollbar-track {
+    background: #333;
+}
+.dark .scrollbar-visible::-webkit-scrollbar-thumb {
+    background: #666;
+}
+.dark .scrollbar-visible::-webkit-scrollbar-thumb:hover {
+    background: #888;
+}
+
+
+/* Kanban Board */
+.kanban-board {
+    display: flex;
+    gap: 1rem;
+    overflow-x: auto;
+    padding-bottom: 1rem;
+    min-height: calc(100vh - 140px);
+}
+
+.kanban-column {
+    min-width: 300px;
+    max-width: 300px;
+    flex-shrink: 0;
+}
+
+.kanban-card-dragging {
+    transform: scale(1.03);
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+    opacity: 0.95;
+}
+
+/* Temperature badges */
+.badge-frio {
+    background-color: #E0F2FE;
+    color: #0284C7;
+}
+.dark .badge-frio {
+    background-color: #0C4A6E;
+    color: #7DD3FC;
+}
+.badge-morno {
+    background-color: #FFEDD5;
+    color: #EA580C;
+}
+.dark .badge-morno {
+    background-color: #7C2D12;
+    color: #FDBA74;
+}
+.badge-quente {
+    background-color: #FEE2E2;
+    color: #DC2626;
+}
+.dark .badge-quente {
+    background-color: #7F1D1D;
+    color: #FCA5A5;
+}
+
+/* Chat bubbles */
+.chat-bubble-agent {
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    border-radius: 1rem 1rem 0.25rem 1rem;
+    max-width: 80%;
+    margin-left: auto;
+}
+.chat-bubble-client {
+    background: hsl(var(--muted));
+    color: hsl(var(--foreground));
+    border-radius: 1rem 1rem 1rem 0.25rem;
+    max-width: 80%;
+}
+
+/* Sidebar */
+.sidebar-item {
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+.sidebar-item:hover {
+    background: hsl(var(--accent));
+}
+.sidebar-item.active {
+    background: hsl(var(--accent));
+    font-weight: 500;
+}
+
+/* Page transitions */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.page-enter {
+    animation: fadeIn 0.25s ease-out;
+}
+
+/* Mono numbers */
+.mono-num {
+    font-family: 'JetBrains Mono', monospace;
+}

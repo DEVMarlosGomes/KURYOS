@@ -1,0 +1,38 @@
+{
+  "summary": "Backend-only regression for KURYOS ERP 8-item sprint plan. Logged in as 5 distinct profiles (admin, formulador, lider_pd, vendedor, qa). Wrote /app/backend/tests/test_kuryos_8_items.py covering all 8 items via the production preview URL. 25 tests, 25 passed (100%). Validated catalog/search ordering & semáforo, ficha-técnica cost stripping, cost-versions RBAC visibility per role, CRM P&D transition validation + admin bypass, retroceder flow (formulador → pending solicitation, admin → direct, lider_pd → decisão), OM CRUD + status workflow + PDF, formula bank fragrance fields, modo_preparo persistence (structured + list-of-strings retrocompat).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/pd/cards/{id}/retroceder", "issue": "Response/spec naming inconsistency: body field is `status_destino` (not `novo_status` as hinted by review spec). When formulador retrocede, response.status=='aguardando_aprovacao' but the CARD's status_pd does NOT change (only a pending solicitation is created). Spec text 'Por formulador → status=aguardando_aprovacao' was ambiguous; current behavior keeps card unchanged until lider_pd approves — which is correct workflow, but ensure UI/docs reflect this. Tests adapted accordingly."},
+      {"endpoint": "GET /api/pd/developments/{id} (direct)", "issue": "Returns 404 even though the development exists (queried via pd_request_id works). Not in spec but worth flagging — likely missing endpoint or filter mismatch."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_kuryos_8_items.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Clarify retroceder spec wording in PRD: when formulador calls it, only the SOLICITATION is in 'aguardando_aprovacao'; the card's status_pd is unchanged. The review_request wording could mislead readers.",
+    "Decide whether GET /api/pd/developments/{dev_id} should be a public endpoint (currently 404)."
+  ],
+  "critical_code_review_comments": [
+    "pd_routes.py is now ~5954 lines — strongly recommend splitting into modules (ordens_manipulacao, retrocessos, ficha_tecnica, catalog) for maintainability (>700-line guideline).",
+    "crm_routes.py is ~4903 lines — same recommendation; PD-related code (PD_STATUSES, transições, move_pd_card) could be co-located with pd_routes for cohesion.",
+    "Field name divergence between review spec (`novo_status`) and actual API (`status_destino`) caused initial test failures — consider an alias to avoid breaking changes for clients already coded against either name."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_kuryos_8_items.py"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "n/a (backend-only request)"},
+  "test_credentials": "admin@kuryos.com/admin123; formulador|liderpd|vendedor|qa@kuryos.com/kuryos123",
+  "seed_data_creation": "Used pre-existing seed (sample-test-om-001, var-1..4, card-test-001, OM 3bbfc261, formula ad6c7a64, request a77ea73b, dev 2da56af0). Test also creates additional OMs via POST and additional pending retrocessos; no destructive cleanup performed since spec instructed not to delete existing data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "All 8 items covered. Auth via /api/auth/login (session cookie). Retroceder payload uses `status_destino` + `justificativa` (>=10 chars). PDF endpoints: /api/pd/ordens-manipulacao/{id}/pdf returns application/pdf. CRM card move uses field `status` (not `new_status`). cost-versions endpoint adds _role_view discriminator in response. To re-run: `export $(grep -v '^#' /app/frontend/.env | xargs) && pytest /app/backend/tests/test_kuryos_8_items.py -v`.",
+  "rca of the issue": "No production bugs found. Two test-side issues fixed during run: (1) wrong field name `novo_status`→`status_destino`; (2) assumption that formulador retrocesso would mutate card status_pd, while implementation correctly only creates a pending solicitation."
+}
