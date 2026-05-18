@@ -21,6 +21,7 @@ from rbac import (
     has_role,
     can_view_formula_composition,
     can_view_live_document_revisions,
+    can_view_commercial_costs,
     PD_READ,
     PD_FULL,
     PD_WRITE,
@@ -29,6 +30,7 @@ from rbac import (
     DOC_REVIEWERS,
     QA_APPROVERS,
     ADMIN_ONLY,
+    COMPRAS_FULL,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,13 @@ ALLOWED_TRANSITIONS = {
     "COMPLETED": [],
 }
 
+ALLOWED_BACKWARD_TRANSITIONS = {
+    "IN_PROGRESS": ["OPEN"],
+    "IN_TESTS": ["IN_PROGRESS"],
+    "WAITING_APPROVAL": ["IN_TESTS"],
+    "APPROVED": ["WAITING_APPROVAL"],
+}
+
 STATUS_LABELS = {
     "OPEN": "Aberto",
     "IN_PROGRESS": "Em Desenvolvimento",
@@ -142,6 +151,7 @@ class PDRequestUpdate(BaseModel):
 class StatusTransition(BaseModel):
     new_status: str
     comment: Optional[str] = None
+    is_backward: bool = False
 
 class FormulaCreate(BaseModel):
     name: str
@@ -158,6 +168,7 @@ class FormulaUpdate(BaseModel):
     volume_unit: Optional[str] = None
     indice_perdas: Optional[float] = None
     cotacao_usd: Optional[float] = None
+    fragrance_target: Optional[float] = None
 
 class FormulaItemCreate(BaseModel):
     ingredient_name: str
@@ -195,6 +206,8 @@ class SampleCreate(BaseModel):
 class SampleUpdate(BaseModel):
     sent_to_client: Optional[bool] = None
     feedback: Optional[str] = None
+    internal_approved: Optional[bool] = None
+    client_approved: Optional[bool] = None
 
 class ApprovalCreate(BaseModel):
     approved_by_client: bool = False
@@ -205,6 +218,21 @@ class CostCreate(BaseModel):
     ingredient_cost: float = 0.0
     packaging_cost: float = 0.0
     labor_cost: float = 0.0
+
+# --- Cost versioning (new system) ---
+
+class PDCostV1Upsert(BaseModel):
+    """P&D saves a draft of ingredient-level costs (v1)."""
+    ingredient_cost_manual: float = 0.0
+    notes: str = ""
+
+class ComprasCostUpsert(BaseModel):
+    """Compras fills in the commercial cost breakdown (v2)."""
+    packaging_cost: float = 0.0
+    labor_cost: float = 0.0
+    overhead_cost: float = 0.0
+    other_cost: float = 0.0
+    notes: str = ""
 
 class DocumentCreate(BaseModel):
     doc_type: str
@@ -645,6 +673,11 @@ async def _build_live_document_snapshot(req_id: str, doc_type: str, tenant_id: s
     if doc_type == "ficha_tecnica":
         if not _is_ficha_tecnica_eligible(ctx):
             raise HTTPException(status_code=400, detail="Ficha Técnica só pode ser gerada após aprovação do cliente e fórmula disponível.")
+        _COST_FIELDS = {"price_per_kg", "price_currency", "cost_brl", "cost_kg_usd", "catalog_id"}
+        composicao_ft = [
+            {k: v for k, v in item.items() if k not in _COST_FIELDS}
+            for item in enriched_items
+        ]
         return {
             "identificacao": {
                 "nome_tecnico": req.get("technical_name") or formula.get("name") or req.get("project_name"),
@@ -655,7 +688,7 @@ async def _build_live_document_snapshot(req_id: str, doc_type: str, tenant_id: s
                 "formulador": formula.get("created_by_name", ""),
                 "cliente": req.get("client_name") or "Portfólio Kuryos",
             },
-            "composicao_completa": enriched_items,
+            "composicao_completa": composicao_ft,
             "modo_preparo": {
                 "resumo": formula.get("notes", ""),
                 "temperatura_processo": lab_results.get("ph", {}).get("temperatura", ""),
@@ -1214,10 +1247,17 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
     
     if new_status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido: {new_status}")
-    
-    allowed = ALLOWED_TRANSITIONS.get(current, [])
-    if new_status not in allowed:
-        raise HTTPException(status_code=400, detail=f"Transição não permitida: {current} → {new_status}. Permitidas: {allowed}")
+
+    if data.is_backward:
+        if not data.comment or len(data.comment.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Justificativa obrigatória para retroceder (mínimo 10 caracteres).")
+        backward_allowed = ALLOWED_BACKWARD_TRANSITIONS.get(current, [])
+        if new_status not in backward_allowed:
+            raise HTTPException(status_code=400, detail=f"Retrocesso não permitido: {current} → {new_status}")
+    else:
+        allowed = ALLOWED_TRANSITIONS.get(current, [])
+        if new_status not in allowed:
+            raise HTTPException(status_code=400, detail=f"Transição não permitida: {current} → {new_status}. Permitidas: {allowed}")
 
     # RN-PD-02: Block IN_TESTS if formula without ingredients
     if new_status == "IN_TESTS":
@@ -1272,7 +1312,22 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
         {"id": req_id},
         {"$set": {"status": new_status, "updated_at": now_iso()}}
     )
-    
+
+    # Sync kanban pipeline card so the column position reflects the new status
+    _PD_STATUS_TO_KANBAN = {
+        "OPEN": "solicitado",
+        "IN_PROGRESS": "em_desenvolvimento",
+        "IN_TESTS": "em_testes",
+        "WAITING_APPROVAL": "aguardando_aprovacao",
+        "REJECTED": "retrabalho_interno",
+    }
+    kanban_status = _PD_STATUS_TO_KANBAN.get(new_status)
+    if kanban_status:
+        await db.pd_cards.update_one(
+            {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
+            {"$set": {"status_pd": kanban_status, "updated_at": now_iso()}}
+        )
+
     await db.pd_request_status_history.insert_one({
         "id": new_id(),
         "pd_request_id": req_id,
@@ -1420,6 +1475,7 @@ async def update_formula(formula_id: str, data: FormulaUpdate, request: Request)
             "volume_unit": "Unidade do lote padrao",
             "indice_perdas": "Fator de perdas",
             "cotacao_usd": "Cotacao USD",
+            "fragrance_target": "Target % fragrance",
         },
     )
 
@@ -1590,6 +1646,11 @@ async def formula_bank(
 
         total_cost_per_kg = round(sum((it.get("cost_brl") or 0) for it in formula_items), 4)
         total_percentage = round(sum((it.get("percentage") or 0) for it in formula_items), 4)
+        _frag_kws = ["fragr", "essência", "essencia", "perfum", "aroma"]
+        fragrance_pct = round(sum(
+            (it.get("percentage") or 0) for it in formula_items
+            if any(kw in str(it.get("ingredient_name", "")).lower() for kw in _frag_kws)
+        ), 4)
 
         row = {
             "id": formula.get("id"),
@@ -1612,6 +1673,8 @@ async def formula_bank(
             "item_count": len(formula_items),
             "total_percentage": total_percentage if show_full else None,
             "total_cost_per_kg": total_cost_per_kg if show_full else None,
+            "fragrance_percentage": fragrance_pct if show_full else None,
+            "fragrance_target": formula.get("fragrance_target"),
             "volume": formula.get("volume", 0),
             "volume_unit": formula.get("volume_unit", "mL"),
             "items": (sorted(
@@ -2223,6 +2286,7 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
     
     if update_fields.get("sent_to_client") == True:
         update_fields["sent_at"] = now_iso()
+        update_fields.setdefault("internal_approved", True)
     
     result = await db.pd_samples.update_one({"id": sample_id}, {"$set": update_fields})
     if result.matched_count == 0:
@@ -2349,6 +2413,259 @@ async def get_costs(dev_id: str, request: Request):
         return {"ingredient_cost": 0, "packaging_cost": 0, "labor_cost": 0, "total_cost": 0}
     return cost
 
+
+# ============ COST VERSIONS (versioned system: P&D v1 → Compras v2) ============
+
+def _default_cost_versions_doc(dev_id: str, tenant_id: str) -> dict:
+    return {
+        "development_id": dev_id,
+        "tenant_id": tenant_id,
+        "v1": {
+            "ingredient_cost_auto": 0.0,
+            "ingredient_cost_manual": 0.0,
+            "total": 0.0,
+            "notes": "",
+            "status": "rascunho",
+            "submitted_at": None,
+            "submitted_by_name": None,
+        },
+        "v2": None,
+        "total_final": 0.0,
+        "updated_at": None,
+    }
+
+
+def _build_cost_versions_response(doc: dict, user: dict, formula_cost_auto: float = 0.0) -> dict:
+    """Return a role-filtered view of the cost versions document.
+
+    compras / admin  → full breakdown of both v1 and v2.
+    P&D roles        → full v1 (they own it), but from v2 only status + total_final.
+    """
+    if not doc:
+        doc = {}
+
+    v1 = dict(doc.get("v1") or {})
+    v1.setdefault("ingredient_cost_auto", formula_cost_auto)
+    v1.setdefault("ingredient_cost_manual", 0.0)
+    v1.setdefault("total", 0.0)
+    v1.setdefault("notes", "")
+    v1.setdefault("status", "rascunho")
+    v1.setdefault("submitted_at", None)
+    v1.setdefault("submitted_by_name", None)
+
+    v2_raw = doc.get("v2")
+    total_final = doc.get("total_final", 0.0)
+
+    if can_view_commercial_costs(user):
+        return {
+            "v1": v1,
+            "v2": v2_raw,
+            "total_final": total_final,
+            "updated_at": doc.get("updated_at"),
+            "_role_view": "compras",
+        }
+
+    # P&D view: full v1, but v2 is redacted to just status + total
+    v2_summary = None
+    if v2_raw:
+        v2_summary = {
+            "status": v2_raw.get("status"),
+            "finalized_at": v2_raw.get("finalized_at"),
+        }
+
+    return {
+        "v1": v1,
+        "v2": v2_summary,
+        "total_final": total_final if v2_raw and v2_raw.get("status") == "finalizado" else None,
+        "updated_at": doc.get("updated_at"),
+        "_role_view": "pd",
+    }
+
+
+@pd_router.get("/developments/{dev_id}/cost-versions")
+async def get_cost_versions(dev_id: str, request: Request):
+    user = await get_current_user(request)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    require_roles(user, PD_READ)
+
+    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+
+    # Derive auto ingredient cost from latest formula
+    formula_cost_auto = 0.0
+    latest_formula = await db.pd_formulas.find(
+        {"development_id": dev_id}, {"_id": 0}
+    ).sort("version", -1).to_list(1)
+    if latest_formula:
+        items = await db.pd_formula_items.find(
+            {"formula_id": latest_formula[0]["id"]}, {"_id": 0}
+        ).to_list(200)
+        formula_cost_auto = round(sum(it.get("cost_brl", 0) for it in items), 4)
+
+    return _build_cost_versions_response(doc, user, formula_cost_auto)
+
+
+@pd_router.put("/developments/{dev_id}/cost-versions/v1")
+async def upsert_cost_v1(dev_id: str, data: PDCostV1Upsert, request: Request):
+    """P&D saves or updates their cost draft (v1). Only allowed while status is 'rascunho'."""
+    user = await get_current_user(request)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    require_roles(user, PD_WRITE)
+
+    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    if existing and (existing.get("v1") or {}).get("status") == "enviado":
+        raise HTTPException(status_code=409, detail="Custo v1 já enviado para Compras. Não é possível editar.")
+
+    # Derive ingredient_cost_auto from latest formula
+    formula_cost_auto = 0.0
+    latest_formula = await db.pd_formulas.find(
+        {"development_id": dev_id}, {"_id": 0}
+    ).sort("version", -1).to_list(1)
+    if latest_formula:
+        items = await db.pd_formula_items.find(
+            {"formula_id": latest_formula[0]["id"]}, {"_id": 0}
+        ).to_list(200)
+        formula_cost_auto = round(sum(it.get("cost_brl", 0) for it in items), 4)
+
+    v1_total = round(formula_cost_auto + (data.ingredient_cost_manual or 0.0), 4)
+    v1_patch = {
+        "v1.ingredient_cost_auto": formula_cost_auto,
+        "v1.ingredient_cost_manual": data.ingredient_cost_manual or 0.0,
+        "v1.total": v1_total,
+        "v1.notes": data.notes or "",
+        "v1.status": "rascunho",
+        "updated_at": now_iso(),
+    }
+
+    if existing:
+        await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": v1_patch})
+    else:
+        doc = _default_cost_versions_doc(dev_id, user["tenant_id"])
+        doc["v1"].update({
+            "ingredient_cost_auto": formula_cost_auto,
+            "ingredient_cost_manual": data.ingredient_cost_manual or 0.0,
+            "total": v1_total,
+            "notes": data.notes or "",
+        })
+        doc["updated_at"] = now_iso()
+        await db.pd_cost_versions.insert_one(doc)
+
+    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="cost_v1_saved", entity_type="pd_cost_versions", entity_id=dev_id,
+                    after={"v1_total": v1_total})
+    return _build_cost_versions_response(doc, user, formula_cost_auto)
+
+
+@pd_router.post("/developments/{dev_id}/cost-versions/v1/submit")
+async def submit_cost_v1(dev_id: str, request: Request):
+    """P&D freezes v1 and sends it to Compras for commercial cost addition."""
+    user = await get_current_user(request)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    require_roles(user, PD_WRITE)
+
+    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=400, detail="Salve um rascunho de custo antes de enviar.")
+    if (existing.get("v1") or {}).get("status") == "enviado":
+        raise HTTPException(status_code=409, detail="Custo v1 já foi enviado para Compras.")
+
+    patch = {
+        "v1.status": "enviado",
+        "v1.submitted_at": now_iso(),
+        "v1.submitted_by_name": user.get("name", ""),
+        "updated_at": now_iso(),
+    }
+    await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": patch})
+
+    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="cost_v1_submitted", entity_type="pd_cost_versions", entity_id=dev_id,
+                    before={"v1_status": "rascunho"}, after={"v1_status": "enviado"})
+    return _build_cost_versions_response(doc, user)
+
+
+@pd_router.put("/developments/{dev_id}/cost-versions/v2")
+async def upsert_cost_v2(dev_id: str, data: ComprasCostUpsert, request: Request):
+    """Compras fills in the commercial cost breakdown (v2). Requires v1 to be submitted."""
+    user = await get_current_user(request)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    require_roles(user, COMPRAS_FULL)
+
+    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    if not existing or (existing.get("v1") or {}).get("status") != "enviado":
+        raise HTTPException(status_code=400, detail="Aguardando envio do custo v1 pelo P&D.")
+    if (existing.get("v2") or {}).get("status") == "finalizado":
+        raise HTTPException(status_code=409, detail="Custo v2 já foi finalizado e não pode ser alterado.")
+
+    v1_total = (existing.get("v1") or {}).get("total", 0.0)
+    v2_total = round(
+        (data.packaging_cost or 0) + (data.labor_cost or 0) +
+        (data.overhead_cost or 0) + (data.other_cost or 0), 4
+    )
+    total_final = round(v1_total + v2_total, 4)
+
+    v2_doc = {
+        "packaging_cost": data.packaging_cost or 0.0,
+        "labor_cost": data.labor_cost or 0.0,
+        "overhead_cost": data.overhead_cost or 0.0,
+        "other_cost": data.other_cost or 0.0,
+        "notes": data.notes or "",
+        "total": v2_total,
+        "status": "rascunho",
+        "finalized_at": (existing.get("v2") or {}).get("finalized_at"),
+        "finalized_by_name": (existing.get("v2") or {}).get("finalized_by_name"),
+    }
+
+    await db.pd_cost_versions.update_one(
+        {"development_id": dev_id},
+        {"$set": {"v2": v2_doc, "total_final": total_final, "updated_at": now_iso()}}
+    )
+
+    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="cost_v2_saved", entity_type="pd_cost_versions", entity_id=dev_id,
+                    after={"v2_total": v2_total, "total_final": total_final})
+    return _build_cost_versions_response(doc, user)
+
+
+@pd_router.post("/developments/{dev_id}/cost-versions/v2/finalize")
+async def finalize_cost_v2(dev_id: str, request: Request):
+    """Compras finalizes the commercial cost. After this, costs are locked."""
+    user = await get_current_user(request)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    require_roles(user, COMPRAS_FULL)
+
+    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    if not existing or not existing.get("v2"):
+        raise HTTPException(status_code=400, detail="Salve os dados de custo comercial antes de finalizar.")
+    if (existing.get("v2") or {}).get("status") == "finalizado":
+        raise HTTPException(status_code=409, detail="Custo v2 já está finalizado.")
+
+    patch = {
+        "v2.status": "finalizado",
+        "v2.finalized_at": now_iso(),
+        "v2.finalized_by_name": user.get("name", ""),
+        "updated_at": now_iso(),
+    }
+    await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": patch})
+
+    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="cost_v2_finalized", entity_type="pd_cost_versions", entity_id=dev_id,
+                    before={"v2_status": "rascunho"},
+                    after={"v2_status": "finalizado", "total_final": doc.get("total_final", 0)})
+    return _build_cost_versions_response(doc, user)
+
 # ============ COSTS AUTO-CALCULATE FROM FORMULA ============
 
 @pd_router.get("/developments/{dev_id}/formula-costs")
@@ -2398,6 +2715,127 @@ async def get_formula_costs(dev_id: str, request: Request):
             "indice_perdas": indice_perdas,
         }
     }
+
+# ============ SAMPLE BATCHES ============
+
+class SampleBatchOverride(BaseModel):
+    ingredient_name_base: str = ""  # ingredient in base formula being overridden
+    ingredient_name: str = ""
+    percentage: float = 0.0
+    fornecedor: str = ""
+
+class SampleBatchVariante(BaseModel):
+    id: str = ""
+    nome: str
+    versao: int = 1
+    overrides: List[SampleBatchOverride] = []
+    notas: str = ""
+
+class SampleBatchCreate(BaseModel):
+    nome: str
+    formula_base_id: str
+    volume_base_ml: float = 1000.0
+    variantes: List[SampleBatchVariante] = []
+    notas: str = ""
+
+@pd_router.get("/developments/{dev_id}/sample-batches")
+async def list_sample_batches(dev_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    batches = await db.pd_sample_batches.find(
+        {"development_id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return batches
+
+@pd_router.post("/developments/{dev_id}/sample-batches")
+async def create_sample_batch(dev_id: str, data: SampleBatchCreate, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    batch_id = new_id()
+    now = now_iso()
+    variantes = []
+    for v in data.variantes:
+        vid = v.id if v.id else new_id()
+        variantes.append({
+            "id": vid,
+            "nome": v.nome,
+            "versao": v.versao,
+            "overrides": [o.dict() for o in v.overrides],
+            "notas": v.notas,
+        })
+    doc = {
+        "id": batch_id,
+        "development_id": dev_id,
+        "tenant_id": user["tenant_id"],
+        "nome": data.nome,
+        "formula_base_id": data.formula_base_id,
+        "volume_base_ml": data.volume_base_ml,
+        "variantes": variantes,
+        "notas": data.notas,
+        "created_at": now,
+        "created_by": user["id"],
+        "created_by_name": user["name"],
+        "updated_at": now,
+    }
+    await db.pd_sample_batches.insert_one({**doc, "_id": batch_id})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="created", entity_type="pd_sample_batches", entity_id=batch_id, after=doc)
+    return doc
+
+@pd_router.put("/developments/{dev_id}/sample-batches/{batch_id}")
+async def update_sample_batch(dev_id: str, batch_id: str, data: SampleBatchCreate, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    if not dev:
+        raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
+    existing = await db.pd_sample_batches.find_one({"id": batch_id, "development_id": dev_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+    variantes = []
+    for v in data.variantes:
+        vid = v.id if v.id else new_id()
+        variantes.append({
+            "id": vid,
+            "nome": v.nome,
+            "versao": v.versao,
+            "overrides": [o.dict() for o in v.overrides],
+            "notas": v.notas,
+        })
+    updates = {
+        "nome": data.nome,
+        "formula_base_id": data.formula_base_id,
+        "volume_base_ml": data.volume_base_ml,
+        "variantes": variantes,
+        "notas": data.notas,
+        "updated_at": now_iso(),
+    }
+    await db.pd_sample_batches.update_one({"id": batch_id}, {"$set": updates})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="updated", entity_type="pd_sample_batches", entity_id=batch_id,
+                    before={"nome": existing.get("nome")}, after=updates)
+    return {**{k: v for k, v in existing.items() if k != "_id"}, **updates}
+
+@pd_router.delete("/developments/{dev_id}/sample-batches/{batch_id}")
+async def delete_sample_batch(dev_id: str, batch_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    existing = await db.pd_sample_batches.find_one(
+        {"id": batch_id, "development_id": dev_id, "tenant_id": user["tenant_id"]}
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+    await db.pd_sample_batches.delete_one({"id": batch_id})
+    await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
+                    action="deleted", entity_type="pd_sample_batches", entity_id=batch_id,
+                    before={"nome": existing.get("nome")})
+    return {"ok": True}
 
 # ============ DOCUMENTS ============
 
@@ -2539,6 +2977,11 @@ async def export_live_document_pdf(version_id: str, request: Request):
     elements.append(Spacer(1, 4*mm))
     elements.append(meta_table)
 
+    _ITEM_COST_FIELDS = {"price_per_kg", "cost_brl", "cost_kg_usd", "price_currency", "catalog_id"}
+    _ALLOWED_ITEM_KEYS_FT  = ("ingredient_name", "nome_tecnico", "nome_comercial", "inci", "fornecedor", "phase", "function", "percentage", "quantidade_lote_padrao", "unidade_lote")
+    _ALLOWED_ITEM_KEYS_ALL = _ALLOWED_ITEM_KEYS_FT + ("price_per_kg", "cost_brl")
+    _allowed_item_keys = _ALLOWED_ITEM_KEYS_FT if doc_version.get("doc_type") == "ficha_tecnica" else _ALLOWED_ITEM_KEYS_ALL
+
     def render_section(title: str, data: Any):
         elements.append(Paragraph(title, h_style))
         if isinstance(data, dict):
@@ -2560,7 +3003,7 @@ async def export_live_document_pdf(version_id: str, request: Request):
                 if isinstance(v, list) and v:
                     if all(isinstance(it, dict) for it in v):
                         keys = list({key for it in v for key in it.keys()})
-                        keys = [k for k in keys if k in ("ingredient_name", "nome_tecnico", "nome_comercial", "inci", "fornecedor", "phase", "function", "percentage", "price_per_kg", "cost_brl", "quantidade_lote_padrao", "unidade_lote")]
+                        keys = [k for k in keys if k in _allowed_item_keys]
                         if keys:
                             header = [k.replace("_", " ").capitalize() for k in keys]
                             rows = [header]
@@ -2810,8 +3253,9 @@ async def get_pd_full_detail(req_id: str, request: Request):
     costs = {"ingredient_cost": 0, "packaging_cost": 0, "labor_cost": 0, "total_cost": 0}
     documents = []
     formula_cost_data = None
+    cost_versions = None
     lab_results_doc = None
-    
+
     if dev:
         formulas = await db.pd_formulas.find({"development_id": dev["id"]}, {"_id": 0}).sort("version", -1).to_list(100)
         for f in formulas:
@@ -2833,15 +3277,20 @@ async def get_pd_full_detail(req_id: str, request: Request):
         if cost_doc:
             costs = cost_doc
         documents = await db.pd_documents.find({"development_id": dev["id"]}, {"_id": 0}).sort("uploaded_at", -1).to_list(100)
-        
+
         # Get unified lab results
         lab_results_doc = await db.pd_lab_results.find_one({"development_id": dev["id"]}, {"_id": 0})
+
+        # Load cost versions (new versioned system) — response is role-filtered
+        cost_versions_raw = await db.pd_cost_versions.find_one({"development_id": dev["id"]}, {"_id": 0})
         
         # Calculate formula cost data from latest formula
+        formula_cost_auto = 0.0
         if formulas:
             latest = formulas[0]
             items = latest.get("items", [])
             total_cost_per_kg = sum(it.get("cost_brl", 0) for it in items)
+            formula_cost_auto = round(total_cost_per_kg, 4)
             total_price_sum = sum(it.get("price_per_kg", 0) for it in items)
             cotacao = latest.get("cotacao_usd", 6.00) or 6.00
             vol = latest.get("volume", 0) or 0
@@ -2860,6 +3309,9 @@ async def get_pd_full_detail(req_id: str, request: Request):
                 "volume_unit": vu,
                 "indice_perdas": ip,
             }
+
+        # Build role-filtered cost_versions response
+        cost_versions = _build_cost_versions_response(cost_versions_raw, user, formula_cost_auto)
     
     # Get client info from CRM if linked
     client_info = None
@@ -2933,6 +3385,7 @@ async def get_pd_full_detail(req_id: str, request: Request):
         "documents": documents,
         "client_info": client_info,
         "formula_cost_data": formula_cost_data,
+        "cost_versions": cost_versions if dev else None,
         "lab_results": lab_results_doc if dev else None,
         "updates": updates_list,
         "pending": pending_list,
@@ -3027,6 +3480,51 @@ async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInp
     return new_formula
 
 
+@pd_router.post("/formulas/{formula_id}/duplicate")
+async def duplicate_formula(formula_id: str, request: Request):
+    """Duplica uma fórmula (bloqueada ou não) como nova variação — ideal para lotes com base comum."""
+    user = await get_current_user(request)
+    src = await db.pd_formulas.find_one({"id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not src:
+        raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+
+    siblings = await db.pd_formulas.find(
+        {"development_id": src["development_id"]}, {"version": 1}
+    ).to_list(100)
+    next_version = max((s.get("version", 1) for s in siblings), default=1) + 1
+
+    src_items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+    new_formula_id = new_id()
+    new_formula = {
+        k: v for k, v in src.items()
+        if k not in ("id", "locked", "locked_at", "locked_by", "locked_by_name", "parent_formula_id",
+                     "version_justification", "created_at", "created_by", "created_by_name", "items")
+    }
+    new_formula.update({
+        "id": new_formula_id,
+        "version": next_version,
+        "name": src.get("name", f"Fórmula v{next_version}"),
+        "locked": False,
+        "parent_formula_id": formula_id,
+        "version_justification": "Variação duplicada",
+        "created_at": now_iso(),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+    })
+    await db.pd_formulas.insert_one(new_formula)
+    new_formula.pop("_id", None)
+
+    new_items = []
+    for item in src_items:
+        new_item = {**{k: v for k, v in item.items() if k != "_id"}, "id": new_id(), "formula_id": new_formula_id}
+        new_items.append(new_item)
+    if new_items:
+        await db.pd_formula_items.insert_many(new_items)
+
+    new_formula["items"] = [{k: v for k, v in it.items() if k != "_id"} for it in new_items]
+    return new_formula
+
+
 # ============ STABILITY STUDY INIT FOR PD CARD ============
 
 @pd_router.get("/requests/{req_id}/stability-study")
@@ -3063,7 +3561,7 @@ class FichaTecnicaAnaliseUpsert(BaseModel):
     odor: Optional[FichaTecnicaParam] = None
     ph: Optional[FichaTecnicaParam] = None
     teor_alcool: Optional[FichaTecnicaParam] = None
-    elaboracao: Optional[str] = None
+    elaboracao: Optional[Any] = None  # structured: {secoes: [{id, nome, temperatura, etapas:[str]}]}
     resp_tecnico: Optional[str] = None
     status_aprovacao: Optional[str] = None  # "aprovado" | "reprovado"
 
@@ -3238,53 +3736,36 @@ async def generate_ficha_tecnica(req_id: str, request: Request):
         elements.append(Paragraph(f"{section_num}. MANIPULAÇÃO / FORMULAÇÃO (v{latest['version']})", heading_style))
         
         if latest.get("items"):
-            formula_header = ["Formulação", "%Fórmula", "Preço R$(Kg)", "Custo R$", "Custo Kg/U$", "% de Custo"]
-            formula_rows = [formula_header]
-            total_pct = 0
-            total_cost = 0
-            total_price = 0
-            for item in latest["items"]:
-                pct = item.get("percentage", 0)
-                ppk = item.get("price_per_kg", 0)
-                cb = item.get("cost_brl", 0)
-                cku = item.get("cost_kg_usd", 0)
-                total_pct += pct
-                total_cost += cb
-                total_price += ppk
-                formula_rows.append([
-                    item["ingredient_name"],
-                    f"{pct:.3f}",
-                    f"{ppk:.2f}",
-                    f"{cb:.2f}",
-                    f"{cku:.2f}",
-                    "",  # will be filled after total
-                ])
-            # Fill cost percentages
-            for i in range(1, len(formula_rows)):
-                cb = float(formula_rows[i][3])
-                cp = (cb / total_cost * 100) if total_cost > 0 else 0
-                formula_rows[i][5] = f"{cp:.1f}%"
-            
+            # Ficha Técnica is an operational document — no cost columns
             vol = latest.get("volume", 0) or 0
             vu = latest.get("volume_unit", "mL")
-            vkg = vol / 1000.0 if vu == "mL" else vol
-            cu = total_cost * vkg if vkg > 0 else total_cost
-            
-            formula_rows.append(["Custo Unit.", f"{total_pct:.2f}", f"{total_price:.2f}", f"R$ {cu:.2f}", "", "100,00%"])
+            formula_header = ["Ingrediente", "Fornecedor", "%Fórmula", f"Qtd/Lote ({vu})"]
+            formula_rows = [formula_header]
+            total_pct = 0
+            for item in latest["items"]:
+                pct = item.get("percentage", 0)
+                total_pct += pct
+                qty = f"{(vol * pct / 100):.3f}" if vol > 0 else "—"
+                formula_rows.append([
+                    item["ingredient_name"],
+                    item.get("fornecedor") or "—",
+                    f"{pct:.3f}",
+                    qty,
+                ])
+            formula_rows.append(["TOTAL", "", f"{total_pct:.2f}", f"{vol:.0f}" if vol > 0 else "—"])
 
-            ft = Table(formula_rows, colWidths=[35*mm, 22*mm, 25*mm, 22*mm, 25*mm, 22*mm])
+            ft = Table(formula_rows, colWidths=[55*mm, 40*mm, 25*mm, 31*mm])
             ft.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#0A0A0B')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, -1), 8),
-                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+                ('ALIGN', (0, 0), (1, -1), 'LEFT'),
                 ('GRID', (0, 0), (-1, -2), 0.5, rl_colors.HexColor('#E5E5E5')),
                 ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
                 ('TOPPADDING', (0, -1), (-1, -1), 8),
                 ('LINEABOVE', (0, -1), (-1, -1), 1, rl_colors.HexColor('#0A0A0B')),
-                ('BACKGROUND', (3, -1), (3, -1), rl_colors.HexColor('#E5E5E5')),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
                 ('TOPPADDING', (0, 0), (-1, 0), 6),
             ]))
@@ -3329,25 +3810,35 @@ async def generate_ficha_tecnica(req_id: str, request: Request):
 
 # ----------- MODELS ------------
 
+class FornecedorCatalog(BaseModel):
+    nome: str
+    codigo: Optional[str] = None
+    preco_rs_kg: float = 0.0
+    moeda: str = "BRL"
+
 class CatalogItemCreate(BaseModel):
     nome: str
     inci: Optional[str] = None
+    codigo_interno: Optional[str] = None
     fornecedor: Optional[str] = None
     preco_rs_kg: float = 0.0
-    moeda: str = "BRL"  # BRL or USD
-    unidade: str = "kg"  # kg, L
-    categoria: Optional[str] = None  # ativo, solvente, conservante, fragrância, espessante, etc
+    moeda: str = "BRL"
+    unidade: str = "kg"
+    categoria: Optional[str] = None
     observacoes: Optional[str] = None
+    fornecedores: Optional[List[FornecedorCatalog]] = []
 
 class CatalogItemUpdate(BaseModel):
     nome: Optional[str] = None
     inci: Optional[str] = None
+    codigo_interno: Optional[str] = None
     fornecedor: Optional[str] = None
     preco_rs_kg: Optional[float] = None
     moeda: Optional[str] = None
     unidade: Optional[str] = None
     categoria: Optional[str] = None
     observacoes: Optional[str] = None
+    fornecedores: Optional[List[FornecedorCatalog]] = None
 
 class InternalResearchCreate(BaseModel):
     project_name: str
@@ -3433,12 +3924,14 @@ async def create_catalog_item(data: CatalogItemCreate, request: Request):
         "tenant_id": user["tenant_id"],
         "nome": data.nome.strip(),
         "inci": (data.inci or "").strip(),
+        "codigo_interno": (data.codigo_interno or "").strip(),
         "fornecedor": (data.fornecedor or "").strip(),
         "preco_rs_kg": float(data.preco_rs_kg or 0),
         "moeda": data.moeda or "BRL",
         "unidade": data.unidade or "kg",
         "categoria": (data.categoria or "").strip(),
         "observacoes": (data.observacoes or "").strip(),
+        "fornecedores": [f.model_dump() for f in (data.fornecedores or [])],
         "ultima_atualizacao": now_iso(),
         "atualizado_por": user["name"],
         "atualizado_por_id": user["id"],
@@ -3458,7 +3951,9 @@ async def list_catalog(request: Request, q: Optional[str] = None, categoria: Opt
         query["$or"] = [
             {"nome": {"$regex": q, "$options": "i"}},
             {"inci": {"$regex": q, "$options": "i"}},
+            {"codigo_interno": {"$regex": q, "$options": "i"}},
             {"fornecedor": {"$regex": q, "$options": "i"}},
+            {"fornecedores.nome": {"$regex": q, "$options": "i"}},
         ]
     if categoria:
         query["categoria"] = categoria
@@ -3509,7 +4004,7 @@ async def update_catalog_item(item_id: str, data: CatalogItemUpdate, request: Re
             "inci": "INCI",
             "fornecedor": "Fornecedor homologado",
         },
-        ignored_fields=["preco_rs_kg", "moeda", "unidade", "categoria", "observacoes", "ultima_atualizacao", "atualizado_por", "atualizado_por_id"],
+        ignored_fields=["preco_rs_kg", "moeda", "unidade", "categoria", "observacoes", "ultima_atualizacao", "atualizado_por", "atualizado_por_id", "fornecedores", "codigo_interno"],
     )
 
     await db.pd_catalog.update_one({"id": item_id}, {"$set": update_fields})

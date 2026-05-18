@@ -20,7 +20,7 @@ import { Plus, Phone, Mail, GripVertical, Wifi, WifiOff } from "lucide-react";
 import { toast } from "sonner";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { WS_BACKEND_URL } from "@/lib/backend";
+import { getCurrentBackendUrl, toWebSocketUrl } from "@/lib/backend";
 
 const TEMP_CLASSES = { frio: "badge-frio", morno: "badge-morno", quente: "badge-quente" };
 const TEMP_LABELS = { frio: "FRIO", morno: "MORNO", quente: "QUENTE" };
@@ -41,6 +41,9 @@ export default function PipelinePage() {
     const [wsConnected, setWsConnected] = useState(false);
     const [view, setView] = useState(() => localStorage.getItem("pipeline:view") || "kanban");
     const [filters, setFilters] = useState({});
+    const [backwardMove, setBackwardMove] = useState(null); // { draggableId, srcStage, dstStage }
+    const [justification, setJustification] = useState("");
+    const [justificationError, setJustificationError] = useState(false);
     const wsRef = useRef(null);
     const boardLoadedRef = useRef(false);
 
@@ -66,12 +69,13 @@ export default function PipelinePage() {
 
     // WebSocket connection
     useEffect(() => {
-        if (!user || !WS_BACKEND_URL) return;
+        const wsBackendUrl = toWebSocketUrl(getCurrentBackendUrl());
+        if (!user || !wsBackendUrl) return;
 
         const connectWs = async () => {
             try {
                 // Browser sends cookies automatically for same-origin WS
-                const ws = new WebSocket(`${WS_BACKEND_URL}/api/ws`);
+                const ws = new WebSocket(`${wsBackendUrl}/api/ws`);
 
                 ws.onopen = () => {
                     setWsConnected(true);
@@ -118,20 +122,27 @@ export default function PipelinePage() {
         const { draggableId, source, destination } = result;
         if (source.droppableId === destination.droppableId) return;
 
-        const newStages = board.stages.map(s => ({
-            ...s, cards: [...s.cards]
-        }));
-
-        const srcStage = newStages.find(s => s.id === source.droppableId);
-        const dstStage = newStages.find(s => s.id === destination.droppableId);
+        const srcStage = board.stages.find(s => s.id === source.droppableId);
+        const dstStage = board.stages.find(s => s.id === destination.droppableId);
         if (!srcStage || !dstStage) return;
 
-        const cardIdx = srcStage.cards.findIndex(c => c.id === draggableId);
-        if (cardIdx === -1) return;
-        const [card] = srcStage.cards.splice(cardIdx, 1);
-        card.stage_id = destination.droppableId;
-        dstStage.cards.splice(destination.index, 0, card);
+        const isBackward = (dstStage.order ?? 0) < (srcStage.order ?? 0);
+        if (isBackward) {
+            // Don't do the optimistic move — ask for justification first
+            setBackwardMove({ draggableId, srcStage, dstStage, destinationIndex: destination.index });
+            setJustification("");
+            setJustificationError(false);
+            return;
+        }
 
+        const newStages = board.stages.map(s => ({ ...s, cards: [...s.cards] }));
+        const srcStageOpt = newStages.find(s => s.id === source.droppableId);
+        const dstStageOpt = newStages.find(s => s.id === destination.droppableId);
+        const cardIdx = srcStageOpt.cards.findIndex(c => c.id === draggableId);
+        if (cardIdx === -1) return;
+        const [card] = srcStageOpt.cards.splice(cardIdx, 1);
+        card.stage_id = destination.droppableId;
+        dstStageOpt.cards.splice(destination.index, 0, card);
         setBoard({ ...board, stages: newStages });
 
         try {
@@ -140,6 +151,26 @@ export default function PipelinePage() {
         } catch {
             toast.error("Erro ao mover lead");
             loadBoard();
+        }
+    };
+
+    const handleConfirmBackwardMove = async () => {
+        if (!justification.trim()) {
+            setJustificationError(true);
+            return;
+        }
+        const { draggableId, dstStage } = backwardMove;
+        try {
+            await api.put(`/cards/${draggableId}/move`, {
+                stage_id: dstStage.id,
+                justification: justification.trim(),
+            });
+            toast.success(`Lead retornado para "${dstStage.name}". Líder notificado para revisão.`);
+            setBackwardMove(null);
+            setJustification("");
+            loadBoard();
+        } catch (err) {
+            toast.error(err.response?.data?.detail || "Erro ao mover lead");
         }
     };
 
@@ -342,6 +373,43 @@ export default function PipelinePage() {
                 cardId={selectedCardId}
                 onClose={() => { setSelectedCardId(null); loadBoard(); }}
             />
+
+            <Dialog open={!!backwardMove} onOpenChange={(open) => { if (!open) setBackwardMove(null); }}>
+                <DialogContent className="max-w-md">
+                    <DialogHeader>
+                        <DialogTitle className="font-heading flex items-center gap-2">
+                            Retorno de Fase
+                        </DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-4 py-2">
+                        {backwardMove && (
+                            <p className="text-sm text-muted-foreground">
+                                Movendo <b>{backwardMove.srcStage.name}</b> → <b>{backwardMove.dstStage.name}</b>.
+                                Esta é uma movimentação retroativa e requer aprovação do líder.
+                            </p>
+                        )}
+                        <div className="space-y-2">
+                            <Label>Justificativa <span className="text-destructive">*</span></Label>
+                            <Textarea
+                                placeholder="Explique o motivo do retorno de fase..."
+                                value={justification}
+                                onChange={(e) => { setJustification(e.target.value); setJustificationError(false); }}
+                                rows={3}
+                                className={justificationError ? "border-destructive" : ""}
+                            />
+                            {justificationError && (
+                                <p className="text-xs text-destructive">Justificativa obrigatória para retorno de fase.</p>
+                            )}
+                        </div>
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setBackwardMove(null)}>Cancelar</Button>
+                        <Button variant="destructive" onClick={handleConfirmBackwardMove}>
+                            Confirmar Retorno
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
 
             <Dialog open={showNewCard} onOpenChange={setShowNewCard}>
                 <DialogContent data-testid="new-card-dialog" className="max-w-2xl max-h-[85vh] flex flex-col p-0 overflow-hidden">

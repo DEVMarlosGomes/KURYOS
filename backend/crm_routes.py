@@ -1534,6 +1534,10 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
             status_code=400,
             detail=f"Transição não permitida: {STAGE_LABELS.get(old_stage)} → {STAGE_LABELS.get(new_stage)}"
         )
+    if new_stage == "pedido_aprovado":
+        from kickoff_routes import _resolve_registered_formula_for_project
+
+        await _resolve_registered_formula_for_project(project_id, user["tenant_id"])
 
     _validate_project_transition_requirements(project, new_stage)
     if new_stage == "projeto_arquivado" and not clean_text(data.motivo_arquivamento or ""):
@@ -1584,6 +1588,17 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
         new_stage=new_stage,
         user=user,
     )
+    kickoff_created = None
+    kickoff_tasks = []
+    if new_stage == "pedido_aprovado":
+        from kickoff_routes import create_kickoff_for_project
+
+        kickoff = await create_kickoff_for_project(project_id, user)
+        kickoff_created = {
+            "kickoff_id": kickoff["id"],
+            "numero_kickoff": kickoff["numero_kickoff"],
+        }
+        kickoff_tasks.append({"tipo": "preencher_kickoff_bloco2", "responsavel": "comercial"})
 
     await audit_log(
         tenant_id=user["tenant_id"],
@@ -1605,6 +1620,8 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
         "from_stage": STAGE_LABELS.get(old_stage, old_stage),
         "to_stage": STAGE_LABELS.get(new_stage, new_stage),
         "tasks_generated": new_tasks,
+        "kickoff_criado": kickoff_created,
+        "tarefas_criadas": kickoff_tasks,
     }
 
 
@@ -1628,6 +1645,39 @@ async def get_project_full(project_id: str, request: Request):
     skus = await db.skus.find(
         {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     ).sort("created_at", -1).to_list(500)
+
+    # Enrich each variation with live P&D status
+    all_card_ids = []
+    for s in samples:
+        for v in s.get("variacoes", []) or []:
+            if v.get("pd_card_id"):
+                all_card_ids.append(v["pd_card_id"])
+
+    if all_card_ids:
+        pd_cards_docs = await db.pd_cards.find(
+            {"id": {"$in": all_card_ids}, "tenant_id": user["tenant_id"]},
+            {"_id": 0, "id": 1, "pd_request_id": 1, "status_pd": 1}
+        ).to_list(1000)
+        cards_map = {c["id"]: c for c in pd_cards_docs}
+
+        req_ids = list({c["pd_request_id"] for c in pd_cards_docs if c.get("pd_request_id")})
+        reqs_map: Dict[str, Any] = {}
+        if req_ids:
+            reqs_docs = await db.pd_requests.find(
+                {"id": {"$in": req_ids}, "tenant_id": user["tenant_id"]},
+                {"_id": 0, "id": 1, "status": 1, "updated_at": 1, "project_name": 1}
+            ).to_list(500)
+            reqs_map = {r["id"]: r for r in reqs_docs}
+
+        for s in samples:
+            for v in s.get("variacoes", []) or []:
+                card = cards_map.get(v.get("pd_card_id"))
+                if card:
+                    req = reqs_map.get(card.get("pd_request_id"), {})
+                    v["pd_request_id"] = card.get("pd_request_id")
+                    v["pd_status"] = req.get("status")
+                    v["pd_status_pd"] = card.get("status_pd")
+                    v["pd_updated_at"] = req.get("updated_at")
 
     return {
         "project": project,

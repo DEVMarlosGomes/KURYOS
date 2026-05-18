@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { Search, FlaskConical, ShieldCheck, BookOpen, Building2, Lock } from "lucide-react";
+import { Search, FlaskConical, ShieldCheck, BookOpen, Building2, Lock, CheckCircle2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 
 function ApprovalBadge({ ok, label }) {
@@ -135,6 +135,8 @@ export default function PDFormulaBank() {
                   <th className="text-left p-3 font-semibold">Formulador</th>
                   <th className="text-left p-3 font-semibold">Aprovacoes</th>
                   <th className="text-right p-3 font-semibold">Itens</th>
+                  <th className="text-right p-3 font-semibold text-purple-700">% Fragr.</th>
+                  <th className="text-right p-3 font-semibold text-purple-500">Target</th>
                   <th className="text-right p-3 font-semibold">Custo/kg</th>
                   <th className="w-28"></th>
                 </tr>
@@ -142,11 +144,11 @@ export default function PDFormulaBank() {
               <tbody>
                 {loading ? (
                   <tr>
-                    <td colSpan={8} className="p-6 text-center text-muted-foreground">Carregando...</td>
+                    <td colSpan={9} className="p-6 text-center text-muted-foreground">Carregando...</td>
                   </tr>
                 ) : items.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="p-6 text-center text-muted-foreground">Nenhuma formula encontrada.</td>
+                    <td colSpan={9} className="p-6 text-center text-muted-foreground">Nenhuma formula encontrada.</td>
                   </tr>
                 ) : items.map((item) => (
                   <tr key={item.id} className="border-b hover:bg-muted/20">
@@ -179,6 +181,28 @@ export default function PDFormulaBank() {
                       {item.item_count}
                       <div className="text-[10px] text-muted-foreground">{(item.total_percentage || 0).toFixed(2)}%</div>
                     </td>
+                    <td className="p-3 text-right font-mono">
+                      {item.fragrance_percentage != null ? (
+                        <span className={`font-semibold ${item.fragrance_percentage > 0 ? "text-purple-700" : "text-muted-foreground"}`}>
+                          {item.fragrance_percentage > 0 ? `${item.fragrance_percentage.toFixed(2)}%` : "—"}
+                        </span>
+                      ) : <span className="text-muted-foreground text-xs">restrito</span>}
+                    </td>
+                    <td className="p-3 text-right font-mono">
+                      {item.fragrance_target != null ? (() => {
+                        const actual = item.fragrance_percentage;
+                        const target = item.fragrance_target;
+                        const onTarget = actual != null && Math.abs(actual - target) <= 0.5;
+                        return (
+                          <span className={`inline-flex items-center gap-1 font-semibold ${onTarget ? "text-green-600" : "text-amber-600"}`}>
+                            {onTarget
+                              ? <CheckCircle2 className="h-3.5 w-3.5" />
+                              : <AlertTriangle className="h-3.5 w-3.5" />}
+                            {target.toFixed(2)}%
+                          </span>
+                        );
+                      })() : <span className="text-muted-foreground text-xs">—</span>}
+                    </td>
                     <td className="p-3 text-right font-mono">R$ {(item.total_cost_per_kg || 0).toFixed(2)}</td>
                     <td className="p-3 text-right">
                       <Button size="sm" variant="outline" onClick={() => setSelected(item)}>Ver</Button>
@@ -210,6 +234,8 @@ export default function PDFormulaBank() {
                   <MetaCard label="Data" value={selected.created_at ? new Date(selected.created_at).toLocaleString("pt-BR") : "—"} />
                   <MetaCard label="Custo total / kg" value={`R$ ${(selected.total_cost_per_kg || 0).toFixed(2)}`} />
                   <MetaCard label="Itens / % total" value={`${selected.item_count} / ${(selected.total_percentage || 0).toFixed(2)}%`} />
+                  <MetaCard label="% Fragrância (real)" value={selected.fragrance_percentage != null ? `${selected.fragrance_percentage.toFixed(2)}%` : "—"} />
+                  <MetaCard label="% Fragrância (target)" value={selected.fragrance_target != null ? `${selected.fragrance_target.toFixed(2)}%` : "Sem target"} />
                 </div>
 
                 <Card>

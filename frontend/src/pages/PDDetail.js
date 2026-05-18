@@ -21,7 +21,9 @@ import {
   Eye, Download, Pencil, Save, X, ShieldCheck, Send, MessageSquare, Settings2,
   Bell, Hourglass, AlertTriangle, Sparkles, ClipboardList, ThumbsUp, ThumbsDown,
   PrinterIcon, CheckSquare, XSquare, Lock, Unlock, RefreshCw, TestTube, TrendingUp,
-  Thermometer, Wind, Snowflake, Sun
+  Thermometer, Wind, Snowflake, Sun, ChevronUp, ChevronDown, Copy,
+  Building2, ShoppingCart, Layers, CheckCircle, Clock4, AlertCircle,
+  GitBranch, Combine, ChevronRight, FlaskRound
 } from "lucide-react";
 
 const STATUS_CONFIG = {
@@ -42,6 +44,13 @@ const ALLOWED_TRANSITIONS = {
   APPROVED: ["COMPLETED"],
   REJECTED: ["IN_PROGRESS"],
   COMPLETED: [],
+};
+
+const BACKWARD_TRANSITIONS = {
+  IN_PROGRESS: "OPEN",
+  IN_TESTS: "IN_PROGRESS",
+  WAITING_APPROVAL: "IN_TESTS",
+  APPROVED: "WAITING_APPROVAL",
 };
 
 const TEST_TYPES = ["Estabilidade", "pH", "Viscosidade", "Sensorial", "Compatibilidade"];
@@ -98,6 +107,8 @@ export default function PDDetail() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
+  const [showBackwardDialog, setShowBackwardDialog] = useState(false);
+  const [backwardJustification, setBackwardJustification] = useState("");
 
   const fetchData = useCallback(async () => {
     try {
@@ -113,25 +124,39 @@ export default function PDDetail() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  const handleStatusChange = async (newStatus) => {
-    // Check blocking tasks before transition
-    const blockingTasks = (data?.blocking_tasks || []).filter(t => 
-      !t.blocks_stages?.length || t.blocks_stages.includes(newStatus)
-    );
-    if (blockingTasks.length > 0) {
-      const titles = blockingTasks.slice(0, 3).map(t => `• ${t.title}`).join("\n");
-      const confirmed = window.confirm(
-        `Existem ${blockingTasks.length} tarefa(s) bloqueante(s):\n${titles}\n\nDeseja avançar mesmo assim?`
+  const handleStatusChange = async (newStatus, { isBackward = false, comment = "" } = {}) => {
+    if (!isBackward) {
+      const blockingTasks = (data?.blocking_tasks || []).filter(t =>
+        !t.blocks_stages?.length || t.blocks_stages.includes(newStatus)
       );
-      if (!confirmed) return;
+      if (blockingTasks.length > 0) {
+        const titles = blockingTasks.slice(0, 3).map(t => `• ${t.title}`).join("\n");
+        const confirmed = window.confirm(
+          `Existem ${blockingTasks.length} tarefa(s) bloqueante(s):\n${titles}\n\nDeseja avançar mesmo assim?`
+        );
+        if (!confirmed) return;
+      }
     }
     try {
-      await api.put(`/pd/requests/${id}/status`, { new_status: newStatus });
-      toast.success("Status atualizado!");
+      await api.put(`/pd/requests/${id}/status`, { new_status: newStatus, is_backward: isBackward, comment: comment || undefined });
+      toast.success(isBackward ? "Etapa retrocedida!" : "Status atualizado!");
       fetchData();
     } catch (err) {
       toast.error(err.response?.data?.detail || "Erro ao alterar status");
     }
+  };
+
+  const handleBackward = async () => {
+    if (!backwardJustification.trim() || backwardJustification.trim().length < 10) {
+      toast.error("Justificativa deve ter no mínimo 10 caracteres");
+      return;
+    }
+    const currentStatus = data?.request?.status;
+    const targetStatus = BACKWARD_TRANSITIONS[currentStatus];
+    if (!targetStatus) return;
+    await handleStatusChange(targetStatus, { isBackward: true, comment: backwardJustification });
+    setShowBackwardDialog(false);
+    setBackwardJustification("");
   };
 
   const downloadFichaTecnica = async () => {
@@ -159,12 +184,13 @@ export default function PDDetail() {
     );
   }
 
-  const { request: req, development: dev, formulas, tests, samples, approval, costs, documents, history, client_info, formula_cost_data, lab_results, updates, pending } = data;
+  const { request: req, development: dev, formulas, tests, samples, approval, costs, documents, history, client_info, formula_cost_data, cost_versions, lab_results, updates, pending } = data;
   const statusConfig = STATUS_CONFIG[req.status];
   const allowedNext = ALLOWED_TRANSITIONS[req.status] || [];
   const hasDev = !!dev;
   const pendingCount = (pending || []).filter(p => p.status === "pendente").length;
   const isInternalResearch = !!req.is_internal_research;
+  const canViewCommercial = authUser && ["admin", "compras"].includes(authUser.role);
 
   return (
     <div className="h-full overflow-auto">
@@ -207,6 +233,11 @@ export default function PDDetail() {
                 Ficha Técnica PDF
               </Button>
             )}
+            {canEdit && BACKWARD_TRANSITIONS[req.status] && (
+              <Button size="sm" variant="outline" onClick={() => { setBackwardJustification(""); setShowBackwardDialog(true); }} className="gap-1.5 text-muted-foreground border-dashed">
+                <ArrowLeft className="h-3.5 w-3.5" /> Retroceder
+              </Button>
+            )}
             {canEdit && allowedNext.map(ns => (
               <Button
                 key={ns}
@@ -220,6 +251,38 @@ export default function PDDetail() {
               </Button>
             ))}
           </div>
+
+          {showBackwardDialog && (
+            <Dialog open onOpenChange={(open) => !open && setShowBackwardDialog(false)}>
+              <DialogContent className="max-w-md">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <ArrowLeft className="h-4 w-4 text-amber-500" /> Retroceder Etapa
+                  </DialogTitle>
+                  <DialogDescription>
+                    De <strong>{STATUS_CONFIG[req.status]?.label}</strong> → <strong>{STATUS_CONFIG[BACKWARD_TRANSITIONS[req.status]]?.label}</strong>. Justificativa obrigatória.
+                  </DialogDescription>
+                </DialogHeader>
+                <div>
+                  <Label>Justificativa <span className="text-red-500">*</span></Label>
+                  <Textarea
+                    value={backwardJustification}
+                    onChange={e => setBackwardJustification(e.target.value)}
+                    placeholder="Descreva o motivo do retrocesso (mínimo 10 caracteres)..."
+                    rows={3}
+                    className="mt-1"
+                  />
+                  <p className="text-[11px] text-muted-foreground mt-1">{backwardJustification.length} / 10 mín.</p>
+                </div>
+                <DialogFooter>
+                  <Button variant="ghost" onClick={() => setShowBackwardDialog(false)}>Cancelar</Button>
+                  <Button variant="outline" onClick={handleBackward} disabled={backwardJustification.trim().length < 10} className="gap-1.5">
+                    <ArrowLeft className="h-3.5 w-3.5" /> Confirmar Retrocesso
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
         </div>
 
         {/* Tabs */}
@@ -239,7 +302,10 @@ export default function PDDetail() {
                 </span>
               )}
             </TabsTrigger>
-            <TabsTrigger value="costs" className="gap-1.5"><DollarSign className="h-3.5 w-3.5" />Custos</TabsTrigger>
+            <TabsTrigger value="costs" className="gap-1.5"><DollarSign className="h-3.5 w-3.5" />Custos P&D</TabsTrigger>
+            {canViewCommercial && (
+              <TabsTrigger value="comercial" className="gap-1.5"><Building2 className="h-3.5 w-3.5" />Comercial</TabsTrigger>
+            )}
             <TabsTrigger value="documents" className="gap-1.5"><FileText className="h-3.5 w-3.5" />Documentos</TabsTrigger>
             <TabsTrigger value="live_docs" className="gap-1.5" data-testid="tab-live-docs">
               <ShieldCheck className="h-3.5 w-3.5" />Documentos Vivos
@@ -288,11 +354,21 @@ export default function PDDetail() {
 
           <TabsContent value="costs">
             {hasDev ? (
-              <CostsTab devId={dev.id} costs={costs} formulas={formulas} formulaCostData={formula_cost_data} onRefresh={fetchData} canEdit={canEdit} />
+              <CostsTab devId={dev.id} costVersions={cost_versions} formulas={formulas} formulaCostData={formula_cost_data} onRefresh={fetchData} canEdit={canEdit} />
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
           </TabsContent>
+
+          {canViewCommercial && (
+            <TabsContent value="comercial">
+              {hasDev ? (
+                <ComercialTab devId={dev.id} costVersions={cost_versions} formulaCostData={formula_cost_data} onRefresh={fetchData} />
+              ) : (
+                <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
+              )}
+            </TabsContent>
+          )}
 
           <TabsContent value="documents">
             {hasDev ? (
@@ -850,9 +926,12 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
   const [formulaCotacao, setFormulaCotacao] = useState("6.00");
   const [saving, setSaving] = useState(false);
   const [expandedFormula, setExpandedFormula] = useState(formulas[0]?.id || null);
-  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", fornecedor: "", phase: "", function: "", catalog_id: "" });
+  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
   const [editingConfig, setEditingConfig] = useState(null);
   const [configForm, setConfigForm] = useState({});
+  const [editingItemId, setEditingItemId] = useState(null);
+  const [editItemForm, setEditItemForm] = useState({ ingredient_name: "", fornecedor: "", percentage: "", price_per_kg: "", price_currency: "BRL" });
+  const [pendingCatalogItem, setPendingCatalogItem] = useState(null);
   const [catalog, setCatalog] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [showNewVersion, setShowNewVersion] = useState(null); // formula to create new version from
@@ -870,16 +949,40 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                           (c.inci && c.inci.toLowerCase().includes(newItem.ingredient_name.toLowerCase())))
     : catalog;
 
+  const supplierRankColor = (rank) => {
+    if (rank === 0) return "text-green-700 bg-green-50 border-green-200 hover:bg-green-100";
+    if (rank === 1) return "text-yellow-700 bg-yellow-50 border-yellow-200 hover:bg-yellow-100";
+    if (rank === 2) return "text-orange-600 bg-orange-50 border-orange-200 hover:bg-orange-100";
+    return "text-red-600 bg-red-50 border-red-200 hover:bg-red-100";
+  };
+
   const pickFromCatalog = (cat) => {
-    setNewItem({
-      ingredient_name: cat.nome,
-      percentage: newItem.percentage,
-      price_per_kg: String(cat.preco_rs_kg || 0),
-      fornecedor: cat.fornecedor || "",
-      phase: newItem.phase,
-      function: newItem.function,
-      catalog_id: cat.id,
-    });
+    const fornecedores = (cat.fornecedores || [])
+      .slice()
+      .sort((a, b) => (a.preco_rs_kg || 0) - (b.preco_rs_kg || 0));
+    if (fornecedores.length > 0) {
+      setNewItem(p => ({
+        ...p,
+        ingredient_name: cat.nome,
+        catalog_id: cat.id,
+        price_per_kg: "",
+        price_currency: "BRL",
+        fornecedor: "",
+      }));
+      setPendingCatalogItem({ ...cat, fornecedores });
+    } else {
+      setNewItem({
+        ingredient_name: cat.nome,
+        percentage: newItem.percentage,
+        price_per_kg: String(cat.preco_rs_kg || 0),
+        price_currency: "BRL",
+        fornecedor: cat.fornecedor || "",
+        phase: newItem.phase,
+        function: newItem.function,
+        catalog_id: cat.id,
+      });
+      setPendingCatalogItem(null);
+    }
     setShowSuggestions(false);
   };
 
@@ -921,17 +1024,21 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
   const addItem = async (formulaId) => {
     if (!newItem.ingredient_name || !newItem.percentage) return toast.error("Preencha ingrediente e %");
     try {
+      const formula = formulas.find(f => f.id === formulaId);
+      const cotacao = formula?.cotacao_usd || 6.00;
+      const rawPrice = parseFloat(newItem.price_per_kg) || 0;
+      const priceInBRL = newItem.price_currency === "USD" ? rawPrice * cotacao : rawPrice;
       await api.post(`/pd/formulas/${formulaId}/items`, {
         ingredient_name: newItem.ingredient_name,
         percentage: parseFloat(newItem.percentage),
-        price_per_kg: parseFloat(newItem.price_per_kg) || 0,
+        price_per_kg: priceInBRL,
         fornecedor: newItem.fornecedor || "",
         phase: newItem.phase,
         function: newItem.function,
         catalog_id: newItem.catalog_id || null,
       });
       toast.success("Ingrediente adicionado!");
-      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", fornecedor: "", phase: "", function: "", catalog_id: "" });
+      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
       setShowSuggestions(false);
       onRefresh();
     } catch (err) { toast.error("Erro ao adicionar"); }
@@ -942,6 +1049,47 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
     catch (err) { toast.error("Erro ao remover"); }
   };
 
+  const startEditItem = (item) => {
+    setEditingItemId(item.id);
+    setEditItemForm({
+      ingredient_name: item.ingredient_name,
+      fornecedor: item.fornecedor || "",
+      percentage: String(item.percentage || ""),
+      price_per_kg: String(item.price_per_kg || ""),
+      price_currency: "BRL",
+    });
+  };
+
+  const cancelEditItem = () => setEditingItemId(null);
+
+  const saveEditItem = async (formulaId) => {
+    try {
+      const formula = formulas.find(f => f.id === formulaId);
+      const cotacao = formula?.cotacao_usd || 6.00;
+      const rawPrice = parseFloat(editItemForm.price_per_kg) || 0;
+      const priceInBRL = editItemForm.price_currency === "USD" ? rawPrice * cotacao : rawPrice;
+      await api.put(`/pd/formula-items/${editingItemId}`, {
+        ingredient_name: editItemForm.ingredient_name,
+        fornecedor: editItemForm.fornecedor || "",
+        percentage: parseFloat(editItemForm.percentage) || 0,
+        price_per_kg: priceInBRL,
+      });
+      toast.success("Item atualizado!");
+      cancelEditItem();
+      onRefresh();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao atualizar");
+    }
+  };
+
+  const duplicateFormula = async (formulaId) => {
+    try {
+      await api.post(`/pd/formulas/${formulaId}/duplicate`);
+      toast.success("Variação criada! Ajuste o ingrediente diferente.");
+      onRefresh();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao duplicar"); }
+  };
+
   const startEditConfig = (f) => {
     setEditingConfig(f.id);
     setConfigForm({
@@ -949,17 +1097,22 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
       volume_unit: f.volume_unit || "mL",
       indice_perdas: f.indice_perdas || 0,
       cotacao_usd: f.cotacao_usd || 6.00,
+      fragrance_target: f.fragrance_target ?? "",
     });
   };
 
   const saveConfig = async (formulaId) => {
     try {
-      await api.put(`/pd/formulas/${formulaId}`, {
+      const payload = {
         volume: parseFloat(configForm.volume) || 0,
         volume_unit: configForm.volume_unit,
         indice_perdas: parseFloat(configForm.indice_perdas) || 0,
         cotacao_usd: parseFloat(configForm.cotacao_usd) || 6.00,
-      });
+      };
+      if (configForm.fragrance_target !== "" && configForm.fragrance_target != null) {
+        payload.fragrance_target = parseFloat(configForm.fragrance_target);
+      }
+      await api.put(`/pd/formulas/${formulaId}`, payload);
       toast.success("Configuração salva!");
       setEditingConfig(null);
       onRefresh();
@@ -1097,6 +1250,11 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                     R$ {custoUnit.toFixed(2)}
                   </span>
                   <Badge variant="secondary" className="text-[10px]">{items.length} itens</Badge>
+                  {canEdit && items.length > 0 && (
+                    <Button size="sm" variant="ghost" className="h-7 text-xs gap-1 text-muted-foreground hover:text-foreground" onClick={() => duplicateFormula(f.id)} title="Copia todos os ingredientes para uma nova versão — ideal para variações de fragrância">
+                      <Copy className="h-3 w-3" /> Duplicar
+                    </Button>
+                  )}
                   {canEdit && f.locked && (
                     <Button size="sm" variant="outline" className="h-7 text-xs gap-1 border-amber-300 hover:bg-amber-50" onClick={() => { setShowNewVersion(f); setNewVersionJustification(""); }} data-testid={`new-version-btn-${f.id}`}>
                       <RefreshCw className="h-3 w-3" /> Nova Versão
@@ -1110,7 +1268,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                 {/* Formula Config Header (like spreadsheet) */}
                 <div className="bg-muted/50 rounded-lg p-3 border">
                   {editingConfig === f.id ? (
-                    <div className="grid grid-cols-4 gap-3">
+                    <div className="grid grid-cols-5 gap-3">
                       <div>
                         <Label className="text-[11px]">Volume</Label>
                         <div className="flex gap-1">
@@ -1134,6 +1292,10 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         <Label className="text-[11px]">Cotação US$</Label>
                         <Input type="number" step="0.01" value={configForm.cotacao_usd} onChange={e => setConfigForm(p => ({ ...p, cotacao_usd: e.target.value }))} className="h-8 text-sm" />
                       </div>
+                      <div>
+                        <Label className="text-[11px] text-purple-700">Target Fragrância (%)</Label>
+                        <Input type="number" step="0.01" placeholder="ex: 2.50" value={configForm.fragrance_target} onChange={e => setConfigForm(p => ({ ...p, fragrance_target: e.target.value }))} className="h-8 text-sm" />
+                      </div>
                       <div className="flex items-end gap-1">
                         <Button size="sm" className="h-8" onClick={() => saveConfig(f.id)}><Save className="h-3 w-3" /></Button>
                         <Button size="sm" variant="ghost" className="h-8" onClick={() => setEditingConfig(null)}><X className="h-3 w-3" /></Button>
@@ -1147,6 +1309,9 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         <span><b>Volume:</b> {volume > 0 ? `${volume} ${volumeUnit}` : "—"}</span>
                         <span><b>Índice Perdas:</b> {indicePerdas > 0 ? `${indicePerdas}%` : "—"}</span>
                         <span><b>Cotação US$:</b> {(f.cotacao_usd || 6.00).toFixed(2)}</span>
+                        {f.fragrance_target != null && (
+                          <span className="text-purple-700"><b>Target Fragr.:</b> {f.fragrance_target.toFixed(2)}%</span>
+                        )}
                       </div>
                       {canEdit && (
                         <Button size="sm" variant="ghost" className="h-7 text-xs gap-1" onClick={(e) => { e.stopPropagation(); startEditConfig(f); }}>
@@ -1172,14 +1337,51 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         <th className="text-right p-2 font-medium w-24">Custo R$</th>
                         <th className="text-right p-2 font-medium w-28">Custo Kg/U$</th>
                         <th className="text-right p-2 font-medium w-24">% de Custo</th>
-                        <th className="w-10"></th>
+                        <th className="w-16"></th>
                       </tr>
                     </thead>
                     <tbody>
                       {items.map(item => {
+                        const isEditingThis = canEdit && editingItemId === item.id;
                         const costPct = totalCostBrl > 0 ? (item.cost_brl / totalCostBrl * 100) : 0;
                         const qtyLote = volume > 0 ? (volume * (item.percentage || 0) / 100) : 0;
                         const qtyLabel = qtyLote > 0 ? `${qtyLote.toFixed(3)} ${volumeUnit}` : "—";
+
+                        if (isEditingThis) {
+                          return (
+                            <tr key={item.id} className="border-t bg-blue-50/40 dark:bg-blue-950/10">
+                              <td className="p-1.5">
+                                <Input value={editItemForm.ingredient_name} onChange={e => setEditItemForm(p => ({ ...p, ingredient_name: e.target.value }))} className="h-7 text-xs" />
+                              </td>
+                              <td className="p-1.5">
+                                <Input value={editItemForm.fornecedor} onChange={e => setEditItemForm(p => ({ ...p, fornecedor: e.target.value }))} className="h-7 text-xs w-24" placeholder="Fornecedor" />
+                              </td>
+                              <td className="p-1.5">
+                                <Input type="number" step="0.001" value={editItemForm.percentage} onChange={e => setEditItemForm(p => ({ ...p, percentage: e.target.value }))} className="h-7 text-xs w-20 text-right font-mono" />
+                              </td>
+                              <td className="p-2 text-right text-xs text-muted-foreground">—</td>
+                              <td className="p-1.5">
+                                <div className="flex gap-1">
+                                  <Input type="number" step="0.01" value={editItemForm.price_per_kg} onChange={e => setEditItemForm(p => ({ ...p, price_per_kg: e.target.value }))} className="h-7 text-xs w-20 text-right font-mono" />
+                                  <button type="button" onClick={() => setEditItemForm(p => ({ ...p, price_currency: p.price_currency === "USD" ? "BRL" : "USD" }))}
+                                    className={`h-7 px-1.5 rounded text-[10px] font-bold border shrink-0 ${editItemForm.price_currency === "USD" ? "bg-blue-600 text-white border-blue-600" : "bg-muted text-muted-foreground border-border"}`}>
+                                    {editItemForm.price_currency === "USD" ? "US$" : "R$"}
+                                  </button>
+                                </div>
+                              </td>
+                              <td className="p-2 text-xs text-muted-foreground text-right">—</td>
+                              <td className="p-2 text-xs text-muted-foreground text-right">—</td>
+                              <td className="p-2 text-xs text-muted-foreground text-right">—</td>
+                              <td className="p-1.5">
+                                <div className="flex gap-1.5 justify-center">
+                                  <button onClick={() => saveEditItem(f.id)} className="text-green-600 hover:text-green-700 transition-colors" title="Salvar"><Save className="h-3.5 w-3.5" /></button>
+                                  <button onClick={cancelEditItem} className="text-muted-foreground hover:text-red-500 transition-colors" title="Cancelar"><X className="h-3.5 w-3.5" /></button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        }
+
                         return (
                           <tr key={item.id} className="border-t hover:bg-muted/30">
                             <td className="p-2 font-medium">{item.ingredient_name}</td>
@@ -1192,9 +1394,10 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                             <td className="p-2 text-right font-mono text-xs">{costPct.toFixed(1)}%</td>
                             <td className="p-2 text-center">
                               {canEdit && (
-                                <button onClick={() => deleteItem(item.id)} className="text-muted-foreground hover:text-red-500 transition-colors">
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </button>
+                                <div className="flex gap-1.5 justify-center">
+                                  <button onClick={() => startEditItem(item)} className="text-muted-foreground hover:text-blue-500 transition-colors" title="Editar"><Pencil className="h-3.5 w-3.5" /></button>
+                                  <button onClick={() => deleteItem(item.id)} className="text-muted-foreground hover:text-red-500 transition-colors" title="Remover"><Trash2 className="h-3.5 w-3.5" /></button>
+                                </div>
                               )}
                             </td>
                           </tr>
@@ -1250,26 +1453,61 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         className="h-8 text-sm" />
                       {showSuggestions && filteredCatalog.length > 0 && (
                         <div className="absolute top-full left-0 right-0 mt-1 bg-popover border rounded-md shadow-lg z-50 max-h-64 overflow-y-auto">
-                          {filteredCatalog.slice(0, 15).map(cat => (
-                            <button
-                              key={cat.id}
-                              type="button"
-                              onMouseDown={(e) => { e.preventDefault(); pickFromCatalog(cat); }}
-                              className="w-full text-left px-3 py-2 hover:bg-muted border-b last:border-0 flex items-center justify-between gap-2"
-                            >
-                              <div className="min-w-0">
-                                <div className="text-sm font-medium truncate">{cat.nome}</div>
-                                <div className="text-[10px] text-muted-foreground truncate">
-                                  {cat.inci && <>INCI: {cat.inci}</>}
-                                  {cat.fornecedor && <> • {cat.fornecedor}</>}
-                                  {cat.categoria && <> • {cat.categoria}</>}
+                          {filteredCatalog.slice(0, 15).map(cat => {
+                            const temFornecedores = (cat.fornecedores || []).length > 0;
+                            const precoMin = temFornecedores
+                              ? Math.min(...cat.fornecedores.map(s => s.preco_rs_kg || 0))
+                              : cat.preco_rs_kg || 0;
+                            return (
+                              <button
+                                key={cat.id}
+                                type="button"
+                                onMouseDown={(e) => { e.preventDefault(); pickFromCatalog(cat); }}
+                                className="w-full text-left px-3 py-2 hover:bg-muted border-b last:border-0 flex items-center justify-between gap-2"
+                              >
+                                <div className="min-w-0">
+                                  <div className="text-sm font-medium truncate">{cat.nome}</div>
+                                  <div className="text-[10px] text-muted-foreground truncate">
+                                    {cat.inci && <>INCI: {cat.inci}</>}
+                                    {cat.codigo_interno && <> · {cat.codigo_interno}</>}
+                                    {temFornecedores ? <> · {cat.fornecedores.length} fornecedor(es)</> : cat.fornecedor ? <> · {cat.fornecedor}</> : null}
+                                    {cat.categoria && <> · {cat.categoria}</>}
+                                  </div>
                                 </div>
-                              </div>
-                              <span className="text-xs font-mono font-semibold shrink-0">
-                                R$ {(cat.preco_rs_kg || 0).toFixed(2)}/{cat.unidade || "kg"}
-                              </span>
-                            </button>
-                          ))}
+                                <span className="text-xs font-mono font-semibold shrink-0 text-green-700">
+                                  {temFornecedores ? "a partir de " : ""}R$ {precoMin.toFixed(2)}/{cat.unidade || "kg"}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {pendingCatalogItem && (
+                        <div className="mt-1 border rounded-md bg-popover shadow-md p-2 z-40">
+                          <div className="text-[10px] font-semibold text-muted-foreground mb-1.5 uppercase tracking-wide flex items-center justify-between">
+                            <span>Selecionar fornecedor — {pendingCatalogItem.nome}</span>
+                          </div>
+                          <div className="space-y-1">
+                            {pendingCatalogItem.fornecedores.map((sup, idx) => (
+                              <button
+                                key={idx}
+                                type="button"
+                                className={`w-full text-left px-2 py-1.5 rounded border text-xs flex items-center justify-between gap-2 transition-colors ${supplierRankColor(idx)}`}
+                                onClick={() => {
+                                  setNewItem(p => ({ ...p, fornecedor: sup.nome, price_per_kg: String(sup.preco_rs_kg || 0), price_currency: sup.moeda || "BRL" }));
+                                  setPendingCatalogItem(null);
+                                }}
+                              >
+                                <span className="font-medium">{sup.nome}{sup.codigo && <span className="text-[10px] ml-1 opacity-70">· {sup.codigo}</span>}</span>
+                                <span className="font-mono font-semibold shrink-0">
+                                  {sup.moeda === "USD" ? "US$" : "R$"} {(sup.preco_rs_kg || 0).toFixed(2)}/{pendingCatalogItem.unidade || "kg"}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                          <button type="button" className="mt-1.5 text-[10px] text-muted-foreground hover:text-foreground underline" onClick={() => setPendingCatalogItem(null)}>
+                            ← inserir preço manualmente
+                          </button>
                         </div>
                       )}
                     </div>
@@ -1285,11 +1523,28 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         onChange={e => setNewItem(p => ({ ...p, percentage: e.target.value }))}
                         placeholder="0.000" className="h-8 text-sm font-mono" />
                     </div>
-                    <div className="w-24">
-                      <Label className="text-[11px] text-muted-foreground">Preço R$/Kg</Label>
-                      <Input type="number" step="0.01" value={newItem.price_per_kg}
-                        onChange={e => setNewItem(p => ({ ...p, price_per_kg: e.target.value, catalog_id: "" }))}
-                        placeholder="0.00" className="h-8 text-sm font-mono" />
+                    <div className="w-36">
+                      <Label className="text-[11px] text-muted-foreground">
+                        Preço {newItem.price_currency === "USD" ? "US$/Kg" : "R$/Kg"}
+                      </Label>
+                      <div className="flex gap-1">
+                        <Input type="number" step="0.01" value={newItem.price_per_kg}
+                          onChange={e => setNewItem(p => ({ ...p, price_per_kg: e.target.value, catalog_id: "" }))}
+                          placeholder="0.00" className="h-8 text-sm font-mono" />
+                        <button
+                          type="button"
+                          onClick={() => setNewItem(p => ({ ...p, price_currency: p.price_currency === "USD" ? "BRL" : "USD" }))}
+                          className={`h-8 px-2 rounded text-[10px] font-bold border shrink-0 transition-colors ${newItem.price_currency === "USD" ? "bg-blue-600 text-white border-blue-600" : "bg-muted text-muted-foreground border-border hover:bg-muted/80"}`}
+                          title={newItem.price_currency === "USD" ? `Cotação: R$ ${(formulas.find(f2 => f2.id === f.id)?.cotacao_usd || 6).toFixed(2)}` : "Clique para inserir em US$"}
+                        >
+                          {newItem.price_currency === "USD" ? "US$" : "R$"}
+                        </button>
+                      </div>
+                      {newItem.price_currency === "USD" && newItem.price_per_kg && (
+                        <div className="text-[10px] text-blue-600 mt-0.5">
+                          = R$ {((parseFloat(newItem.price_per_kg) || 0) * (formulas.find(f2 => f2.id === f.id)?.cotacao_usd || 6)).toFixed(2)}/Kg
+                        </div>
+                      )}
                     </div>
                     <Button size="sm" className="h-8 gap-1" onClick={() => addItem(f.id)}>
                       <Plus className="h-3 w-3" /> Adicionar
@@ -1343,9 +1598,588 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
           </DialogContent>
         </Dialog>
       )}
+
+      <SampleBatchSection devId={devId} formulas={formulas} onRefresh={onRefresh} canEdit={canEdit} />
     </div>
   );
 }
+
+/* ============ SAMPLE BATCH COMPONENTS ============ */
+
+function SampleBatchEditor({ devId, formulas, initial, onSave, onClose }) {
+  const emptyVariante = () => ({ id: crypto.randomUUID(), nome: "", versao: 1, overrides: [], notas: "" });
+  const [form, setForm] = useState(initial ? {
+    nome: initial.nome || "",
+    formula_base_id: initial.formula_base_id || (formulas[0]?.id || ""),
+    volume_base_ml: initial.volume_base_ml || 15,
+    notas: initial.notas || "",
+    variantes: (initial.variantes || []).map(v => ({
+      id: v.id || crypto.randomUUID(),
+      nome: v.nome || "",
+      versao: v.versao || 1,
+      overrides: (v.overrides || []).map(o => ({ ...o })),
+      notas: v.notas || "",
+    })),
+  } : {
+    nome: "",
+    formula_base_id: formulas[0]?.id || "",
+    volume_base_ml: 15,
+    notas: "",
+    variantes: [emptyVariante()],
+  });
+  const [saving, setSaving] = useState(false);
+  const [baseItems, setBaseItems] = useState([]);
+  const [loadingItems, setLoadingItems] = useState(false);
+
+  useEffect(() => {
+    if (!form.formula_base_id) return;
+    setLoadingItems(true);
+    api.get(`/pd/formulas/${form.formula_base_id}/items`)
+      .then(({ data }) => setBaseItems(Array.isArray(data) ? data : []))
+      .catch(() => setBaseItems([]))
+      .finally(() => setLoadingItems(false));
+  }, [form.formula_base_id]);
+
+  const setVariante = (idx, updates) => setForm(f => {
+    const v = [...f.variantes];
+    v[idx] = { ...v[idx], ...updates };
+    return { ...f, variantes: v };
+  });
+
+  const addVariante = () => setForm(f => ({ ...f, variantes: [...f.variantes, emptyVariante()] }));
+
+  const removeVariante = (idx) => setForm(f => ({ ...f, variantes: f.variantes.filter((_, i) => i !== idx) }));
+
+  const addOverride = (vIdx) => setVariante(vIdx, {
+    overrides: [...(form.variantes[vIdx]?.overrides || []), { ingredient_name_base: "", ingredient_name: "", percentage: 0, fornecedor: "" }]
+  });
+
+  const updateOverride = (vIdx, oIdx, field, value) => {
+    const v = [...form.variantes];
+    const overrides = v[vIdx].overrides.map((o, i) => i === oIdx ? { ...o, [field]: value } : o);
+    v[vIdx] = { ...v[vIdx], overrides };
+    setForm(f => ({ ...f, variantes: v }));
+  };
+
+  const removeOverride = (vIdx, oIdx) => {
+    const v = [...form.variantes];
+    v[vIdx] = { ...v[vIdx], overrides: v[vIdx].overrides.filter((_, i) => i !== oIdx) };
+    setForm(f => ({ ...f, variantes: v }));
+  };
+
+  const handleSave = async () => {
+    if (!form.nome.trim()) { toast.error("Nome do lote é obrigatório"); return; }
+    if (!form.formula_base_id) { toast.error("Selecione a fórmula base"); return; }
+    setSaving(true);
+    try {
+      await onSave(form);
+      onClose();
+    } catch (err) {
+      toast.error("Erro ao salvar lote");
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1">
+          <Label className="text-xs font-medium">Nome do Lote <span className="text-red-500">*</span></Label>
+          <Input value={form.nome} onChange={e => setForm(f => ({ ...f, nome: e.target.value }))} placeholder="Ex: Lote Fragrâncias Jun/2026" />
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs font-medium">Volume da Amostra (mL)</Label>
+          <Input type="number" value={form.volume_base_ml} onChange={e => setForm(f => ({ ...f, volume_base_ml: parseFloat(e.target.value) || 0 }))} />
+          <p className="text-[10px] text-muted-foreground">Volume de cada amostra a elaborar no lab — não o volume do produto final (padrão: 15 mL)</p>
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <Label className="text-xs font-medium">Fórmula Base <span className="text-red-500">*</span></Label>
+        <Select value={form.formula_base_id} onValueChange={v => setForm(f => ({ ...f, formula_base_id: v }))}>
+          <SelectTrigger><SelectValue placeholder="Selecione a fórmula base..." /></SelectTrigger>
+          <SelectContent>
+            {formulas.map(f => (
+              <SelectItem key={f.id} value={f.id}>v{f.version} — {f.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {loadingItems && <p className="text-xs text-muted-foreground">Carregando ingredientes...</p>}
+        {baseItems.length > 0 && (
+          <p className="text-xs text-muted-foreground">{baseItems.length} ingredientes na fórmula base</p>
+        )}
+      </div>
+
+      <div className="space-y-1">
+        <Label className="text-xs font-medium">Observações do Lote</Label>
+        <Textarea value={form.notas} onChange={e => setForm(f => ({ ...f, notas: e.target.value }))} placeholder="Observações gerais sobre este lote..." rows={2} />
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <Label className="text-sm font-semibold flex items-center gap-1.5"><GitBranch className="h-4 w-4 text-violet-500" />Variantes</Label>
+          <Button variant="outline" size="sm" onClick={addVariante} className="h-7 text-xs gap-1"><Plus className="h-3 w-3" />Adicionar</Button>
+        </div>
+
+        {form.variantes.map((v, vIdx) => (
+          <div key={v.id} className="border rounded-lg p-3 space-y-3 bg-muted/30">
+            <div className="flex items-center gap-2">
+              <div className="flex items-center justify-center h-6 w-6 rounded-full bg-violet-100 text-violet-700 text-xs font-bold flex-shrink-0">{vIdx + 1}</div>
+              <Input
+                value={v.nome}
+                onChange={e => setVariante(vIdx, { nome: e.target.value })}
+                placeholder={`Nome da variante ${vIdx + 1} (ex: Rosa, Floral, sem frag.)`}
+                className="h-8 text-sm flex-1"
+              />
+              <Input
+                type="number"
+                value={v.versao}
+                onChange={e => setVariante(vIdx, { versao: parseInt(e.target.value) || 1 })}
+                className="h-8 w-20 text-sm"
+                placeholder="v"
+                min={1}
+              />
+              {form.variantes.length > 1 && (
+                <button onClick={() => removeVariante(vIdx)} className="text-muted-foreground hover:text-red-500 transition-colors">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground font-medium">Substituições de ingredientes</span>
+                <Button variant="ghost" size="sm" onClick={() => addOverride(vIdx)} className="h-6 text-xs gap-1 text-violet-600 hover:text-violet-700">
+                  <Plus className="h-3 w-3" />Substituição
+                </Button>
+              </div>
+              {v.overrides.length === 0 && (
+                <p className="text-xs text-muted-foreground italic py-1">Sem substituições — todos os ingredientes seguem a fórmula base.</p>
+              )}
+              {v.overrides.map((o, oIdx) => (
+                <div key={oIdx} className="grid grid-cols-[1fr_auto_1fr_auto_80px_auto] gap-1.5 items-center">
+                  <Select value={o.ingredient_name_base} onValueChange={val => updateOverride(vIdx, oIdx, "ingredient_name_base", val)}>
+                    <SelectTrigger className="h-7 text-xs"><SelectValue placeholder="Substituir..." /></SelectTrigger>
+                    <SelectContent>
+                      {baseItems.map(it => <SelectItem key={it.id} value={it.ingredient_name}>{it.ingredient_name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                  <ChevronRight className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                  <Input value={o.ingredient_name} onChange={e => updateOverride(vIdx, oIdx, "ingredient_name", e.target.value)} placeholder="Novo ingrediente" className="h-7 text-xs" />
+                  <span className="text-xs text-muted-foreground">%</span>
+                  <Input type="number" step="0.001" value={o.percentage} onChange={e => updateOverride(vIdx, oIdx, "percentage", parseFloat(e.target.value) || 0)} className="h-7 text-xs" />
+                  <button onClick={() => removeOverride(vIdx, oIdx)} className="text-muted-foreground hover:text-red-500 transition-colors">
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="space-y-1">
+              <Textarea value={v.notas} onChange={e => setVariante(vIdx, { notas: e.target.value })} placeholder="Notas desta variante..." rows={1} className="text-xs" />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex justify-end gap-2 pt-2 border-t">
+        <Button variant="outline" onClick={onClose}>Cancelar</Button>
+        <Button onClick={handleSave} disabled={saving} className="gap-1.5">
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          Salvar Lote
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function fmtQty(pct, volumeMl) {
+  const g = (pct / 100) * volumeMl;
+  if (g === 0) return "0,000 g";
+  if (g < 0.1) return `${(g * 1000).toFixed(0)} mg`;
+  if (g < 10) return `${g.toFixed(3)} g`;
+  return `${g.toFixed(2)} g`;
+}
+
+function SampleBatchCard({ batch, formulas, onEdit, onDelete, canEdit }) {
+  const [baseItems, setBaseItems] = useState([]);
+  const [expanded, setExpanded] = useState(false);
+  const [showComparativo, setShowComparativo] = useState(false);
+
+  useEffect(() => {
+    if (!expanded || !batch.formula_base_id) return;
+    api.get(`/pd/formulas/${batch.formula_base_id}/items`)
+      .then(({ data }) => setBaseItems(Array.isArray(data) ? data : []))
+      .catch(() => setBaseItems([]));
+  }, [expanded, batch.formula_base_id]);
+
+  const baseFormula = formulas.find(f => f.id === batch.formula_base_id);
+  const variantes = batch.variantes || [];
+  const volumeMl = batch.volume_base_ml || 15;
+
+  const variableSlots = useMemo(() => {
+    return new Set((batch.variantes || []).flatMap(v => (v.overrides || []).map(o => o.ingredient_name_base).filter(Boolean)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batch.variantes]);
+
+  // Resolve all ingredients for a given variant (overrides applied)
+  const resolveVariantItems = useCallback((v) => {
+    return baseItems.map(baseItem => {
+      const ov = (v.overrides || []).find(o => o.ingredient_name_base === baseItem.ingredient_name);
+      if (ov) {
+        return {
+          ...baseItem,
+          ingredient_name: ov.ingredient_name || baseItem.ingredient_name,
+          percentage: ov.percentage,
+          fornecedor: ov.fornecedor || baseItem.fornecedor,
+          is_substituted: true,
+          original_name: baseItem.ingredient_name,
+        };
+      }
+      return { ...baseItem, is_substituted: false };
+    });
+  }, [baseItems]);
+
+  // Group items by phase, preserving insertion order
+  const groupByPhase = (items) => {
+    const groups = new Map();
+    items.forEach(it => {
+      const ph = it.phase || "Geral";
+      if (!groups.has(ph)) groups.set(ph, []);
+      groups.get(ph).push(it);
+    });
+    return [...groups.entries()];
+  };
+
+  const fixedItems = useMemo(() => baseItems.filter(it => !variableSlots.has(it.ingredient_name)), [baseItems, variableSlots]);
+  const variableItems = useMemo(() => baseItems.filter(it => variableSlots.has(it.ingredient_name)), [baseItems, variableSlots]);
+
+  return (
+    <div className="border rounded-xl bg-background shadow-sm overflow-hidden">
+      {/* Collapsed header */}
+      <div
+        className="flex items-center gap-3 p-4 cursor-pointer hover:bg-muted/30 transition-colors"
+        onClick={() => setExpanded(e => !e)}
+      >
+        <div className="flex items-center justify-center h-9 w-9 rounded-lg bg-violet-100 text-violet-600 flex-shrink-0">
+          <Combine className="h-4.5 w-4.5" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="font-semibold text-sm truncate">{batch.nome}</p>
+          <p className="text-xs text-muted-foreground">
+            Base: {baseFormula ? `v${baseFormula.version} — ${baseFormula.name}` : "—"} · <b>{volumeMl} mL</b> por amostra · {variantes.length} variante{variantes.length !== 1 ? "s" : ""}
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {variantes.map((v, i) => (
+            <span key={v.id} className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-violet-50 text-violet-700 border border-violet-200">
+              {v.nome || `V${i + 1}`}
+            </span>
+          ))}
+        </div>
+        {canEdit && (
+          <div className="flex gap-1" onClick={e => e.stopPropagation()}>
+            <button onClick={() => onEdit(batch)} className="text-muted-foreground hover:text-blue-500 transition-colors p-1"><Pencil className="h-3.5 w-3.5" /></button>
+            <button onClick={() => onDelete(batch.id)} className="text-muted-foreground hover:text-red-500 transition-colors p-1"><Trash2 className="h-3.5 w-3.5" /></button>
+          </div>
+        )}
+        <ChevronDown className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? "rotate-180" : ""}`} />
+      </div>
+
+      {expanded && (
+        <div className="border-t bg-muted/10">
+          {baseItems.length === 0 ? (
+            <div className="p-6 flex items-center justify-center gap-2 text-muted-foreground text-sm">
+              <Loader2 className="h-4 w-4 animate-spin" /> Carregando ingredientes...
+            </div>
+          ) : (
+            <>
+              {/* ── Per-variant manipulation orders ── */}
+              <div className="p-4 space-y-4">
+                <div className="flex items-center gap-2">
+                  <FlaskRound className="h-4 w-4 text-violet-600" />
+                  <span className="text-xs font-bold uppercase tracking-wider text-violet-700">Ordens de Manipulação</span>
+                  <span className="text-[10px] text-muted-foreground">— {volumeMl} mL por amostra (densidade ≈ 1 g/mL)</span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {variantes.map((v, vIdx) => {
+                    const resolvedItems = resolveVariantItems(v);
+                    const phases = groupByPhase(resolvedItems);
+                    const totalPct = resolvedItems.reduce((s, it) => s + (it.percentage || 0), 0);
+
+                    return (
+                      <div key={v.id} className="border rounded-lg overflow-hidden shadow-sm">
+                        {/* Order header */}
+                        <div className="bg-slate-800 dark:bg-slate-900 text-white px-4 py-2.5 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="flex items-center justify-center h-5 w-5 rounded-full bg-violet-400/30 text-[10px] font-bold">{vIdx + 1}</div>
+                            <span className="font-bold text-sm">{v.nome || `Variante ${vIdx + 1}`}</span>
+                            {v.versao > 1 && <span className="text-[10px] opacity-60">v{v.versao}</span>}
+                          </div>
+                          <div className="text-[11px] opacity-70 font-mono">{volumeMl} mL</div>
+                        </div>
+
+                        {/* Ingredient list by phase */}
+                        {phases.map(([phase, items]) => (
+                          <div key={phase}>
+                            <div className="px-3 py-1 bg-muted/40 border-b border-t text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                              Fase {phase}
+                            </div>
+                            {items.map((it, itIdx) => (
+                              <div
+                                key={itIdx}
+                                className={`flex items-center justify-between px-3 py-2 border-b text-xs ${
+                                  it.is_substituted
+                                    ? "bg-amber-50/60 dark:bg-amber-950/20"
+                                    : itIdx % 2 === 0 ? "bg-background" : "bg-muted/20"
+                                }`}
+                              >
+                                <div className="flex-1 min-w-0 pr-3">
+                                  <span className={`font-medium ${it.is_substituted ? "text-amber-700 dark:text-amber-400" : ""}`}>
+                                    {it.ingredient_name}
+                                  </span>
+                                  {it.is_substituted && (
+                                    <span className="ml-1.5 text-[10px] text-amber-600/70 dark:text-amber-500/70">
+                                      ↳ subst. {it.original_name}
+                                    </span>
+                                  )}
+                                  {it.fornecedor && (
+                                    <span className="ml-1.5 text-[10px] text-muted-foreground">{it.fornecedor}</span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-4 flex-shrink-0 text-right">
+                                  <span className="text-muted-foreground font-mono w-16">{(it.percentage || 0).toFixed(3)}%</span>
+                                  <span className={`font-mono font-bold w-20 ${it.is_substituted ? "text-amber-700 dark:text-amber-400" : ""}`}>
+                                    {fmtQty(it.percentage || 0, volumeMl)}
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+
+                        {/* Order footer */}
+                        <div className="flex items-center justify-between px-3 py-2 bg-slate-100 dark:bg-slate-800 font-bold border-t-2">
+                          <span className="text-xs">Total</span>
+                          <div className="flex items-center gap-4 text-right">
+                            <span className="font-mono text-xs text-muted-foreground w-16">{totalPct.toFixed(2)}%</span>
+                            <span className="font-mono text-sm w-20">{volumeMl.toFixed(1)} g*</span>
+                          </div>
+                        </div>
+
+                        {v.notas && (
+                          <div className="px-3 py-1.5 text-[10px] text-muted-foreground bg-muted/20 border-t italic">{v.notas}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <p className="text-[10px] text-muted-foreground">* Estimativa assumindo densidade ≈ 1,0 g/mL (produto aquoso). Ajuste conforme densidade real do produto.</p>
+              </div>
+
+              {/* ── Comparativo (collapsible) ── */}
+              <div className="border-t">
+                <button
+                  onClick={() => setShowComparativo(s => !s)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 text-xs text-muted-foreground hover:bg-muted/20 transition-colors"
+                >
+                  <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showComparativo ? "rotate-180" : ""}`} />
+                  Tabela comparativa de variantes
+                </button>
+                {showComparativo && (
+                  <div className="border-t overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-muted/50">
+                          <th className="p-2 text-left font-medium text-muted-foreground">Ingrediente</th>
+                          <th className="p-2 text-right font-medium text-muted-foreground">% Base</th>
+                          <th className="p-2 text-right font-medium text-muted-foreground">g/{volumeMl}mL</th>
+                          {variantes.map(v => (
+                            <th key={v.id} className="p-2 text-center font-medium text-violet-700 bg-violet-50/60">
+                              {v.nome || "Variante"}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {fixedItems.map(it => (
+                          <tr key={it.id} className="border-t hover:bg-muted/20">
+                            <td className="p-2 font-medium">{it.ingredient_name}</td>
+                            <td className="p-2 text-right font-mono">{(it.percentage || 0).toFixed(3)}</td>
+                            <td className="p-2 text-right font-mono">{fmtQty(it.percentage || 0, volumeMl)}</td>
+                            {variantes.map(v => (
+                              <td key={v.id} className="p-2 text-center text-muted-foreground bg-violet-50/30">—</td>
+                            ))}
+                          </tr>
+                        ))}
+                        {variableItems.map(it => (
+                          <tr key={it.id} className="border-t bg-amber-50/40 hover:bg-amber-50/60">
+                            <td className="p-2 font-medium text-amber-700">{it.ingredient_name} <span className="text-[10px] bg-amber-100 text-amber-600 rounded px-1 ml-1">variável</span></td>
+                            <td className="p-2 text-right font-mono text-amber-700">{(it.percentage || 0).toFixed(3)}</td>
+                            <td className="p-2 text-right font-mono text-amber-700">{fmtQty(it.percentage || 0, volumeMl)}</td>
+                            {variantes.map(v => {
+                              const ov = (v.overrides || []).find(o => o.ingredient_name_base === it.ingredient_name);
+                              return (
+                                <td key={v.id} className="p-2 text-center bg-violet-50/50">
+                                  {ov ? (
+                                    <div>
+                                      <p className="font-medium text-violet-700">{ov.ingredient_name || it.ingredient_name}</p>
+                                      <p className="font-mono text-violet-600">{(ov.percentage || 0).toFixed(3)}%</p>
+                                      <p className="font-mono text-[10px] text-violet-500">{fmtQty(ov.percentage || 0, volumeMl)}</p>
+                                      {ov.fornecedor && <p className="text-[10px] text-muted-foreground">{ov.fornecedor}</p>}
+                                    </div>
+                                  ) : (
+                                    <span className="text-muted-foreground">base</span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot>
+                        <tr className="border-t-2 bg-muted/30 font-bold">
+                          <td className="p-2 text-xs">Total</td>
+                          <td className="p-2 text-right font-mono">{baseItems.reduce((s, it) => s + (it.percentage || 0), 0).toFixed(2)}</td>
+                          <td className="p-2 text-right font-mono">{volumeMl.toFixed(0)} mL</td>
+                          {variantes.map(v => <td key={v.id} className="p-2 bg-violet-50/30" />)}
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {batch.notas && (
+                <div className="px-4 py-2 border-t">
+                  <p className="text-xs text-muted-foreground bg-muted/30 rounded p-2">{batch.notas}</p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SampleBatchSection({ devId, formulas, onRefresh, canEdit }) {
+  const [batches, setBatches] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingBatch, setEditingBatch] = useState(null);
+
+  const fetchBatches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get(`/pd/developments/${devId}/sample-batches`);
+      setBatches(Array.isArray(data) ? data : []);
+    } catch { setBatches([]); } finally { setLoading(false); }
+  }, [devId]);
+
+  useEffect(() => { fetchBatches(); }, [fetchBatches]);
+
+  const handleSave = async (form) => {
+    if (editingBatch) {
+      await api.put(`/pd/developments/${devId}/sample-batches/${editingBatch.id}`, form);
+      toast.success("Lote atualizado");
+    } else {
+      await api.post(`/pd/developments/${devId}/sample-batches`, form);
+      toast.success("Lote criado");
+    }
+    fetchBatches();
+  };
+
+  const handleDelete = async (batchId) => {
+    if (!window.confirm("Remover este lote de amostras?")) return;
+    try {
+      await api.delete(`/pd/developments/${devId}/sample-batches/${batchId}`);
+      toast.success("Lote removido");
+      fetchBatches();
+    } catch { toast.error("Erro ao remover lote"); }
+  };
+
+  const openCreate = () => { setEditingBatch(null); setEditorOpen(true); };
+  const openEdit = (batch) => { setEditingBatch(batch); setEditorOpen(true); };
+
+  return (
+    <div className="mt-8 space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="h-px flex-1 bg-border" />
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-violet-50 border border-violet-200">
+            <GitBranch className="h-3.5 w-3.5 text-violet-600" />
+            <span className="text-xs font-semibold text-violet-700">Lotes de Amostras</span>
+            {batches.length > 0 && (
+              <span className="text-[10px] bg-violet-200 text-violet-700 rounded-full px-1.5">{batches.length}</span>
+            )}
+          </div>
+          <div className="h-px flex-1 bg-border" />
+        </div>
+        {canEdit && formulas.length > 0 && (
+          <Button variant="outline" size="sm" onClick={openCreate} className="ml-3 h-7 text-xs gap-1 border-violet-200 text-violet-700 hover:bg-violet-50">
+            <Plus className="h-3 w-3" />Novo Lote
+          </Button>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-6">
+          <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+        </div>
+      ) : batches.length === 0 ? (
+        <div className="text-center py-8 border border-dashed rounded-xl bg-muted/20">
+          <Combine className="h-8 w-8 text-muted-foreground/40 mx-auto mb-2" />
+          <p className="text-sm text-muted-foreground">Nenhum lote de amostras ainda.</p>
+          {canEdit && formulas.length > 0 && (
+            <p className="text-xs text-muted-foreground mt-1">Crie um lote para organizar variantes com mesma base (ex: diferentes fragrâncias).</p>
+          )}
+          {formulas.length === 0 && (
+            <p className="text-xs text-muted-foreground mt-1">Crie uma fórmula base primeiro para habilitar lotes.</p>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {batches.map(batch => (
+            <SampleBatchCard
+              key={batch.id}
+              batch={batch}
+              formulas={formulas}
+              onEdit={openEdit}
+              onDelete={handleDelete}
+              canEdit={canEdit}
+            />
+          ))}
+        </div>
+      )}
+
+      <Dialog open={editorOpen} onOpenChange={open => { if (!open) setEditorOpen(false); }}>
+        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <GitBranch className="h-5 w-5 text-violet-600" />
+              {editingBatch ? "Editar Lote de Amostras" : "Novo Lote de Amostras"}
+            </DialogTitle>
+            <DialogDescription>
+              Defina uma fórmula base e configure variantes com substituições de ingredientes (ex: fragrâncias diferentes).
+            </DialogDescription>
+          </DialogHeader>
+          {editorOpen && (
+            <SampleBatchEditor
+              devId={devId}
+              formulas={formulas}
+              initial={editingBatch}
+              onSave={handleSave}
+              onClose={() => setEditorOpen(false)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 /* ============ ESTABILIDADES TAB ============ */
 
 const CONDITION_ICONS = {
@@ -1616,9 +2450,18 @@ const FT_PARAMS = [
 
 function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
   const [analise, setAnalise] = useState({});
+  const EMPTY_ELABORACAO = { secoes: [] };
+  const parseElaboracao = (raw) => {
+    if (!raw) return EMPTY_ELABORACAO;
+    if (typeof raw === "object" && Array.isArray(raw.secoes)) return raw;
+    // legacy plain string → migrate to single section
+    if (typeof raw === "string" && raw.trim()) return { secoes: [{ id: "s1", nome: "Modo de Preparo", temperatura: "", etapas: [raw] }] };
+    return EMPTY_ELABORACAO;
+  };
+
   const [form, setForm] = useState({
     produto: "", lote: "", data_fabricacao: "", validade: "", quantidade: "",
-    elaboracao: "", resp_tecnico: "", status_aprovacao: "",
+    elaboracao: EMPTY_ELABORACAO, resp_tecnico: "", status_aprovacao: "",
     aspecto: { especificacao: "", resultado: "", pa: "" },
     cor: { especificacao: "", resultado: "", pa: "" },
     densidade: { especificacao: "", resultado: "", pa: "" },
@@ -1640,7 +2483,7 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
         data_fabricacao: a.data_fabricacao || "",
         validade: a.validade || "",
         quantidade: a.quantidade || "",
-        elaboracao: a.elaboracao || "",
+        elaboracao: parseElaboracao(a.elaboracao),
         resp_tecnico: a.resp_tecnico || "",
         status_aprovacao: a.status_aprovacao || "",
         aspecto: a.aspecto || { especificacao: "", resultado: "", pa: "" },
@@ -1666,6 +2509,34 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
       toast.error(err.response?.data?.detail || "Erro ao salvar");
     } finally { setSaving(false); }
   };
+
+  const elab = form.elaboracao || { secoes: [], observacoes_gerais: "" };
+  const setElab = (updater) => setForm(p => ({ ...p, elaboracao: updater(p.elaboracao || { secoes: [], observacoes_gerais: "" }) }));
+
+  const addSecao = () => setElab(e => ({
+    ...e,
+    secoes: [...e.secoes, {
+      id: `s${Date.now()}`,
+      nome: `Fase ${String.fromCharCode(65 + e.secoes.length)}`,
+      tipo: "",
+      temperatura: "",
+      agitacao: "",
+      tempo_min: "",
+      etapas: [""],
+    }]
+  }));
+  const removeSecao = (sid) => setElab(e => ({ ...e, secoes: e.secoes.filter(s => s.id !== sid) }));
+  const updateSecao = (sid, field, val) => setElab(e => ({ ...e, secoes: e.secoes.map(s => s.id === sid ? { ...s, [field]: val } : s) }));
+  const addEtapa = (sid) => setElab(e => ({ ...e, secoes: e.secoes.map(s => s.id === sid ? { ...s, etapas: [...s.etapas, ""] } : s) }));
+  const removeEtapa = (sid, idx) => setElab(e => ({ ...e, secoes: e.secoes.map(s => s.id === sid ? { ...s, etapas: s.etapas.filter((_, i) => i !== idx) } : s) }));
+  const updateEtapa = (sid, idx, val) => setElab(e => ({ ...e, secoes: e.secoes.map(s => s.id === sid ? { ...s, etapas: s.etapas.map((et, i) => i === idx ? val : et) } : s) }));
+  const moveSecao = (idx, dir) => setElab(e => {
+    const arr = [...e.secoes];
+    const to = idx + dir;
+    if (to < 0 || to >= arr.length) return e;
+    [arr[idx], arr[to]] = [arr[to], arr[idx]];
+    return { ...e, secoes: arr };
+  });
 
   const latest = formulas?.[0];
   const items = latest?.items || [];
@@ -1807,7 +2678,6 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
                     <th className="text-left p-2 font-medium">Fornecedor</th>
                     <th className="text-right p-2 font-medium w-20">%Fórmula</th>
                     <th className="text-right p-2 font-medium w-24">Qtd/Lote</th>
-                    <th className="text-right p-2 font-medium w-24">Custo R$</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1821,7 +2691,6 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
                         <td className="p-2 text-muted-foreground">{item.fornecedor || "—"}</td>
                         <td className="p-2 text-right font-mono">{(item.percentage || 0).toFixed(3)}</td>
                         <td className="p-2 text-right font-mono text-blue-600">{qty}</td>
-                        <td className="p-2 text-right font-mono">R$ {(item.cost_brl || 0).toFixed(2)}</td>
                       </tr>
                     );
                   })}
@@ -1832,20 +2701,274 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
         </Card>
       )}
 
-      {/* Descrição da Elaboração */}
+      {/* Descrição da Elaboração — Modo de Preparo (padrão Ameratti) */}
       <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Descrição da Elaboração</CardTitle>
+        <CardHeader className="pb-2">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                2.2 · Descrição da Elaboração — Modo de Preparo
+              </CardTitle>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Fase a fase · etapa a etapa · ingredientes vinculados da fórmula
+              </p>
+            </div>
+            {canEdit && (
+              <Button size="sm" variant="outline" className="h-7 gap-1 text-xs shrink-0" onClick={addSecao}>
+                <Plus className="h-3 w-3" /> Adicionar Fase
+              </Button>
+            )}
+          </div>
         </CardHeader>
-        <CardContent>
-          <Textarea
-            value={form.elaboracao || ""}
-            onChange={e => setForm(p => ({ ...p, elaboracao: e.target.value }))}
-            placeholder="Descreva o modo de preparo passo a passo..."
-            rows={5}
-            disabled={!canEdit}
-            data-testid="ft-elaboracao"
-          />
+        <CardContent className="space-y-4 pt-2" data-testid="ft-elaboracao">
+          {elab.secoes.length === 0 && (
+            <div className="text-center py-10 text-muted-foreground border-2 border-dashed rounded-xl">
+              <p className="text-sm font-medium">Nenhuma fase adicionada</p>
+              {canEdit && <p className="text-xs mt-1">Use "+ Adicionar Fase" para criar Fase A, B, C...</p>}
+            </div>
+          )}
+
+          {elab.secoes.map((secao, sIdx) => {
+            // Auto-link formula items whose "phase" field matches this section name (case-insensitive)
+            const linkedItems = (items || []).filter(it =>
+              it.phase && secao.nome &&
+              it.phase.trim().toLowerCase() === secao.nome.trim().toLowerCase()
+            );
+            const vol = latest?.volume || 0;
+            const vu = latest?.volume_unit || "mL";
+
+            const TIPO_COLORS = {
+              "Aquosa":        "bg-blue-500/15 text-blue-700 dark:text-blue-300 border-blue-500/30",
+              "Oleosa":        "bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30",
+              "Conservantes":  "bg-violet-500/15 text-violet-700 dark:text-violet-300 border-violet-500/30",
+              "Ativos":        "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
+              "Emulsificação": "bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30",
+              "Resfriamento":  "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border-cyan-500/30",
+              "Ajuste de pH":  "bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30",
+              "Outro":         "bg-slate-500/15 text-slate-600 dark:text-slate-300 border-slate-500/30",
+            };
+            const tipoColor = TIPO_COLORS[secao.tipo] || "";
+
+            return (
+              <div key={secao.id} className="border rounded-xl overflow-hidden shadow-sm">
+                {/* ── Phase header ── */}
+                <div className="bg-[#0A0A0B] text-white px-4 py-2.5 flex items-center gap-3 flex-wrap">
+                  {/* Letter badge */}
+                  <span className="flex items-center justify-center h-7 w-7 rounded-lg bg-white/10 text-sm font-bold shrink-0">
+                    {String.fromCharCode(65 + sIdx)}
+                  </span>
+
+                  {/* Phase name */}
+                  {canEdit ? (
+                    <Input
+                      value={secao.nome}
+                      onChange={e => updateSecao(secao.id, "nome", e.target.value)}
+                      className="h-7 w-36 text-sm font-semibold bg-transparent border-0 border-b border-white/30 rounded-none text-white placeholder:text-white/40 focus:border-white/70 px-0"
+                      placeholder="Nome da fase..."
+                    />
+                  ) : (
+                    <span className="text-sm font-semibold">{secao.nome}</span>
+                  )}
+
+                  {/* Tipo */}
+                  {canEdit ? (
+                    <select
+                      value={secao.tipo || ""}
+                      onChange={e => updateSecao(secao.id, "tipo", e.target.value)}
+                      className="h-7 text-xs bg-white/10 border border-white/20 rounded px-2 text-white focus:outline-none focus:border-white/50"
+                    >
+                      <option value="">Tipo...</option>
+                      {["Aquosa","Oleosa","Conservantes","Ativos","Emulsificação","Resfriamento","Ajuste de pH","Outro"].map(t => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  ) : secao.tipo ? (
+                    <span className={`text-[11px] font-medium border rounded-full px-2.5 py-0.5 ${tipoColor}`}>{secao.tipo}</span>
+                  ) : null}
+
+                  {/* Temperatura */}
+                  {canEdit ? (
+                    <div className="flex items-center gap-1">
+                      <Thermometer className="h-3.5 w-3.5 text-white/50 shrink-0" />
+                      <Input
+                        value={secao.temperatura || ""}
+                        onChange={e => updateSecao(secao.id, "temperatura", e.target.value)}
+                        className="h-6 w-20 text-xs bg-transparent border-0 border-b border-white/30 rounded-none text-white placeholder:text-white/40 focus:border-white/70 px-0"
+                        placeholder="ex: 70°C"
+                      />
+                    </div>
+                  ) : secao.temperatura ? (
+                    <span className="flex items-center gap-1 text-white/70 text-xs">
+                      <Thermometer className="h-3 w-3" />{secao.temperatura}
+                    </span>
+                  ) : null}
+
+                  {/* Agitação */}
+                  {canEdit ? (
+                    <select
+                      value={secao.agitacao || ""}
+                      onChange={e => updateSecao(secao.id, "agitacao", e.target.value)}
+                      className="h-7 text-xs bg-white/10 border border-white/20 rounded px-2 text-white focus:outline-none focus:border-white/50"
+                    >
+                      <option value="">Agitação...</option>
+                      {["Suave","Média","Alta","Homogeneizador","Sem agitação"].map(a => (
+                        <option key={a} value={a}>{a}</option>
+                      ))}
+                    </select>
+                  ) : secao.agitacao ? (
+                    <span className="text-white/60 text-xs">Agit. {secao.agitacao}</span>
+                  ) : null}
+
+                  {/* Tempo */}
+                  {canEdit ? (
+                    <div className="flex items-center gap-1">
+                      <span className="text-white/50 text-xs">Tempo:</span>
+                      <Input
+                        value={secao.tempo_min || ""}
+                        onChange={e => updateSecao(secao.id, "tempo_min", e.target.value)}
+                        className="h-6 w-14 text-xs bg-transparent border-0 border-b border-white/30 rounded-none text-white placeholder:text-white/40 focus:border-white/70 px-0"
+                        placeholder="min"
+                      />
+                    </div>
+                  ) : secao.tempo_min ? (
+                    <span className="text-white/60 text-xs">{secao.tempo_min} min</span>
+                  ) : null}
+
+                  {/* Controls */}
+                  <div className="ml-auto flex items-center gap-1 shrink-0">
+                    {canEdit && (
+                      <>
+                        <button type="button" onClick={() => moveSecao(sIdx, -1)} disabled={sIdx === 0}
+                          className="h-6 w-6 flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-30 text-white/70">
+                          <ChevronUp className="h-3.5 w-3.5" />
+                        </button>
+                        <button type="button" onClick={() => moveSecao(sIdx, 1)} disabled={sIdx === elab.secoes.length - 1}
+                          className="h-6 w-6 flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-30 text-white/70">
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        </button>
+                        <button type="button" onClick={() => removeSecao(secao.id)}
+                          className="h-6 w-6 flex items-center justify-center rounded hover:bg-red-500/30 text-white/60 hover:text-red-300 ml-1">
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* ── Linked ingredients (auto from formula) ── */}
+                {linkedItems.length > 0 && (
+                  <div className="border-b bg-muted/20">
+                    <div className="px-4 py-1.5 flex items-center gap-2">
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                        Ingredientes desta fase (da fórmula)
+                      </span>
+                      <span className="text-[10px] text-muted-foreground border rounded-full px-1.5 py-px">{linkedItems.length}</span>
+                    </div>
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-t border-b text-muted-foreground">
+                          <th className="text-left px-4 py-1.5 font-medium">Ingrediente</th>
+                          <th className="text-left px-3 py-1.5 font-medium">Fornecedor</th>
+                          <th className="text-right px-3 py-1.5 font-medium w-20">% Fórmula</th>
+                          <th className="text-right px-4 py-1.5 font-medium w-24">Qtd / Lote</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {linkedItems.map(item => {
+                          const qty = vol > 0 ? `${(vol * (item.percentage || 0) / 100).toFixed(3)} ${vu}` : "—";
+                          return (
+                            <tr key={item.id} className="hover:bg-muted/30">
+                              <td className="px-4 py-1.5 font-medium">{item.ingredient_name}</td>
+                              <td className="px-3 py-1.5 text-muted-foreground">{item.fornecedor || "—"}</td>
+                              <td className="px-3 py-1.5 text-right font-mono">{(item.percentage || 0).toFixed(3)}</td>
+                              <td className="px-4 py-1.5 text-right font-mono text-blue-600 dark:text-blue-400">{qty}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {linkedItems.length === 0 && items.length > 0 && (
+                  <div className="border-b bg-muted/10 px-4 py-2 flex items-center gap-2">
+                    <span className="text-[10px] text-muted-foreground/60 italic">
+                      Nenhum ingrediente da fórmula com fase "{secao.nome}".
+                      Defina o campo "Fase" nos ingredientes da formulação para vincular aqui.
+                    </span>
+                  </div>
+                )}
+
+                {/* ── Procedimento / Steps ── */}
+                <div className="divide-y">
+                  <div className="px-4 py-1.5 bg-muted/10">
+                    <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Procedimento</span>
+                  </div>
+                  {secao.etapas.map((etapa, eIdx) => (
+                    <div key={eIdx} className="flex items-start gap-2 px-4 py-2 hover:bg-muted/20 group">
+                      <span className="text-xs font-mono font-bold text-muted-foreground/60 mt-2 w-5 shrink-0 text-right select-none">
+                        {eIdx + 1}.
+                      </span>
+                      {canEdit ? (
+                        <Textarea
+                          value={etapa}
+                          onChange={e => updateEtapa(secao.id, eIdx, e.target.value)}
+                          rows={2}
+                          placeholder="Descreva a etapa de preparo..."
+                          className="flex-1 text-sm resize-none border-0 bg-transparent focus:bg-muted/30 focus:border rounded px-2 min-h-[2.5rem]"
+                        />
+                      ) : (
+                        <p className="flex-1 text-sm py-1.5 leading-relaxed">
+                          {etapa || <span className="italic text-muted-foreground">—</span>}
+                        </p>
+                      )}
+                      {canEdit && (
+                        <button type="button" onClick={() => removeEtapa(secao.id, eIdx)}
+                          className="mt-1.5 h-6 w-6 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 hover:bg-destructive/10 text-muted-foreground hover:text-destructive shrink-0 transition-opacity">
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {canEdit && (
+                    <div className="px-4 py-2">
+                      <button type="button" onClick={() => addEtapa(secao.id)}
+                        className="text-xs text-primary hover:underline flex items-center gap-1">
+                        <Plus className="h-3 w-3" /> Adicionar etapa
+                      </button>
+                    </div>
+                  )}
+                  {!canEdit && secao.etapas.length === 0 && (
+                    <p className="px-4 py-2 text-xs text-muted-foreground italic">Nenhuma etapa registrada.</p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Observações Gerais */}
+          {(canEdit || elab.observacoes_gerais) && (
+            <div className="border rounded-xl overflow-hidden">
+              <div className="bg-muted/40 px-4 py-2 border-b">
+                <span className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                  Observações Gerais de Processo
+                </span>
+              </div>
+              <div className="p-4">
+                {canEdit ? (
+                  <Textarea
+                    value={elab.observacoes_gerais || ""}
+                    onChange={e => setElab(el => ({ ...el, observacoes_gerais: e.target.value }))}
+                    rows={3}
+                    placeholder="Ex: produto sensível à temperatura — não ultrapassar 45°C na adição de ativos. Ajustar pH para 5,5–6,0 com NaOH 10% ou ácido cítrico 10%."
+                    className="w-full text-sm border-0 bg-transparent resize-none focus:bg-muted/20 focus:border rounded px-0"
+                  />
+                ) : (
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{elab.observacoes_gerais}</p>
+                )}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -2147,6 +3270,8 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
   const [form, setForm] = useState({ formula_version: formulas[0]?.version || 1, sent_to_client: false, feedback: "" });
   const [editingId, setEditingId] = useState(null);
   const [editFeedback, setEditFeedback] = useState("");
+  const [sampleVolume, setSampleVolume] = useState(15);
+  const [showOrderId, setShowOrderId] = useState(null);
 
   const createSample = async () => {
     try {
@@ -2166,13 +3291,35 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
     } catch (err) { toast.error("Erro"); }
   };
 
+  const getSampleStatus = (s) => {
+    if (!s.sent_to_client) return { label: "Com P&D", color: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400", stage: 0 };
+    if (s.client_approved === true) return { label: "Aprovada", color: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300", stage: 3 };
+    if (s.client_approved === false) return { label: "Reprovada pelo cliente", color: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300", stage: 3 };
+    return { label: "Aguardando aprovação do cliente", color: "bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300", stage: 2 };
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h3 className="text-base font-semibold">Amostras ({samples.length})</h3>
-        <Button size="sm" onClick={() => setShowCreate(true)} className="gap-1.5" disabled={!canEdit}>
-          <Plus className="h-3.5 w-3.5" /> Nova Amostra
-        </Button>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 border rounded-md px-2 py-1 bg-muted/30">
+            <Beaker className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-xs text-muted-foreground">Vol. amostra:</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={sampleVolume}
+              onChange={e => setSampleVolume(parseFloat(e.target.value) || 15)}
+              className="w-14 text-xs font-mono bg-transparent border-none outline-none text-right"
+            />
+            <span className="text-xs text-muted-foreground">mL</span>
+          </div>
+          <Button size="sm" onClick={() => setShowCreate(true)} className="gap-1.5" disabled={!canEdit}>
+            <Plus className="h-3.5 w-3.5" /> Nova Amostra
+          </Button>
+        </div>
       </div>
 
       {showCreate && (
@@ -2190,12 +3337,8 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
               </div>
               <div className="flex items-center gap-3 pt-6">
                 <Switch checked={form.sent_to_client} onCheckedChange={v => setForm(p => ({ ...p, sent_to_client: v }))} />
-                <Label>Já enviada ao cliente</Label>
+                <Label>Já entregue ao comercial</Label>
               </div>
-            </div>
-            <div>
-              <Label>Feedback do cliente</Label>
-              <Textarea value={form.feedback} onChange={e => setForm(p => ({ ...p, feedback: e.target.value }))} rows={2} placeholder="Comentários do cliente sobre a amostra..." />
             </div>
             <div className="flex gap-2">
               <Button size="sm" onClick={createSample}>Registrar Amostra</Button>
@@ -2205,34 +3348,50 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
         </Card>
       )}
 
-      <div className="space-y-2">
+      <div className="space-y-3">
         {samples.map(s => {
           const isEditing = editingId === s.id;
+          const status = getSampleStatus(s);
           return (
             <Card key={s.id}>
               <CardContent className="p-4">
                 <div className="flex items-start justify-between gap-3">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap mb-2">
                       <span className="font-medium text-sm">Fórmula v{s.formula_version}</span>
-                      {s.sent_to_client ? (
-                        <Badge className="bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 text-[11px] gap-1"><Send className="h-3 w-3" /> Enviada</Badge>
-                      ) : (
-                        <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 text-[11px]">Não enviada</Badge>
-                      )}
+                      <Badge className={`text-[11px] ${status.color}`}>{status.label}</Badge>
                     </div>
-                    {!isEditing ? (
-                      <>
-                        {s.feedback && (
-                          <div className="mt-2 bg-muted/50 p-2.5 rounded text-sm flex items-start gap-2">
-                            <MessageSquare className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
-                            <p className="text-sm">{s.feedback}</p>
+
+                    {/* Progress indicator */}
+                    <div className="flex items-center gap-1 mb-3">
+                      {[
+                        { step: 1, label: "Com P&D", done: status.stage >= 1 },
+                        { step: 2, label: "No Comercial", done: status.stage >= 2 },
+                        { step: 3, label: "Decisão cliente", done: status.stage >= 3 },
+                      ].map((st, i) => (
+                        <React.Fragment key={st.step}>
+                          <div className={`flex items-center gap-1 text-[10px] font-medium ${st.done ? "text-green-700" : "text-muted-foreground"}`}>
+                            <div className={`h-4 w-4 rounded-full flex items-center justify-center text-[9px] font-bold ${st.done ? "bg-green-600 text-white" : "bg-muted border"}`}>
+                              {st.step}
+                            </div>
+                            {st.label}
                           </div>
-                        )}
-                        {!s.feedback && <p className="text-xs text-muted-foreground mt-1 italic">Sem feedback do cliente</p>}
-                      </>
+                          {i < 2 && <div className={`flex-1 h-px mx-1 ${st.done ? "bg-green-400" : "bg-border"}`} style={{ maxWidth: 24 }} />}
+                        </React.Fragment>
+                      ))}
+                    </div>
+
+                    {/* Feedback */}
+                    {!isEditing ? (
+                      s.feedback && (
+                        <div className="bg-muted/50 p-2.5 rounded text-sm flex items-start gap-2">
+                          <MessageSquare className="h-3.5 w-3.5 text-muted-foreground mt-0.5 shrink-0" />
+                          <p className="text-sm">{s.feedback}</p>
+                        </div>
+                      )
                     ) : (
-                      <div className="mt-2 space-y-2">
+                      <div className="space-y-2">
+                        <Label className="text-xs">Feedback do cliente</Label>
                         <Textarea value={editFeedback} onChange={e => setEditFeedback(e.target.value)} rows={2} placeholder="Feedback do cliente..." />
                         <div className="flex gap-2">
                           <Button size="sm" onClick={() => updateSample(s.id, { feedback: editFeedback })} className="gap-1"><Save className="h-3 w-3" /> Salvar</Button>
@@ -2241,19 +3400,61 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
+
+                  <div className="flex flex-col items-end gap-1.5 shrink-0">
+                    {/* Stage 1 → 2: Entregar ao Comercial */}
                     {!s.sent_to_client && canEdit && (
                       <Button size="sm" variant="outline" onClick={() => updateSample(s.id, { sent_to_client: true })} className="gap-1 text-xs">
-                        <Send className="h-3 w-3" /> Enviar
+                        <Send className="h-3 w-3" /> Entregar ao Comercial
                       </Button>
                     )}
+                    {/* Stage 2 → 3: Registrar decisão do cliente */}
+                    {s.sent_to_client && s.client_approved == null && canEdit && (
+                      <div className="flex gap-1.5">
+                        <Button size="sm" variant="outline" className="gap-1 text-xs text-green-700 border-green-300 hover:bg-green-50"
+                          onClick={() => { setEditingId(s.id); setEditFeedback(s.feedback || ""); updateSample(s.id, { client_approved: true }); }}>
+                          <ThumbsUp className="h-3 w-3" /> Cliente aprovou
+                        </Button>
+                        <Button size="sm" variant="outline" className="gap-1 text-xs text-red-600 border-red-300 hover:bg-red-50"
+                          onClick={() => { setEditingId(s.id); setEditFeedback(s.feedback || ""); updateSample(s.id, { client_approved: false }); }}>
+                          <ThumbsDown className="h-3 w-3" /> Cliente reprovou
+                        </Button>
+                      </div>
+                    )}
+                    {/* Edit feedback */}
                     {!isEditing && canEdit && (
-                      <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => { setEditingId(s.id); setEditFeedback(s.feedback || ""); }}>
+                      <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setEditingId(s.id); setEditFeedback(s.feedback || ""); }}>
                         <Pencil className="h-3.5 w-3.5" />
                       </Button>
                     )}
+                    {/* Manipulation order toggle */}
+                    <Button
+                      variant="ghost" size="sm"
+                      className="gap-1 text-xs text-muted-foreground h-7"
+                      onClick={() => setShowOrderId(prev => prev === s.id ? null : s.id)}
+                    >
+                      <ClipboardList className="h-3.5 w-3.5" />
+                      {showOrderId === s.id ? "Fechar ordem" : "Ordem"}
+                    </Button>
                   </div>
                 </div>
+
+                {/* Manipulation order panel */}
+                {showOrderId === s.id && (() => {
+                  const f = formulas.find(f => f.version === s.formula_version);
+                  return (
+                    <div className="mt-3 border-t pt-3">
+                      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">
+                        Ordem de manipulação — {sampleVolume} mL (≈ {sampleVolume} g)
+                      </p>
+                      {f ? (
+                        <ManipulacaoOrder formulaId={f.id} sampleVolume={sampleVolume} />
+                      ) : (
+                        <p className="text-xs text-muted-foreground">Fórmula v{s.formula_version} não encontrada.</p>
+                      )}
+                    </div>
+                  );
+                })()}
               </CardContent>
             </Card>
           );
@@ -2261,72 +3462,164 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
       </div>
 
       {samples.length === 0 && !showCreate && (
-        <EmptyState icon={Package} title="Nenhuma amostra registrada" subtitle="Registre amostras enviadas ao cliente" />
+        <EmptyState icon={Package} title="Nenhuma amostra registrada" subtitle="Registre amostras produzidas para entrega ao comercial" />
       )}
     </div>
   );
 }
 
-/* ============ COSTS TAB (Auto-calculated from formula + manual) ============ */
-function CostsTab({ devId, costs, formulas, formulaCostData, onRefresh, canEdit }) {
-  const [form, setForm] = useState({
-    ingredient_cost: costs.ingredient_cost || 0,
-    packaging_cost: costs.packaging_cost || 0,
-    labor_cost: costs.labor_cost || 0,
-  });
-  const [saving, setSaving] = useState(false);
+/* ============ MANIPULACAO ORDER (per-sample inline) ============ */
+function ManipulacaoOrder({ formulaId, sampleVolume }) {
+  const [items, setItems] = useState(null);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    setForm({
-      ingredient_cost: costs.ingredient_cost || 0,
-      packaging_cost: costs.packaging_cost || 0,
-      labor_cost: costs.labor_cost || 0,
-    });
-  }, [costs]);
+    if (!formulaId) return;
+    setLoading(true);
+    api.get(`/pd/formulas/${formulaId}/items`)
+      .then(r => setItems(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setItems([]))
+      .finally(() => setLoading(false));
+  }, [formulaId]);
 
-  const total = (parseFloat(form.ingredient_cost) || 0) + (parseFloat(form.packaging_cost) || 0) + (parseFloat(form.labor_cost) || 0);
+  if (loading) return <p className="text-xs text-muted-foreground py-2">Carregando composição...</p>;
+  if (!items) return null;
+  if (items.length === 0) return <p className="text-xs text-muted-foreground py-2">Fórmula sem ingredientes cadastrados.</p>;
 
-  const saveCosts = async () => {
-    setSaving(true);
-    try {
-      await api.post(`/pd/developments/${devId}/costs`, {
-        ingredient_cost: parseFloat(form.ingredient_cost) || 0,
-        packaging_cost: parseFloat(form.packaging_cost) || 0,
-        labor_cost: parseFloat(form.labor_cost) || 0,
-      });
-      toast.success("Custos salvos com sucesso!");
-      onRefresh();
-    } catch (err) { toast.error("Erro ao salvar custos"); }
-    finally { setSaving(false); }
-  };
+  const totalPct = items.reduce((s, r) => s + (r.percentage || 0), 0);
+
+  return (
+    <div className="mt-3 rounded-md border bg-background overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="bg-muted/50 border-b">
+            <th className="text-left px-3 py-2 font-semibold">Ingrediente</th>
+            <th className="text-left px-3 py-2 font-semibold">Fase</th>
+            <th className="text-right px-3 py-2 font-semibold">%</th>
+            <th className="text-right px-3 py-2 font-semibold">Qtd (g)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((row) => {
+            const qty = ((row.percentage || 0) / 100) * sampleVolume;
+            return (
+              <tr key={row.id} className="border-b last:border-0 hover:bg-muted/20">
+                <td className="px-3 py-1.5 font-medium">{row.ingredient_name}</td>
+                <td className="px-3 py-1.5 text-muted-foreground">{row.phase || "—"}</td>
+                <td className="px-3 py-1.5 text-right font-mono">{(row.percentage || 0).toFixed(3)}</td>
+                <td className="px-3 py-1.5 text-right font-mono font-semibold">{qty.toFixed(4)}</td>
+              </tr>
+            );
+          })}
+          <tr className="bg-muted/30 font-semibold">
+            <td className="px-3 py-1.5" colSpan={2}>TOTAL</td>
+            <td className="px-3 py-1.5 text-right font-mono">{totalPct.toFixed(3)}</td>
+            <td className="px-3 py-1.5 text-right font-mono">{((totalPct / 100) * sampleVolume).toFixed(4)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ============ COSTS TAB — P&D view (ingredient costs + submit to Compras) ============ */
+function CostsTab({ devId, costVersions, formulas, formulaCostData, onRefresh, canEdit }) {
+  const v1 = costVersions?.v1 || {};
+  const v2summary = costVersions?.v2 || null;
+  const totalFinal = costVersions?.total_final;
+  const v1Status = v1.status || "rascunho";
+  const isSubmitted = v1Status === "enviado";
+
+  const [manualAdj, setManualAdj] = useState(v1.ingredient_cost_manual || 0);
+  const [notes, setNotes] = useState(v1.notes || "");
+  const [saving, setSaving] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    setManualAdj(v1.ingredient_cost_manual || 0);
+    setNotes(v1.notes || "");
+  }, [v1.ingredient_cost_manual, v1.notes]);
 
   const latestFormula = formulas && formulas.length > 0 ? formulas[0] : null;
 
+  const saveV1 = async () => {
+    setSaving(true);
+    try {
+      await api.put(`/pd/developments/${devId}/cost-versions/v1`, {
+        ingredient_cost_manual: parseFloat(manualAdj) || 0,
+        notes,
+      });
+      toast.success("Rascunho de custo salvo.");
+      onRefresh();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao salvar custo."); }
+    finally { setSaving(false); }
+  };
+
+  const submitV1 = async () => {
+    setSubmitting(true);
+    try {
+      await api.post(`/pd/developments/${devId}/cost-versions/v1/submit`);
+      toast.success("Custo v1 enviado para Compras.");
+      onRefresh();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao enviar."); }
+    finally { setSubmitting(false); }
+  };
+
+  const v1StatusConfig = {
+    rascunho: { label: "Rascunho", icon: Clock4, cls: "bg-slate-500/10 text-slate-400 border-slate-500/20" },
+    enviado:  { label: "Enviado para Compras", icon: CheckCircle, cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/20" },
+  }[v1Status] || { label: v1Status, icon: AlertCircle, cls: "bg-amber-500/10 text-amber-600 border-amber-500/20" };
+
+  const v2StatusConfig = !v2summary ? null : {
+    rascunho:   { label: "Compras em análise", icon: Clock4, cls: "bg-sky-500/10 text-sky-600 border-sky-500/20" },
+    finalizado: { label: "Custo final disponível", icon: CheckCircle2, cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/20" },
+  }[v2summary.status] || { label: v2summary.status, icon: AlertCircle, cls: "bg-slate-500/10 text-slate-400 border-slate-500/20" };
+
   return (
     <div className="space-y-6">
-      <h3 className="text-base font-semibold">Relatório de Custos</h3>
-      
-      {/* Formula-based costs (auto-calculated) */}
+      {/* Status header */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <h3 className="text-base font-semibold flex items-center gap-2">
+          <Layers className="h-4 w-4 text-cyan-500" />
+          Custo P&D — v1
+        </h3>
+        <Badge className={`border gap-1.5 ${v1StatusConfig.cls}`}>
+          <v1StatusConfig.icon className="h-3 w-3" />
+          {v1StatusConfig.label}
+        </Badge>
+        {v1.submitted_at && (
+          <span className="text-xs text-muted-foreground">
+            por {v1.submitted_by_name} em {new Date(v1.submitted_at).toLocaleDateString("pt-BR")}
+          </span>
+        )}
+        {v2StatusConfig && (
+          <Badge className={`border gap-1.5 ${v2StatusConfig.cls}`}>
+            <v2StatusConfig.icon className="h-3 w-3" />
+            {v2StatusConfig.label}
+          </Badge>
+        )}
+      </div>
+
+      {/* Formula ingredient cost table (auto) */}
       {latestFormula && (
         <Card className="border-green-200 dark:border-green-900">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <CardTitle className="text-base flex items-center gap-2">
                 <Beaker className="h-4 w-4 text-green-600" />
-                Custo da Fórmula (v{latestFormula.version} — {latestFormula.name})
+                Custo de Ingredientes — Fórmula v{latestFormula.version} ({latestFormula.name})
               </CardTitle>
               <Badge variant="outline" className="text-[10px] text-green-600 border-green-300">Auto-calculado</Badge>
             </div>
           </CardHeader>
           <CardContent>
-            {/* Mini formula cost table */}
             <div className="border rounded-md overflow-hidden mb-4">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="bg-[#0A0A0B] text-white text-xs">
-                    <th className="text-left p-2 font-medium">Formulação</th>
-                    <th className="text-right p-2 font-medium w-24">%Fórmula</th>
-                    <th className="text-right p-2 font-medium w-28">Preço R$/Kg</th>
+                    <th className="text-left p-2 font-medium">Ingrediente</th>
+                    <th className="text-right p-2 font-medium w-24">% Fórmula</th>
+                    <th className="text-right p-2 font-medium w-28">R$/Kg</th>
                     <th className="text-right p-2 font-medium w-24">Custo R$</th>
                     <th className="text-right p-2 font-medium w-24">% Custo</th>
                   </tr>
@@ -2340,7 +3633,7 @@ function CostsTab({ devId, costs, formulas, formulaCostData, onRefresh, canEdit 
                         <td className="p-2">{item.ingredient_name}</td>
                         <td className="p-2 text-right font-mono text-xs">{(item.percentage || 0).toFixed(3)}</td>
                         <td className="p-2 text-right font-mono text-xs">{(item.price_per_kg || 0).toFixed(2)}</td>
-                        <td className="p-2 text-right font-mono text-xs">{(item.cost_brl || 0).toFixed(2)}</td>
+                        <td className="p-2 text-right font-mono text-xs">{(item.cost_brl || 0).toFixed(4)}</td>
                         <td className="p-2 text-right font-mono text-xs">{pct.toFixed(1)}%</td>
                       </tr>
                     );
@@ -2348,13 +3641,11 @@ function CostsTab({ devId, costs, formulas, formulaCostData, onRefresh, canEdit 
                 </tbody>
               </table>
             </div>
-
-            {/* Summary */}
             {formulaCostData && (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="rounded-lg border p-3 text-center">
-                  <div className="text-xs text-muted-foreground mb-1">Custo/Kg</div>
-                  <div className="text-lg font-bold">R$ {formulaCostData.total_cost_per_kg.toFixed(2)}</div>
+                  <div className="text-xs text-muted-foreground mb-1">Custo/Kg (R$)</div>
+                  <div className="text-lg font-bold">{formulaCostData.total_cost_per_kg.toFixed(4)}</div>
                 </div>
                 <div className="rounded-lg border p-3 text-center bg-green-50 dark:bg-green-950">
                   <div className="text-xs text-muted-foreground mb-1">Custo Unitário</div>
@@ -2365,7 +3656,7 @@ function CostsTab({ devId, costs, formulas, formulaCostData, onRefresh, canEdit 
                 </div>
                 {formulaCostData.indice_perdas > 0 && (
                   <div className="rounded-lg border p-3 text-center bg-orange-50 dark:bg-orange-950">
-                    <div className="text-xs text-muted-foreground mb-1">Com Perdas ({formulaCostData.indice_perdas}%)</div>
+                    <div className="text-xs text-muted-foreground mb-1">c/ Perdas ({formulaCostData.indice_perdas}%)</div>
                     <div className="text-lg font-bold text-orange-700">R$ {formulaCostData.custo_com_perdas.toFixed(2)}</div>
                   </div>
                 )}
@@ -2379,38 +3670,316 @@ function CostsTab({ devId, costs, formulas, formulaCostData, onRefresh, canEdit 
         </Card>
       )}
 
-      {/* Manual costs */}
-      <Card>
+      {/* Manual adjustment + notes (editable only when rascunho) */}
+      <Card className={isSubmitted ? "opacity-70" : ""}>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Custos Adicionais (Manual)</CardTitle>
+          <CardTitle className="text-base">Ajuste Manual de Custo de Ingredientes</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <Label className="flex items-center gap-1.5"><Beaker className="h-3.5 w-3.5 text-purple-500" /> Ingredientes (R$)</Label>
-              <Input type="number" step="0.01" value={form.ingredient_cost}
-                onChange={e => setForm(p => ({ ...p, ingredient_cost: e.target.value }))} className="mt-1" />
+              <Label className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
+                <DollarSign className="h-3.5 w-3.5" /> Ajuste manual (R$)
+              </Label>
+              <Input type="number" step="0.01" value={manualAdj} disabled={isSubmitted || !canEdit}
+                onChange={e => setManualAdj(e.target.value)} />
+              <p className="text-[11px] text-muted-foreground mt-1">
+                Valor somado ao custo auto-calculado da fórmula. Use para MP cotada fora do sistema.
+              </p>
             </div>
             <div>
-              <Label className="flex items-center gap-1.5"><Package className="h-3.5 w-3.5 text-amber-500" /> Embalagem (R$)</Label>
-              <Input type="number" step="0.01" value={form.packaging_cost}
-                onChange={e => setForm(p => ({ ...p, packaging_cost: e.target.value }))} className="mt-1" />
-            </div>
-            <div>
-              <Label className="flex items-center gap-1.5"><DollarSign className="h-3.5 w-3.5 text-green-500" /> Mão de Obra (R$)</Label>
-              <Input type="number" step="0.01" value={form.labor_cost}
-                onChange={e => setForm(p => ({ ...p, labor_cost: e.target.value }))} className="mt-1" />
+              <Label className="text-xs text-muted-foreground mb-1 block">Observações</Label>
+              <Input value={notes} disabled={isSubmitted || !canEdit} onChange={e => setNotes(e.target.value)}
+                placeholder="Justificativa do ajuste, fornecedor, etc." />
             </div>
           </div>
+
+          <div className="flex items-center justify-between rounded-lg border p-3 bg-muted/30">
+            <span className="text-sm font-medium">Total v1 (ingredientes):</span>
+            <span className="text-xl font-bold text-green-700">
+              R$ {((v1.ingredient_cost_auto || formulaCostData?.total_cost_per_kg || 0) + (parseFloat(manualAdj) || 0)).toFixed(4)}
+            </span>
+          </div>
+
+          {!isSubmitted && canEdit && (
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={saveV1} disabled={saving} className="flex-1 gap-1.5">
+                <Save className="h-4 w-4" />
+                {saving ? "Salvando..." : "Salvar Rascunho"}
+              </Button>
+              <Button onClick={submitV1} disabled={submitting} className="flex-1 gap-1.5 bg-emerald-600 hover:bg-emerald-700">
+                <Send className="h-4 w-4" />
+                {submitting ? "Enviando..." : "Enviar para Compras"}
+              </Button>
+            </div>
+          )}
+
+          {isSubmitted && (
+            <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 dark:bg-emerald-950 dark:border-emerald-900 p-3 text-sm text-emerald-700 dark:text-emerald-300">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              Custo v1 enviado e bloqueado para edição. Aguardando análise comercial.
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Final cost (shown to P&D only when v2 is finalized) */}
+      {totalFinal != null && (
+        <Card className="border-2 border-emerald-500/30 bg-emerald-50/50 dark:bg-emerald-950/30">
+          <CardContent className="pt-5 pb-5">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+                <div>
+                  <p className="font-semibold text-sm">Custo Final Aprovado pelo Comercial</p>
+                  <p className="text-xs text-muted-foreground">
+                    Finalizado em {v2summary?.finalized_at ? new Date(v2summary.finalized_at).toLocaleDateString("pt-BR") : "—"}
+                  </p>
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-2xl font-bold text-emerald-700">R$ {totalFinal.toFixed(2)}</div>
+                <div className="text-[11px] text-muted-foreground">custo total unitário</div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ============ COMERCIAL TAB — Compras view (full v1 + v2 inputs) ============ */
+function ComercialTab({ devId, costVersions, formulaCostData, onRefresh }) {
+  const v1 = costVersions?.v1 || {};
+  const v2 = costVersions?.v2 || {};
+  const v1Status = v1.status || "rascunho";
+  const v2Status = v2.status || null;
+  const isFinalized = v2Status === "finalizado";
+  const totalFinal = costVersions?.total_final || 0;
+
+  const [form, setForm] = useState({
+    packaging_cost: v2.packaging_cost || 0,
+    labor_cost: v2.labor_cost || 0,
+    overhead_cost: v2.overhead_cost || 0,
+    other_cost: v2.other_cost || 0,
+    notes: v2.notes || "",
+  });
+  const [saving, setSaving] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
+
+  useEffect(() => {
+    setForm({
+      packaging_cost: v2.packaging_cost || 0,
+      labor_cost: v2.labor_cost || 0,
+      overhead_cost: v2.overhead_cost || 0,
+      other_cost: v2.other_cost || 0,
+      notes: v2.notes || "",
+    });
+  }, [v2.packaging_cost, v2.labor_cost, v2.overhead_cost, v2.other_cost, v2.notes]);
+
+  const v2Total = (parseFloat(form.packaging_cost) || 0) + (parseFloat(form.labor_cost) || 0)
+    + (parseFloat(form.overhead_cost) || 0) + (parseFloat(form.other_cost) || 0);
+  const previewTotal = (v1.total || 0) + v2Total;
+
+  const saveV2 = async () => {
+    setSaving(true);
+    try {
+      await api.put(`/pd/developments/${devId}/cost-versions/v2`, {
+        packaging_cost: parseFloat(form.packaging_cost) || 0,
+        labor_cost: parseFloat(form.labor_cost) || 0,
+        overhead_cost: parseFloat(form.overhead_cost) || 0,
+        other_cost: parseFloat(form.other_cost) || 0,
+        notes: form.notes,
+      });
+      toast.success("Custos comerciais salvos.");
+      onRefresh();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao salvar."); }
+    finally { setSaving(false); }
+  };
+
+  const finalizeV2 = async () => {
+    setFinalizing(true);
+    try {
+      await api.post(`/pd/developments/${devId}/cost-versions/v2/finalize`);
+      toast.success("Custo comercial finalizado e comunicado ao P&D.");
+      onRefresh();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao finalizar."); }
+    finally { setFinalizing(false); }
+  };
+
+  if (v1Status !== "enviado") {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+          <Clock4 className="h-7 w-7 text-muted-foreground" />
+        </div>
+        <p className="font-medium">Aguardando custo v1 do P&D</p>
+        <p className="text-sm text-muted-foreground max-w-sm">
+          O setor de P&D ainda não enviou o custo de ingredientes. Assim que o custo v1 for submetido, você poderá preencher os custos comerciais aqui.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-3 flex-wrap">
+        <h3 className="text-base font-semibold flex items-center gap-2">
+          <Building2 className="h-4 w-4 text-sky-500" />
+          Análise Comercial — Custo v2
+        </h3>
+        {v2Status && (
+          <Badge className={`border gap-1.5 ${v2Status === "finalizado"
+            ? "bg-emerald-500/10 text-emerald-600 border-emerald-500/20"
+            : "bg-sky-500/10 text-sky-600 border-sky-500/20"}`}>
+            {v2Status === "finalizado" ? <CheckCircle2 className="h-3 w-3" /> : <Clock4 className="h-3 w-3" />}
+            {v2Status === "finalizado" ? "Finalizado" : "Rascunho"}
+          </Badge>
+        )}
+        {isFinalized && v2.finalized_at && (
+          <span className="text-xs text-muted-foreground">
+            por {v2.finalized_by_name} em {new Date(v2.finalized_at).toLocaleDateString("pt-BR")}
+          </span>
+        )}
+      </div>
+
+      {/* V1 summary (read-only for Compras) */}
+      <Card className="border-green-200/50 dark:border-green-900/50">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm flex items-center gap-2 text-muted-foreground">
+            <Beaker className="h-3.5 w-3.5 text-green-600" />
+            Custo P&D (v1 — recebido e bloqueado)
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="rounded-lg border p-3 text-center">
+              <div className="text-xs text-muted-foreground mb-1">Ingredientes Auto</div>
+              <div className="font-bold text-sm">R$ {(v1.ingredient_cost_auto || 0).toFixed(4)}</div>
+            </div>
+            {(v1.ingredient_cost_manual || 0) > 0 && (
+              <div className="rounded-lg border p-3 text-center">
+                <div className="text-xs text-muted-foreground mb-1">Ajuste Manual</div>
+                <div className="font-bold text-sm">R$ {(v1.ingredient_cost_manual || 0).toFixed(4)}</div>
+              </div>
+            )}
+            <div className="rounded-lg border bg-green-50 dark:bg-green-950 p-3 text-center col-span-2">
+              <div className="text-xs text-muted-foreground mb-1">Total v1 (ingredientes)</div>
+              <div className="font-bold text-lg text-green-700">R$ {(v1.total || 0).toFixed(4)}</div>
+            </div>
+          </div>
+          {v1.notes && (
+            <p className="mt-3 text-xs text-muted-foreground italic border-l-2 border-green-300 pl-2">{v1.notes}</p>
+          )}
+          {formulaCostData && (
+            <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2">
+              <div className="rounded-lg border p-2.5 text-center">
+                <div className="text-[10px] text-muted-foreground mb-0.5">Custo Unit. (fórmula)</div>
+                <div className="font-bold text-sm">R$ {formulaCostData.custo_unitario.toFixed(2)}</div>
+                <div className="text-[10px] text-muted-foreground">{formulaCostData.volume} {formulaCostData.volume_unit}</div>
+              </div>
+              {formulaCostData.indice_perdas > 0 && (
+                <div className="rounded-lg border p-2.5 text-center">
+                  <div className="text-[10px] text-muted-foreground mb-0.5">c/ Perdas ({formulaCostData.indice_perdas}%)</div>
+                  <div className="font-bold text-sm text-orange-600">R$ {formulaCostData.custo_com_perdas.toFixed(2)}</div>
+                </div>
+              )}
+              <div className="rounded-lg border p-2.5 text-center">
+                <div className="text-[10px] text-muted-foreground mb-0.5">Cotação US$</div>
+                <div className="font-bold text-sm">{formulaCostData.cotacao_usd.toFixed(2)}</div>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* V2 inputs */}
+      <Card className={isFinalized ? "opacity-75" : ""}>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <ShoppingCart className="h-4 w-4 text-sky-600" />
+            Custos Adicionais (Compras)
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {[
+              { key: "packaging_cost", label: "Embalagem (R$)", icon: Package, color: "text-amber-500" },
+              { key: "labor_cost", label: "Mão de Obra (R$)", icon: DollarSign, color: "text-sky-500" },
+              { key: "overhead_cost", label: "Overhead / Fixos (R$)", icon: Building2, color: "text-violet-500" },
+              { key: "other_cost", label: "Outros (R$)", icon: Layers, color: "text-rose-500" },
+            ].map(({ key, label, icon: Icon, color }) => (
+              <div key={key}>
+                <Label className={`flex items-center gap-1.5 text-xs mb-1 ${color}`}>
+                  <Icon className="h-3.5 w-3.5" /> {label}
+                </Label>
+                <Input type="number" step="0.01" value={form[key]} disabled={isFinalized}
+                  onChange={e => setForm(p => ({ ...p, [key]: e.target.value }))} />
+              </div>
+            ))}
+          </div>
+
+          <div>
+            <Label className="text-xs text-muted-foreground mb-1 block">Observações do Compras</Label>
+            <Input value={form.notes} disabled={isFinalized} onChange={e => setForm(p => ({ ...p, notes: e.target.value }))}
+              placeholder="Fornecedor, cotação, condições de pagamento, etc." />
+          </div>
+
           <Separator />
-          <div className="flex items-center justify-between">
-            <span className="font-semibold">Total Adicional:</span>
-            <span className="text-xl font-bold">R$ {total.toFixed(2)}</span>
+
+          {/* Cost breakdown summary */}
+          <div className="rounded-lg border bg-muted/20 p-4 space-y-2">
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Ingredientes P&D (v1)</span>
+              <span className="font-mono">R$ {(v1.total || 0).toFixed(4)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Embalagem</span>
+              <span className="font-mono">R$ {(parseFloat(form.packaging_cost) || 0).toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Mão de Obra</span>
+              <span className="font-mono">R$ {(parseFloat(form.labor_cost) || 0).toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Overhead / Fixos</span>
+              <span className="font-mono">R$ {(parseFloat(form.overhead_cost) || 0).toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Outros</span>
+              <span className="font-mono">R$ {(parseFloat(form.other_cost) || 0).toFixed(2)}</span>
+            </div>
+            <Separator />
+            <div className="flex justify-between font-bold text-base">
+              <span>Total Final</span>
+              <span className="text-emerald-700">R$ {(isFinalized ? totalFinal : previewTotal).toFixed(2)}</span>
+            </div>
           </div>
-          <Button onClick={saveCosts} disabled={saving || !canEdit} className="w-full gap-1.5">
-            <Save className="h-4 w-4" />
-            {saving ? "Salvando..." : "Salvar Custos"}
-          </Button>
+
+          {!isFinalized && (
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={saveV2} disabled={saving} className="flex-1 gap-1.5">
+                <Save className="h-4 w-4" />
+                {saving ? "Salvando..." : "Salvar Rascunho"}
+              </Button>
+              <Button onClick={finalizeV2} disabled={finalizing || !v2Status} className="flex-1 gap-1.5 bg-emerald-600 hover:bg-emerald-700">
+                <CheckCircle2 className="h-4 w-4" />
+                {finalizing ? "Finalizando..." : "Finalizar Custo"}
+              </Button>
+            </div>
+          )}
+
+          {!v2Status && (
+            <p className="text-xs text-center text-muted-foreground">Salve um rascunho antes de finalizar.</p>
+          )}
+
+          {isFinalized && (
+            <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 dark:bg-emerald-950 dark:border-emerald-900 p-3 text-sm text-emerald-700 dark:text-emerald-300">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              Custo finalizado e comunicado ao P&D. Custo total: <strong>R$ {totalFinal.toFixed(2)}</strong>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

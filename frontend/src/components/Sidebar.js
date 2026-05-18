@@ -4,7 +4,7 @@ import { useTheme } from "@/App";
 import {
     LayoutDashboard, Kanban, Users, LogOut, Moon, Sun, FlaskConical, Building2,
     Package, ChevronDown, ChevronRight, ShieldCheck, BarChart3, Warehouse, ClipboardList,
-    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart
+    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -50,6 +50,14 @@ const NAV_MODULES = [
         ],
     },
     {
+        key: "kickoffs",
+        type: "link",
+        path: "/kickoffs",
+        label: "Kickoffs",
+        icon: ClipboardList,
+        roles: ["admin", "vendedor", "sales_ops", "formulador", "qa", "lider_pd", "engenharia_produto", "sucesso_cliente", "gestor"],
+    },
+    {
         key: "pd",
         type: "group",
         label: "P&D",
@@ -80,7 +88,23 @@ const NAV_MODULES = [
         path: "/orders",
         label: "Pedidos",
         icon: ShoppingCart,
-        roles: null, // all roles per user request
+        roles: null,
+    },
+    {
+        key: "compras",
+        type: "link",
+        path: "/compras",
+        label: "Compras",
+        icon: Package,
+        roles: ["admin", "compras", "engenharia_produto", "lider_pd", "qa", "sales_ops"],
+    },
+    {
+        key: "contratos",
+        type: "link",
+        path: "/contratos",
+        label: "Contratos CGI",
+        icon: FileText,
+        roles: ["admin", "sales_ops", "vendedor", "compras", "lider_pd", "qa", "engenharia_produto", "sucesso_cliente"],
     },
     {
         key: "audit",

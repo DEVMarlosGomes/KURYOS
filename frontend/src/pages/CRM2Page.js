@@ -11,7 +11,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { GripVertical, Building2, PackagePlus, Archive, ChevronRight } from "lucide-react";
+import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConical, ExternalLink } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import SampleBatchModal from "@/components/SampleBatchModal";
@@ -96,7 +96,18 @@ function createEmptySample() {
     };
 }
 
+function KickoffBadge({ project }) {
+    if (!project?.kickoff_status) return null;
+    const approved = project.kickoff_status === "aprovado";
+    return (
+        <Badge variant={approved ? "outline" : "secondary"} className="text-[10px]">
+            {approved ? "Kickoff aprovado" : `Kickoff ${project.kickoff_status === "aguardando_aprovacao" ? "em aprovacao" : "pendente"}`}
+        </Badge>
+    );
+}
+
 export default function CRM2Page() {
+    const navigate = useNavigate();
     const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
     const [filters, setFilters] = useState({});
@@ -165,6 +176,23 @@ export default function CRM2Page() {
     useEffect(() => { if (selectedProjectId) loadProjectDetail(selectedProjectId); }, [selectedProjectId, loadProjectDetail]);
 
     const stageLabelMap = useMemo(() => constants?.stage_labels || Object.fromEntries(STAGES.map((stage) => [stage.id, stage.label])), [constants]);
+
+    const pdStatusLabel = {
+        OPEN: "Aberto",
+        IN_PROGRESS: "Em andamento",
+        IN_TESTS: "Em testes",
+        WAITING_APPROVAL: "Aguard. aprovação",
+        APPROVED: "Aprovado",
+        CLOSED: "Fechado",
+    };
+    const pdStatusColor = {
+        OPEN: "bg-slate-100 text-slate-700 border-slate-200",
+        IN_PROGRESS: "bg-blue-50 text-blue-700 border-blue-200",
+        IN_TESTS: "bg-purple-50 text-purple-700 border-purple-200",
+        WAITING_APPROVAL: "bg-amber-50 text-amber-700 border-amber-200",
+        APPROVED: "bg-green-50 text-green-700 border-green-200",
+        CLOSED: "bg-gray-100 text-gray-500 border-gray-200",
+    };
     const projectPositioningOptions = constants?.project_posicionamento || [];
     const projectServiceOptions = constants?.project_tipo_servico || [];
     const projectRestrictionOptions = constants?.project_restricoes_tecnicas || [];
@@ -261,6 +289,14 @@ export default function CRM2Page() {
             motivo_arquivamento: motivoArquivamento || undefined,
         });
         toast.success(`Projeto movido para ${data.to_stage}`);
+        if (data.kickoff_criado?.kickoff_id) {
+            toast.success(`Kickoff ${data.kickoff_criado.numero_kickoff} criado.`, {
+                action: {
+                    label: "Abrir",
+                    onClick: () => navigate(`/kickoff/${data.kickoff_criado.kickoff_id}`),
+                },
+            });
+        }
         if (data.trigger_batch_samples) {
             setBatchProjectId(projectId);
             setBatchSamples([createEmptySample()]);
@@ -456,6 +492,7 @@ export default function CRM2Page() {
                                                                         {formatSlugLabel(project.posicionamento)}
                                                                     </Badge>
                                                                 )}
+                                                                <KickoffBadge project={project} />
                                                                 {project.prazo_desejado_amostra && (
                                                                     <span className="text-[10px] text-muted-foreground ml-auto">
                                                                         {new Date(project.prazo_desejado_amostra).toLocaleDateString("pt-BR")}
@@ -490,9 +527,12 @@ export default function CRM2Page() {
                           render: (p) => p.tipo_servico ? formatSlugLabel(p.tipo_servico) : "—" },
                         { key: "stage", label: "Fase",
                           render: (p) => (
-                              <Badge variant="outline" className="text-[10px]">
-                                  {stageLabelMap[p.stage] || p.stage}
-                              </Badge>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                  <Badge variant="outline" className="text-[10px]">
+                                      {stageLabelMap[p.stage] || p.stage}
+                                  </Badge>
+                                  <KickoffBadge project={p} />
+                              </div>
                           ) },
                         { key: "responsavel_comercial", label: "Responsável",
                           render: (p) => userNameById[p.responsavel_comercial] || "—" },
@@ -519,6 +559,7 @@ export default function CRM2Page() {
                                 <div className="flex flex-wrap items-center gap-2 mt-1">
                                     <Badge variant="outline">{selectedProject.cliente_nome}</Badge>
                                     <Badge>{stageLabelMap[selectedProject.stage] || selectedProject.stage}</Badge>
+                                    <KickoffBadge project={selectedProject} />
                                     {selectedProject.categoria && (
                                         <Badge variant="secondary">{formatSlugLabel(selectedProject.categoria)}</Badge>
                                     )}
@@ -709,14 +750,30 @@ export default function CRM2Page() {
                                             <div className="space-y-2">
                                                 {(sample.variacoes || []).map((variacao) => (
                                                     <div key={variacao.id} className="flex items-start justify-between gap-3 rounded-md bg-muted/40 px-3 py-2">
-                                                        <div>
+                                                        <div className="flex-1 min-w-0">
                                                             <p className="text-sm font-medium">{variacao.codigo}</p>
                                                             <p className="text-xs text-muted-foreground">{variacao.descricao_aplicacao || "Sem descrição"}</p>
                                                             {variacao.feedback_cliente && (
                                                                 <p className="text-xs text-muted-foreground mt-1">Feedback: {variacao.feedback_cliente}</p>
                                                             )}
+                                                            {variacao.pd_status && (
+                                                                <div className="flex items-center gap-1.5 mt-1.5">
+                                                                    <FlaskConical className="h-3 w-3 text-muted-foreground shrink-0" />
+                                                                    <span className={`inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border ${pdStatusColor[variacao.pd_status] || "bg-muted text-muted-foreground"}`}>
+                                                                        P&D: {pdStatusLabel[variacao.pd_status] || variacao.pd_status}
+                                                                    </span>
+                                                                    {variacao.pd_request_id && (
+                                                                        <button
+                                                                            className="text-[10px] text-primary underline underline-offset-2 flex items-center gap-0.5 hover:opacity-70"
+                                                                            onClick={() => navigate(`/pd/requests/${variacao.pd_request_id}`)}
+                                                                        >
+                                                                            ver <ExternalLink className="h-2.5 w-2.5" />
+                                                                        </button>
+                                                                    )}
+                                                                </div>
+                                                            )}
                                                         </div>
-                                                        <div className="text-right">
+                                                        <div className="text-right shrink-0">
                                                             <Badge variant="secondary" className="text-[10px]">{stageLabelMap[variacao.status] || variacao.status}</Badge>
                                                             {(variacao.resultado || sample.resultado) && (
                                                                 <p className="text-[10px] text-muted-foreground mt-1">

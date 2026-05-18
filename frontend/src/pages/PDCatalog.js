@@ -9,7 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Card, CardContent } from "@/components/ui/card";
-import { Plus, Search, Pencil, Trash2, Database, History, Tag, TrendingUp, TrendingDown } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, Database, History, Tag, TrendingUp, TrendingDown, X } from "lucide-react";
 import { toast } from "sonner";
 import PDSubNav from "@/components/PDSubNav";
 
@@ -28,15 +28,19 @@ const CATEGORIAS = [
   "Outro",
 ];
 
+const emptyFornecedor = { nome: "", codigo: "", preco_rs_kg: "", moeda: "BRL" };
+
 const emptyForm = {
   nome: "",
   inci: "",
+  codigo_interno: "",
   fornecedor: "",
   preco_rs_kg: "",
   moeda: "BRL",
   unidade: "kg",
   categoria: "",
   observacoes: "",
+  fornecedores: [],
 };
 
 export default function PDCatalog() {
@@ -79,12 +83,19 @@ export default function PDCatalog() {
     setForm({
       nome: item.nome || "",
       inci: item.inci || "",
+      codigo_interno: item.codigo_interno || "",
       fornecedor: item.fornecedor || "",
       preco_rs_kg: String(item.preco_rs_kg ?? ""),
       moeda: item.moeda || "BRL",
       unidade: item.unidade || "kg",
       categoria: item.categoria || "",
       observacoes: item.observacoes || "",
+      fornecedores: (item.fornecedores || []).map(s => ({
+        nome: s.nome || "",
+        codigo: s.codigo || "",
+        preco_rs_kg: String(s.preco_rs_kg ?? ""),
+        moeda: s.moeda || "BRL",
+      })),
     });
     setShowForm(true);
   };
@@ -96,6 +107,9 @@ export default function PDCatalog() {
       const payload = {
         ...form,
         preco_rs_kg: parseFloat(form.preco_rs_kg) || 0,
+        fornecedores: form.fornecedores
+          .filter(s => s.nome.trim())
+          .map(s => ({ nome: s.nome.trim(), codigo: s.codigo.trim() || null, preco_rs_kg: parseFloat(s.preco_rs_kg) || 0, moeda: s.moeda })),
       };
       if (editingId) {
         await api.put(`/pd/catalog/${editingId}`, payload);
@@ -173,48 +187,65 @@ export default function PDCatalog() {
               <thead>
                 <tr className="bg-muted/50 border-b">
                   <th className="text-left p-3 font-semibold">Ingrediente</th>
-                  <th className="text-left p-3 font-semibold">INCI</th>
-                  <th className="text-left p-3 font-semibold">Fornecedor</th>
+                  <th className="text-left p-3 font-semibold">INCI / Código</th>
+                  <th className="text-left p-3 font-semibold">Fornecedores</th>
                   <th className="text-left p-3 font-semibold">Categoria</th>
-                  <th className="text-right p-3 font-semibold w-32">Preço / kg</th>
                   <th className="text-left p-3 font-semibold w-32">Atualizado</th>
-                  <th className="w-32"></th>
+                  <th className="w-28"></th>
                 </tr>
               </thead>
               <tbody>
                 {loading ? (
-                  <tr><td colSpan={7} className="p-6 text-center text-muted-foreground">Carregando...</td></tr>
+                  <tr><td colSpan={6} className="p-6 text-center text-muted-foreground">Carregando...</td></tr>
                 ) : items.length === 0 ? (
-                  <tr><td colSpan={7} className="p-6 text-center text-muted-foreground">Nenhum ingrediente cadastrado. Clique em "Novo Ingrediente".</td></tr>
-                ) : items.map(item => (
-                  <tr key={item.id} className="border-b hover:bg-muted/20">
-                    <td className="p-3 font-medium">{item.nome}</td>
-                    <td className="p-3 text-xs text-muted-foreground">{item.inci || "—"}</td>
-                    <td className="p-3 text-xs">{item.fornecedor || "—"}</td>
-                    <td className="p-3">{item.categoria && <Badge variant="outline" className="text-xs">{item.categoria}</Badge>}</td>
-                    <td className="p-3 text-right font-mono">
-                      {item.moeda === "USD" ? "US$ " : "R$ "}{(item.preco_rs_kg || 0).toFixed(2)}
-                      <span className="text-[10px] text-muted-foreground ml-1">/ {item.unidade}</span>
-                    </td>
-                    <td className="p-3 text-xs text-muted-foreground">
-                      {item.ultima_atualizacao ? new Date(item.ultima_atualizacao).toLocaleDateString("pt-BR") : "—"}
-                      {item.atualizado_por && <div className="text-[10px]">por {item.atualizado_por}</div>}
-                    </td>
-                    <td className="p-3">
-                      <div className="flex items-center gap-1 justify-end">
-                        <Button variant="ghost" size="icon" className="h-7 w-7" title="Histórico de preço" onClick={() => openHistory(item)}>
-                          <History className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(item)}>
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-red-500" onClick={() => remove(item.id)}>
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                  <tr><td colSpan={6} className="p-6 text-center text-muted-foreground">Nenhum ingrediente cadastrado. Clique em "Novo Ingrediente".</td></tr>
+                ) : items.map(item => {
+                  const fns = (item.fornecedores || []).slice().sort((a, b) => (a.preco_rs_kg || 0) - (b.preco_rs_kg || 0));
+                  const rankColor = (i) => i === 0 ? "text-green-700 bg-green-50" : i === 1 ? "text-yellow-700 bg-yellow-50" : i === 2 ? "text-orange-600 bg-orange-50" : "text-red-600 bg-red-50";
+                  return (
+                    <tr key={item.id} className="border-b hover:bg-muted/20">
+                      <td className="p-3">
+                        <div className="font-medium">{item.nome}</div>
+                        {item.codigo_interno && <div className="text-[10px] text-muted-foreground">{item.codigo_interno}</div>}
+                      </td>
+                      <td className="p-3 text-xs text-muted-foreground">
+                        {item.inci || "—"}
+                      </td>
+                      <td className="p-3">
+                        {fns.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {fns.map((s, i) => (
+                              <span key={i} className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${rankColor(i)}`}>
+                                {s.nome}
+                                <span className="font-mono opacity-80">{s.moeda === "USD" ? "US$" : "R$"}{(s.preco_rs_kg || 0).toFixed(2)}</span>
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">{item.fornecedor || "—"}</span>
+                        )}
+                      </td>
+                      <td className="p-3">{item.categoria && <Badge variant="outline" className="text-xs">{item.categoria}</Badge>}</td>
+                      <td className="p-3 text-xs text-muted-foreground">
+                        {item.ultima_atualizacao ? new Date(item.ultima_atualizacao).toLocaleDateString("pt-BR") : "—"}
+                        {item.atualizado_por && <div className="text-[10px]">por {item.atualizado_por}</div>}
+                      </td>
+                      <td className="p-3">
+                        <div className="flex items-center gap-1 justify-end">
+                          <Button variant="ghost" size="icon" className="h-7 w-7" title="Histórico de preço" onClick={() => openHistory(item)}>
+                            <History className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(item)}>
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-red-500" onClick={() => remove(item.id)}>
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -241,8 +272,8 @@ export default function PDCatalog() {
               <Input value={form.inci} onChange={(e) => setForm(p => ({ ...p, inci: e.target.value }))} placeholder="Ex: Cocos Nucifera Oil" />
             </div>
             <div>
-              <Label>Fornecedor</Label>
-              <Input value={form.fornecedor} onChange={(e) => setForm(p => ({ ...p, fornecedor: e.target.value }))} placeholder="Ex: Croda, Basf..." />
+              <Label>Código Interno</Label>
+              <Input value={form.codigo_interno} onChange={(e) => setForm(p => ({ ...p, codigo_interno: e.target.value }))} placeholder="Ex: MP-042" />
             </div>
             <div>
               <Label>Categoria</Label>
@@ -264,23 +295,55 @@ export default function PDCatalog() {
                 </SelectContent>
               </Select>
             </div>
-            <div>
-              <Label>Preço por {form.unidade}</Label>
-              <Input type="number" step="0.01" value={form.preco_rs_kg} onChange={(e) => setForm(p => ({ ...p, preco_rs_kg: e.target.value }))} placeholder="0.00" />
-            </div>
-            <div>
-              <Label>Moeda</Label>
-              <Select value={form.moeda} onValueChange={(v) => setForm(p => ({ ...p, moeda: v }))}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="BRL">R$ (BRL)</SelectItem>
-                  <SelectItem value="USD">US$ (USD)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
             <div className="col-span-2">
               <Label>Observações</Label>
               <Textarea value={form.observacoes} onChange={(e) => setForm(p => ({ ...p, observacoes: e.target.value }))} rows={2} placeholder="Lote, validade, condições..." />
+            </div>
+
+            {/* Multi-supplier section */}
+            <div className="col-span-2 border-t pt-3">
+              <div className="flex items-center justify-between mb-2">
+                <Label className="text-sm font-semibold">Fornecedores e Preços</Label>
+                <Button type="button" size="sm" variant="outline" className="h-7 text-xs gap-1"
+                  onClick={() => setForm(p => ({ ...p, fornecedores: [...p.fornecedores, { ...emptyFornecedor }] }))}>
+                  <Plus className="h-3 w-3" /> Adicionar Fornecedor
+                </Button>
+              </div>
+              {form.fornecedores.length === 0 ? (
+                <p className="text-xs text-muted-foreground italic">Nenhum fornecedor cadastrado. Clique em "Adicionar Fornecedor" para incluir opções de compra com preços comparativos.</p>
+              ) : (
+                <div className="space-y-2">
+                  {form.fornecedores.map((sup, idx) => (
+                    <div key={idx} className="grid grid-cols-[1fr_auto_auto_auto_auto] gap-2 items-end bg-muted/30 rounded p-2">
+                      <div>
+                        <Label className="text-[10px] text-muted-foreground">Nome do Fornecedor</Label>
+                        <Input value={sup.nome} onChange={e => setForm(p => ({ ...p, fornecedores: p.fornecedores.map((s, i) => i === idx ? { ...s, nome: e.target.value } : s) }))} placeholder="Ex: Croda Brasil" className="h-7 text-xs" />
+                      </div>
+                      <div className="w-28">
+                        <Label className="text-[10px] text-muted-foreground">Código do Forn.</Label>
+                        <Input value={sup.codigo} onChange={e => setForm(p => ({ ...p, fornecedores: p.fornecedores.map((s, i) => i === idx ? { ...s, codigo: e.target.value } : s) }))} placeholder="Ref. fornecedor" className="h-7 text-xs" />
+                      </div>
+                      <div className="w-24">
+                        <Label className="text-[10px] text-muted-foreground">Preço / {form.unidade}</Label>
+                        <Input type="number" step="0.01" value={sup.preco_rs_kg} onChange={e => setForm(p => ({ ...p, fornecedores: p.fornecedores.map((s, i) => i === idx ? { ...s, preco_rs_kg: e.target.value } : s) }))} placeholder="0.00" className="h-7 text-xs font-mono" />
+                      </div>
+                      <div className="w-20">
+                        <Label className="text-[10px] text-muted-foreground">Moeda</Label>
+                        <Select value={sup.moeda} onValueChange={v => setForm(p => ({ ...p, fornecedores: p.fornecedores.map((s, i) => i === idx ? { ...s, moeda: v } : s) }))}>
+                          <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="BRL">R$</SelectItem>
+                            <SelectItem value="USD">US$</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <button type="button" onClick={() => setForm(p => ({ ...p, fornecedores: p.fornecedores.filter((_, i) => i !== idx) }))} className="h-7 w-7 flex items-center justify-center text-muted-foreground hover:text-red-500 transition-colors mt-4">
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 

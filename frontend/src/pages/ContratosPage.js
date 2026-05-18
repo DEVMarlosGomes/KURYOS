@@ -1,0 +1,326 @@
+import { useState, useEffect, useCallback } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import api from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import { toast } from "sonner";
+import { BACKEND_URL } from "@/lib/backend";
+import {
+  FileText, Plus, Loader2, Download, Search, X, RefreshCw,
+  Building2, CheckCircle2, Calendar, ExternalLink
+} from "lucide-react";
+
+function formatDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("pt-BR");
+}
+
+function formatDateTime(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString("pt-BR");
+}
+
+function GenerateDialog({ open, onClose, onGenerated }) {
+  const [kickoffs, setKickoffs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedKickoff, setSelectedKickoff] = useState("");
+  const [overrides, setOverrides] = useState({
+    inscricao_estadual: "",
+    endereco_completo: "",
+    representante_nome: "",
+    representante_cpf: "",
+    representante_rg: "",
+    representante_cargo: "",
+  });
+  const [observacoes, setObservacoes] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    api.get("/compras/boms").then(({ data }) => {
+      setKickoffs(data.boms || []);
+    }).catch(() => toast.error("Erro ao carregar kickoffs aprovados"))
+    .finally(() => setLoading(false));
+  }, [open]);
+
+  const handleGenerate = async () => {
+    if (!selectedKickoff) { toast.error("Selecione um Kickoff"); return; }
+    setSaving(true);
+    try {
+      const payload = {
+        kickoff_id: selectedKickoff,
+        observacoes,
+        contratante: Object.values(overrides).some(v => v.trim()) ? overrides : undefined,
+      };
+      await api.post("/contratos/gerar", payload);
+      toast.success("Contrato CGI gerado com sucesso");
+      onGenerated();
+      onClose();
+      reset();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao gerar contrato");
+    } finally { setSaving(false); }
+  };
+
+  const reset = () => {
+    setSelectedKickoff(""); setObservacoes("");
+    setOverrides({ inscricao_estadual: "", endereco_completo: "", representante_nome: "", representante_cpf: "", representante_rg: "", representante_cargo: "" });
+  };
+
+  const selectedData = kickoffs.find(k => k.kickoff_id === selectedKickoff);
+
+  return (
+    <Dialog open={open} onOpenChange={o => { if (!o) { reset(); onClose(); } }}>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileText className="h-5 w-5 text-indigo-600" />
+            Gerar Contrato CGI
+          </DialogTitle>
+          <DialogDescription>
+            Selecione um Kickoff aprovado. O contrato será gerado com os dados do cliente e do kickoff.
+          </DialogDescription>
+        </DialogHeader>
+
+        {loading ? (
+          <div className="flex justify-center py-8"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
+        ) : (
+          <div className="space-y-5">
+            <div className="space-y-1">
+              <Label className="text-xs font-medium">Kickoff (aprovado) <span className="text-red-500">*</span></Label>
+              <Select value={selectedKickoff} onValueChange={setSelectedKickoff}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Selecione o Kickoff..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {kickoffs.length === 0 && <SelectItem value="__none" disabled>Nenhum Kickoff aprovado</SelectItem>}
+                  {kickoffs.map(k => (
+                    <SelectItem key={k.kickoff_id} value={k.kickoff_id}>
+                      {k.numero_kickoff} — {k.cliente || k.projeto_vinculado || k.kickoff_id}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {selectedData && (
+                <div className="mt-1 p-2 bg-muted/40 rounded text-xs space-y-0.5">
+                  <p><span className="text-muted-foreground">Cliente:</span> {selectedData.cliente || "—"}</p>
+                  <p><span className="text-muted-foreground">Aprovado em:</span> {formatDate(selectedData.approved_at)}</p>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Dados do Contratante (opcional)</p>
+              <p className="text-xs text-muted-foreground -mt-2">Preencha apenas campos não disponíveis no cadastro do cliente.</p>
+              <div className="grid grid-cols-2 gap-3">
+                {[
+                  { key: "inscricao_estadual", label: "Inscrição Estadual" },
+                  { key: "representante_nome", label: "Representante Legal" },
+                  { key: "representante_cpf", label: "CPF do Representante" },
+                  { key: "representante_rg", label: "RG do Representante" },
+                  { key: "representante_cargo", label: "Cargo" },
+                ].map(({ key, label }) => (
+                  <div key={key} className="space-y-1">
+                    <Label className="text-xs">{label}</Label>
+                    <Input
+                      value={overrides[key]}
+                      onChange={e => setOverrides(o => ({ ...o, [key]: e.target.value }))}
+                      placeholder={label}
+                      className="h-8 text-sm"
+                    />
+                  </div>
+                ))}
+                <div className="col-span-2 space-y-1">
+                  <Label className="text-xs">Endereço Completo</Label>
+                  <Input
+                    value={overrides.endereco_completo}
+                    onChange={e => setOverrides(o => ({ ...o, endereco_completo: e.target.value }))}
+                    placeholder="Rua, nº, CEP, Cidade/UF"
+                    className="h-8 text-sm"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs font-medium">Observações Adicionais</Label>
+              <Textarea
+                value={observacoes}
+                onChange={e => setObservacoes(e.target.value)}
+                rows={3}
+                placeholder="Cláusulas adicionais, condições especiais..."
+              />
+            </div>
+
+            <div className="p-3 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-700 space-y-1">
+              <p className="font-semibold">Fabricante (fixo):</p>
+              <p>KURYOS BEAUTY PACKING INDUSTRIAL LTDA · CNPJ 00.767.554/0001-19</p>
+              <p>ANVISA 355030801-206-000078-1-1 · Foro: Comarca de São Paulo/SP</p>
+            </div>
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => { reset(); onClose(); }}>Cancelar</Button>
+          <Button onClick={handleGenerate} disabled={saving || loading || !selectedKickoff} className="gap-1.5">
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+            Gerar CGI
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ContratoCard({ contrato }) {
+  const [downloading, setDownloading] = useState(false);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const token = localStorage.getItem("token") || sessionStorage.getItem("token");
+      const resp = await fetch(`${BACKEND_URL}/api/contratos/${contrato.id}/pdf`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!resp.ok) throw new Error("Erro ao baixar PDF");
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${contrato.numero_contrato}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error("Erro ao baixar PDF do contrato");
+    } finally { setDownloading(false); }
+  };
+
+  return (
+    <Card className="hover:shadow-md transition-shadow">
+      <CardContent className="p-4">
+        <div className="flex items-start gap-3">
+          <div className="flex items-center justify-center h-10 w-10 rounded-lg bg-indigo-50 text-indigo-600 flex-shrink-0">
+            <FileText className="h-5 w-5" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-semibold">{contrato.numero_contrato}</span>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-green-100 text-green-700 border border-green-200">
+                <CheckCircle2 className="h-3 w-3" />gerado
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground mt-0.5 truncate">
+              Kickoff: {contrato.numero_kickoff} · v{contrato.kickoff_versao}
+            </p>
+            <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
+              <span className="flex items-center gap-1"><Building2 className="h-3 w-3" />{contrato.contratante?.razao_social || "—"}</span>
+              <span className="flex items-center gap-1"><Calendar className="h-3 w-3" />{formatDateTime(contrato.created_at)}</span>
+            </div>
+            {contrato.observacoes && (
+              <p className="text-xs text-muted-foreground mt-1 italic">{contrato.observacoes}</p>
+            )}
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDownload}
+            disabled={downloading}
+            className="gap-1.5 flex-shrink-0"
+          >
+            {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+            PDF
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export default function ContratosPage() {
+  const { user } = useAuth();
+  const [contratos, setContratos] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [generateOpen, setGenerateOpen] = useState(false);
+  const [search, setSearch] = useState("");
+
+  const canGenerate = user && ["admin", "sales_ops", "vendedor", "compras"].includes(user.role);
+
+  const fetchContratos = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get("/contratos");
+      setContratos(data.contratos || []);
+    } catch { toast.error("Erro ao carregar contratos"); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { fetchContratos(); }, [fetchContratos]);
+
+  const filtered = contratos.filter(c =>
+    !search ||
+    (c.numero_contrato || "").toLowerCase().includes(search.toLowerCase()) ||
+    (c.numero_kickoff || "").toLowerCase().includes(search.toLowerCase()) ||
+    (c.contratante?.razao_social || "").toLowerCase().includes(search.toLowerCase())
+  );
+
+  return (
+    <div className="p-6 max-w-5xl mx-auto space-y-6">
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-heading font-semibold flex items-center gap-2">
+            <FileText className="h-6 w-6 text-indigo-600" />
+            Contratos CGI
+          </h1>
+          <p className="text-sm text-muted-foreground mt-0.5">Contratos Gerais de Industrialização vinculados a Kickoffs aprovados</p>
+        </div>
+        {canGenerate && (
+          <Button onClick={() => setGenerateOpen(true)} className="gap-1.5">
+            <Plus className="h-4 w-4" />
+            Gerar CGI
+          </Button>
+        )}
+      </div>
+
+      <div className="flex gap-2 items-center">
+        <div className="relative flex-1 max-w-xs">
+          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+          <Input className="pl-8 h-9 text-sm" placeholder="Buscar por contrato, kickoff, cliente..." value={search} onChange={e => setSearch(e.target.value)} />
+          {search && <button className="absolute right-2.5 top-2.5" onClick={() => setSearch("")}><X className="h-4 w-4 text-muted-foreground" /></button>}
+        </div>
+        <Button variant="ghost" size="sm" onClick={fetchContratos} className="h-9 w-9 p-0">
+          <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+        </Button>
+      </div>
+
+      {loading ? (
+        <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
+      ) : filtered.length === 0 ? (
+        <div className="text-center py-16 border border-dashed rounded-xl bg-muted/10">
+          <FileText className="h-10 w-10 text-muted-foreground/30 mx-auto mb-3" />
+          <p className="text-muted-foreground">
+            {contratos.length === 0 ? "Nenhum contrato gerado ainda." : "Nenhum contrato corresponde ao filtro."}
+          </p>
+          {canGenerate && contratos.length === 0 && (
+            <Button variant="outline" className="mt-4 gap-1.5" onClick={() => setGenerateOpen(true)}>
+              <Plus className="h-4 w-4" />Gerar primeiro CGI
+            </Button>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {filtered.map(c => <ContratoCard key={c.id} contrato={c} />)}
+          <p className="text-xs text-muted-foreground text-right pt-1">{filtered.length} contrato{filtered.length !== 1 ? "s" : ""}</p>
+        </div>
+      )}
+
+      <GenerateDialog open={generateOpen} onClose={() => setGenerateOpen(false)} onGenerated={fetchContratos} />
+    </div>
+  );
+}

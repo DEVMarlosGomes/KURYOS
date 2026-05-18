@@ -1,38 +1,21 @@
-2026-05-05 14:47:30,812 - server - WARNING - Using local development defaults for: MONGO_URL, DB_NAME, JWT_SECRET
-INFO:     Started server process [19708]
+2026-05-09 14:22:55,258 - server - WARNING - Using local development defaults for: MONGO_URL, DB_NAME, JWT_SECRET
+INFO:     Started server process [4156]
 INFO:     Waiting for application startup.
-2026-05-05 14:47:31,470 - server - WARNING - No EMERGENT_LLM_KEY for storage
-2026-05-05 14:47:31,610 - crm_routes - INFO - CRM module initialized
-2026-05-05 14:47:31,611 - estoque_routes - INFO - Estoque module initialized
-2026-05-05 14:47:31,611 - workflow_engine - INFO - Workflow engine initialized
-2026-05-05 14:47:31,612 - workflow_routes - INFO - Workflow routes initialized
-2026-05-05 14:47:32,013 - server - INFO - CRM Kuryos API started
+2026-05-09 14:22:55,418 - server - WARNING - No EMERGENT_LLM_KEY for storage
+2026-05-09 14:22:55,432 - crm_routes - INFO - CRM module initialized
+2026-05-09 14:22:55,433 - estoque_routes - INFO - Estoque module initialized
+2026-05-09 14:22:55,443 - workflow_engine - INFO - Workflow engine initialized
+2026-05-09 14:22:55,444 - workflow_routes - INFO - Workflow routes initialized
+2026-05-09 14:22:57,689 - server - INFO - CRM Kuryos API started
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     ('127.0.0.1', 61018) - "WebSocket /api/ws" [accepted]
+INFO:     ('127.0.0.1', 65375) - "WebSocket /api/ws" [accepted]
 INFO:     connection open
 INFO:     connection closed
-INFO:     ('127.0.0.1', 61026) - "WebSocket /api/ws" [accepted]
+INFO:     ('127.0.0.1', 65383) - "WebSocket /api/ws" [accepted]
 INFO:     connection open
-INFO:     ('127.0.0.1', 61034) - "WebSocket /api/ws" [accepted]
+INFO:     ('127.0.0.1', 65385) - "WebSocket /api/ws" [accepted]
 INFO:     connection open
-INFO:     ('127.0.0.1', 61073) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-INFO:     connection closed
-INFO:     ('127.0.0.1', 61075) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-INFO:     ('127.0.0.1', 61079) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-2026-05-05 14:51:43,371 - crm_routes - INFO - Batch created 1 projects for client bea88601-0a7c-4937-be2c-ba42033aa9ce
+2026-05-12 09:40:09,703 - crm_routes - INFO - Auto-created pd_request 5542d9f4-6829-40b2-ba5d-963f33e31076 for pd_card 0a6b5cfc-8c08-4ab9-b7f9-02bfd263522b (variação 102/A)
 INFO:     connection closed
 INFO:     connection closed
-INFO:     connection closed
-INFO:     connection closed
-INFO:     ('127.0.0.1', 63851) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-INFO:     ('127.0.0.1', 58766) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-INFO:     ('127.0.0.1', 58800) - "WebSocket /api/ws" [accepted]
-INFO:     connection open
-INFO:     ('127.0.0.1', 58802) - "WebSocket /api/ws" [accepted]
-INFO:     connection open

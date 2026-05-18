@@ -2,16 +2,16 @@
 RBAC - Role Based Access Control for Kuryos ERP
 ================================================
 
-Defines the 8 user profiles per Section 10 of PRD and provides
+Defines the user profiles per Section 10 of PRD and provides
 helpers to enforce role restrictions on routes.
 """
 
 from typing import Iterable, Set
 from fastapi import HTTPException
 
-# All canonical roles supported by the system (Section 10 PRD).
+# All canonical roles supported by the system.
 ROLES = {
-    "admin",                # Total access. Gustavo + admins.
+    "admin",                # Total access.
     "vendedor",             # Comercial: pipeline clientes/projetos/amostras (read+write); sem P&D.
     "sales_ops",            # Comercial: total CRM, KPIs, configuracao; sem formulas.
     "formulador",           # P&D: pipeline P&D, banco de formulas, estoque lab, estabilidades.
@@ -19,6 +19,7 @@ ROLES = {
     "lider_pd",             # Lider P&D: total P&D + dashboards de equipe.
     "engenharia_produto",   # Operacional: kickoff, BOM/embalagem, EPA.
     "sucesso_cliente",      # Pos-venda: clientes fechados, recompra/cross-sell.
+    "compras",              # Compras: recebe custos v1 do P&D, define custos finais (v2).
 }
 
 # Legacy role aliases -> canonical roles (for backwards compatibility)
@@ -31,13 +32,14 @@ COMERCIAL_FULL = {"admin", "vendedor", "sales_ops", "sucesso_cliente"}
 COMERCIAL_LEAD = {"admin", "sales_ops", "sucesso_cliente"}
 PD_FULL = {"admin", "lider_pd", "formulador", "qa", "engenharia_produto"}
 PD_WRITE = {"admin", "lider_pd", "formulador"}
-PD_READ = PD_FULL | {"sales_ops"}
+PD_READ = PD_FULL | {"sales_ops", "compras"}   # compras pode visualizar solicitacoes P&D
 QA_APPROVERS = {"admin", "qa", "lider_pd"}
 ENG_PRODUTO = {"admin", "engenharia_produto", "lider_pd"}
 HOMOLOGACAO_WRITE = {"admin", "lider_pd", "qa", "formulador"}
 HOMOLOGACAO_APPROVE = {"admin", "lider_pd", "qa"}
 DOC_REVIEWERS = {"admin", "lider_pd", "qa", "engenharia_produto", "formulador"}
 ADMIN_ONLY = {"admin"}
+COMPRAS_FULL = {"admin", "compras"}             # acesso total ao modulo de custos comerciais
 
 
 def normalize_role(role: str) -> str:
@@ -75,3 +77,9 @@ def can_view_formula_composition(user: dict) -> bool:
 def can_view_live_document_revisions(user: dict) -> bool:
     """Roles allowed to see versions in 'em_revisao' (production line is restricted)."""
     return has_role(user, DOC_REVIEWERS)
+
+
+def can_view_commercial_costs(user: dict) -> bool:
+    """Only compras and admin see the full commercial cost breakdown (v2).
+    P&D roles see only the final total, never the line-item detail."""
+    return has_role(user, COMPRAS_FULL)

@@ -26,7 +26,7 @@ export function AuthProvider({ children }) {
             setUser(data);
             return { success: true };
         } catch (e) {
-            return { success: false, error: formatApiError(e.response?.data?.detail) };
+            return { success: false, error: formatApiError(e.response?.data?.detail ?? e) };
         }
     };
 
@@ -36,7 +36,7 @@ export function AuthProvider({ children }) {
             setUser(data);
             return { success: true };
         } catch (e) {
-            return { success: false, error: formatApiError(e.response?.data?.detail) };
+            return { success: false, error: formatApiError(e.response?.data?.detail ?? e) };
         }
     };
 

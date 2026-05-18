@@ -1,0 +1,57 @@
+(node:19444) [DEP_WEBPACK_DEV_SERVER_ON_AFTER_SETUP_MIDDLEWARE] DeprecationWarning: 'onAfterSetupMiddleware' option is deprecated. Please use the 'setupMiddlewares' option.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:19444) [DEP_WEBPACK_DEV_SERVER_ON_BEFORE_SETUP_MIDDLEWARE] DeprecationWarning: 'onBeforeSetupMiddleware' option is deprecated. Please use the 'setupMiddlewares' option.
+Starting the development server...
+
+(node:19444) [DEP_WEBPACK_COMPILATION_ASSETS] DeprecationWarning: Compilation.assets will be frozen in future, all modifications are deprecated.
+BREAKING CHANGE: No more changes should happen to Compilation.assets after sealing the Compilation.
+	Do changes to assets earlier, e. g. in Compilation.hooks.processAssets.
+	Make sure to select an appropriate stage from Compilation.PROCESS_ASSETS_STAGE_*.
+Compiled with warnings.
+
+[eslint] 
+src\components\Sidebar.js
+  Line 151:8:  React Hook useEffect has a missing dependency: 'filteredModules'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\CRM2Page.js
+  Line 197:11:  The 'projectServiceOptions' logical expression could make the dependencies of useMemo Hook (at line 243) change on every render. To fix this, wrap the initialization of 'projectServiceOptions' in its own useMemo() Hook  react-hooks/exhaustive-deps
+
+src\pages\KickoffPage.js
+  Line 98:6:  React Hook useEffect has a missing dependency: 'loadKickoff'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\KickoffsListPage.js
+  Line 59:6:  React Hook useEffect has a missing dependency: 'loadKickoffs'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\PDDetail.js
+  Line 1623:38:  React Hook useEffect has a missing dependency: 'fetchStudy'. Either include it or remove the dependency array       react-hooks/exhaustive-deps
+  Line 1890:6:   React Hook useEffect has a missing dependency: 'parseElaboracao'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\TasksPage.js
+  Line 153:6:  React Hook useEffect has a missing dependency: 'loadTasks'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+Search for the keywords to learn more about each warning.
+To ignore, add // eslint-disable-next-line to the line before.
+
+[1m[33mWARNING[39m[22m in [1m[eslint] 
+src\components\Sidebar.js
+  Line 151:8:  React Hook useEffect has a missing dependency: 'filteredModules'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\CRM2Page.js
+  Line 197:11:  The 'projectServiceOptions' logical expression could make the dependencies of useMemo Hook (at line 243) change on every render. To fix this, wrap the initialization of 'projectServiceOptions' in its own useMemo() Hook  react-hooks/exhaustive-deps
+
+src\pages\KickoffPage.js
+  Line 98:6:  React Hook useEffect has a missing dependency: 'loadKickoff'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\KickoffsListPage.js
+  Line 59:6:  React Hook useEffect has a missing dependency: 'loadKickoffs'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\PDDetail.js
+  Line 1623:38:  React Hook useEffect has a missing dependency: 'fetchStudy'. Either include it or remove the dependency array       react-hooks/exhaustive-deps
+  Line 1890:6:   React Hook useEffect has a missing dependency: 'parseElaboracao'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+src\pages\TasksPage.js
+  Line 153:6:  React Hook useEffect has a missing dependency: 'loadTasks'. Either include it or remove the dependency array  react-hooks/exhaustive-deps
+
+[39m[22m
+
+webpack compiled with [1m[33m1 warning[39m[22m

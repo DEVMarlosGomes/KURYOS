@@ -41,7 +41,7 @@ def init_workflow(database, new_id_fn, now_iso_fn):
 #   ENTITY TYPES & ROLE MAPPING
 # ======================================================================
 
-ENTITY_TYPES = {"client", "project", "sample", "variacao", "pd_card", "sku", "pd_document", "stability_study"}
+ENTITY_TYPES = {"client", "project", "sample", "variacao", "pd_card", "sku", "pd_document", "stability_study", "kickoff"}
 
 # Default RBAC role responsible for each task category.
 # Falls back to entity owner if no user with the role exists.

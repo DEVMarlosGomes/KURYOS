@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(curl -s http://localhost:5173 -o /dev/null -w \"%{http_code}\")",
+      "Bash(curl -s http://localhost:3000 -o /dev/null -w \"%{http_code}\")",
+      "Bash(netstat -ano)",
+      "Bash(python -m uvicorn server:app --host 127.0.0.1 --port 8000)",
+      "Bash(echo \"Backend started PID=$!\")",
+      "Bash(curl -s http://127.0.0.1:8000/api/pd/metrics -o /dev/null -w \"Backend: %{http_code}\\\\n\")",
+      "PowerShell(Start-Sleep -Seconds 5; try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/pd/metrics\" -UseBasicParsing -TimeoutSec 5; \"Backend status: $\\($r.StatusCode\\)\" } catch { \"Backend not reachable: $_\" })",
+      "PowerShell(Get-Process | Where-Object { $_.Name -eq \"python\" -or $_.Name -eq \"uvicorn\" } | Stop-Process -Force -ErrorAction SilentlyContinue; Write-Host \"Killed old python processes\")",
+      "PowerShell($proc = Start-Process -FilePath \"python\" -ArgumentList \"-m\", \"uvicorn\", \"server:app\", \"--host\", \"127.0.0.1\", \"--port\", \"8000\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\backend\" -RedirectStandardOutput \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\backend_local.out.log\" -RedirectStandardError \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\backend_local.err.log\" -PassThru -WindowStyle Hidden; Write-Host \"Backend PID: $\\($proc.Id\\)\")",
+      "PowerShell(Start-Sleep -Seconds 6; try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/pd/metrics\" -UseBasicParsing -TimeoutSec 5; \"Backend OK: $\\($r.StatusCode\\)\" } catch { \"Backend error: $_\" }; Get-Content \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\backend_local.err.log\" -Tail 10)",
+      "PowerShell($proc = Start-Process -FilePath \"npm\" -ArgumentList \"run\", \"dev\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend\" -RedirectStandardOutput \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.out.log\" -RedirectStandardError \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.err.log\" -PassThru -WindowStyle Hidden; Write-Host \"Frontend PID: $\\($proc.Id\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(list\\(d.get\\('scripts',{}\\).keys\\(\\)\\)\\)\")",
+      "PowerShell($proc = Start-Process -FilePath \"npm\" -ArgumentList \"start\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend\" -RedirectStandardOutput \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.out.log\" -RedirectStandardError \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.err.log\" -PassThru -WindowStyle Hidden; Write-Host \"Frontend PID: $\\($proc.Id\\)\")",
+      "PowerShell($env:BROWSER = \"none\"; $env:PORT = \"3000\"; $proc = Start-Process -FilePath \"cmd\" -ArgumentList \"/c\", \"cd /d c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend && set BROWSER=none && set PORT=3000 && node_modules\\\\.bin\\\\craco.cmd start\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend\" -RedirectStandardOutput \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.out.log\" -RedirectStandardError \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend_dev.err.log\" -PassThru -WindowStyle Hidden; Write-Host \"Frontend PID: $\\($proc.Id\\)\")",
+      "Bash(python backend_test.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python backend_test.py)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; cd \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\"; python test_new_features.py 2>&1)",
+      "PowerShell($body = '{\"email\":\"admin@kuryos.com\",\"password\":\"admin123\"}'; $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/auth/login\" -Method POST -Body $body -ContentType \"application/json\" -UseBasicParsing -TimeoutSec 10; $r.StatusCode; $r.Content | ConvertFrom-Json | Select-Object -Property access_token, user)",
+      "PowerShell($body = '{\"email\":\"admin@kuryos.com\",\"password\":\"admin123\"}'; $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/auth/login\" -Method POST -Body $body -ContentType \"application/json\" -UseBasicParsing -TimeoutSec 10; $data = $r.Content | ConvertFrom-Json; $token = $data.access_token; Write-Host \"Token obtained: $\\($token.Substring\\(0,20\\)\\)...\"; $token | Out-File \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\test_token.txt\" -Encoding utf8)",
+      "PowerShell($body = '{\"email\":\"admin@kuryos.com\",\"password\":\"admin123\"}'; $r = Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/auth/login\" -Method POST -Body $body -ContentType \"application/json\" -UseBasicParsing -TimeoutSec 10; Write-Host \"Status: $\\($r.StatusCode\\)\"; Write-Host \"Content: $\\($r.Content\\)\")",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; cd \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\"; python seed_test_data.py 2>&1)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; cd \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\"; python -c \"items = [\\(74.2\\),\\(5.0\\),\\(5.0\\),\\(3.0\\),\\(2.0\\),\\(1.5\\),\\(0.5\\),\\(1.0\\),\\(0.5\\),\\(0.3\\),\\(0.2\\),\\(0.1\\),\\(0.2\\),\\(0.5\\),\\(1.0\\),\\(2.0\\),\\(0.2\\),\\(0.1\\),\\(1.0\\),\\(0.5\\),\\(1.2\\)]; print\\(f'Total: {sum\\(items\\):.3f}%'\\)\")",
+      "PowerShell(Get-Process | Where-Object { $_.Name -eq \"node\" } | Select-Object Id, Name, CPU | Format-Table)",
+      "PowerShell($proc = Start-Process -FilePath \"cmd\" -ArgumentList \"/c\", \"set BROWSER=none && set PORT=3000 && node_modules\\\\.bin\\\\craco.cmd start > ..\\\\frontend_dev.out.log 2>&1\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend\" -PassThru -WindowStyle Normal; Write-Host \"Frontend PID: $\\($proc.Id\\)\")",
+      "PowerShell($proc = Start-Process -FilePath \"cmd\" -ArgumentList \"/c\", \"set BROWSER=none && set PORT=3000 && node_modules\\\\.bin\\\\craco.cmd start > ..\\\\frontend_dev.out.log 2>&1\" -WorkingDirectory \"c:\\\\Users\\\\MARLOS\\\\Downloads\\\\KURYOS\\\\frontend\" -PassThru -WindowStyle Hidden; Write-Host \"Frontend PID: $\\($proc.Id\\)\")",
+      "PowerShell(Start-Process \"http://localhost:3000\")",
+      "Bash(node --input-type=module --eval \"import\\('./src/pages/PDDetail.js'\\).catch\\(e => { console.error\\(e.message\\); process.exit\\(1\\); }\\)\")"
+    ]
+  }
+}

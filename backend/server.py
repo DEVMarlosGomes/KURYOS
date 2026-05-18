@@ -41,6 +41,9 @@ from pd_routes import pd_router, init_pd, run_stability_scheduler, check_stabili
 from crm_routes import crm_router, init_crm, run_alert_scheduler
 from estoque_routes import estoque_router, init_estoque
 from orders_routes import orders_router, init_orders
+from kickoff_routes import kickoff_router, init_kickoff
+from compras_routes import compras_router, init_compras
+from contratos_routes import contratos_router, init_contratos
 from workflow_engine import init_workflow, run_workflow_notification_scheduler
 from workflow_routes import workflow_router, init_workflow_routes
 from rbac import (
@@ -286,6 +289,7 @@ class CardUpdate(BaseModel):
 
 class CardMove(BaseModel):
     stage_id: str
+    justification: Optional[str] = None
 
 class FieldValueSave(BaseModel):
     field_id: str
@@ -653,15 +657,50 @@ async def move_card(card_id: str, data: CardMove, request: Request):
     old_stage = await db.stages.find_one({"id": card["stage_id"]}, {"_id": 0})
     new_stage = await db.stages.find_one({"id": data.stage_id}, {"_id": 0})
 
+    is_backward = (
+        old_stage and new_stage and
+        new_stage.get("order", 0) < old_stage.get("order", 0)
+    )
+    if is_backward and not (data.justification or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Justificativa obrigatória para mover um lead para fase anterior."
+        )
+
     await db.cards.update_one({"id": card_id}, {"$set": {"stage_id": data.stage_id}})
 
     old_name = old_stage["name"] if old_stage else "?"
     new_name = new_stage["name"] if new_stage else "?"
+    action_label = "Retorno de fase (requer revisão do líder)" if is_backward else "Movido de fase"
+    details = f"{old_name} → {new_name}"
+    if is_backward and data.justification:
+        details += f" | Justificativa: {data.justification.strip()}"
     await db.card_history.insert_one({
-        "id": new_id(), "card_id": card_id, "action": "Movido de fase",
-        "details": f"{old_name} -> {new_name}", "user_id": user["id"],
-        "user_name": user["name"], "created_at": now_iso()
+        "id": new_id(), "card_id": card_id, "action": action_label,
+        "details": details, "user_id": user["id"],
+        "user_name": user["name"], "created_at": now_iso(),
+        "is_backward": is_backward,
     })
+
+    if is_backward:
+        # Create a lider review task
+        lider = await db.users.find_one(
+            {"tenant_id": user["tenant_id"], "role": {"$in": ["admin", "gestor", "sales_ops"]}},
+            {"_id": 0, "id": 1, "name": 1}
+        )
+        task_assignee_id = lider["id"] if lider else user["id"]
+        task_assignee_name = lider["name"] if lider else user["name"]
+        await db.tasks.insert_one({
+            "id": new_id(), "tenant_id": user["tenant_id"],
+            "title": f"Revisar retorno de fase: {card.get('nome_cliente', card_id)}",
+            "description": f"O lead '{card.get('nome_cliente', '')}' foi movido de volta para '{new_name}' (antes: '{old_name}').\nJustificativa: {(data.justification or '').strip()}\nSolicitado por: {user['name']}",
+            "assignee_id": task_assignee_id, "assignee_name": task_assignee_name,
+            "created_by_id": user["id"], "created_by_name": user["name"],
+            "status": "pendente", "priority": "alta",
+            "entity_type": "card", "entity_id": card_id,
+            "created_at": now_iso(), "due_date": None,
+        })
+
 
     updated = await db.cards.find_one({"id": card_id}, {"_id": 0})
     await ws_manager.broadcast(user["tenant_id"], "card_moved", {"card": updated, "from_stage": old_name, "to_stage": new_name})
@@ -1716,7 +1755,7 @@ async def seed_admin():
     creds_md.append("- POST /api/auth/logout")
     creds_md.append("- POST /api/auth/refresh")
     creds_md.append("")
-    with open("/app/memory/test_credentials.md", "w") as f:
+    with open("/app/memory/test_credentials.md", "w", encoding="utf-8") as f:
         f.write("\n".join(creds_md))
 
 # ============ STARTUP ============
@@ -1777,9 +1816,25 @@ async def startup():
 
     # Initialize Orders module
     init_orders(db, get_current_user, new_id, now_iso)
+    init_kickoff(db, get_current_user, new_id, now_iso)
+    init_compras(db, get_current_user, new_id, now_iso)
+    init_contratos(db, get_current_user, new_id, now_iso)
     await db.orders.create_index([("tenant_id", 1), ("status", 1)])
     await db.orders.create_index([("tenant_id", 1), ("pd_request_id", 1)])
     await db.orders.create_index([("tenant_id", 1), ("created_at", -1)])
+    # Kickoff
+    await db.kickoffs.create_index([("tenant_id", 1), ("projeto_id", 1), ("status", 1)])
+    await db.kickoffs.create_index([("tenant_id", 1), ("kickoff_group_id", 1), ("versao_numero", -1)])
+    await db.kickoffs.create_index([("tenant_id", 1), ("numero_kickoff", 1)])
+    # Compras (Ordens de Compra) - linked to Kickoff/BOM
+    await db.ordens_compra.create_index([("tenant_id", 1), ("status", 1)])
+    await db.ordens_compra.create_index([("tenant_id", 1), ("kickoff_id", 1)])
+    await db.ordens_compra.create_index([("tenant_id", 1), ("fornecedor_id", 1)])
+    await db.ordens_compra.create_index([("tenant_id", 1), ("numero_oc", 1)], unique=True, sparse=True)
+    # Contratos CGI
+    await db.contratos.create_index([("tenant_id", 1), ("kickoff_id", 1)])
+    await db.contratos.create_index([("tenant_id", 1), ("client_id", 1)])
+    await db.contratos.create_index([("tenant_id", 1), ("numero_contrato", 1)], unique=True, sparse=True)
 
     # Initialize Workflow Engine + Routes (ERP v3.0)
     init_workflow(db, new_id, now_iso)
@@ -1852,6 +1907,9 @@ app.include_router(crm_router)
 app.include_router(estoque_router)
 app.include_router(orders_router)
 app.include_router(workflow_router)
+app.include_router(kickoff_router)
+app.include_router(compras_router)
+app.include_router(contratos_router)
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
