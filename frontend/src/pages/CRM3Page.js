@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
-import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,10 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter
 } from "@/components/ui/dialog";
-import {
-    Select, SelectContent, SelectItem, SelectTrigger, SelectValue
-} from "@/components/ui/select";
-import { GripVertical, Building2, FlaskConical, AlertTriangle, PackageCheck, ChevronRight, Trash2, Plus, X, Edit2 } from "lucide-react";
+import { Building2, FlaskConical, AlertTriangle, ChevronRight, Trash2, Plus, X, Lock } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import ViewSwitcher from "@/components/ViewSwitcher";
@@ -68,13 +64,10 @@ export default function CRM3Page() {
     const [filters, setFilters] = useState({});
     const [selectedSample, setSelectedSample] = useState(null);
     const [selectedVariacao, setSelectedVariacao] = useState(null);
-    const [showReasonModal, setShowReasonModal] = useState(false);
-    const [pendingMove, setPendingMove] = useState(null);
-    const [reason, setReason] = useState("");
-    const [reasonOrigin, setReasonOrigin] = useState("interna");
-    const [feedbackText, setFeedbackText] = useState("");
-    const [reworkDirections, setReworkDirections] = useState("");
     const [tab, setTab] = useState("briefing");
+
+    // Estado para registrar resultado do cliente (somente quando variação está em "enviada")
+    const [resultadoForm, setResultadoForm] = useState({});  // variacaoId → { resultado, feedback, loading }
 
     useEffect(() => {
         localStorage.setItem("crm3:view", view);
@@ -130,6 +123,8 @@ export default function CRM3Page() {
                                 id: variacao.id || `${sample.id}-var`,
                                 codigo: variacao.codigo || '',
                                 status: variacao.status || stage.id,
+                                status_pd_label: variacao.status_pd_label || null,
+                                status_pd_raw: variacao.status_pd_raw || null,
                                 sample_id: sample.id,
                                 sample_numero: sample.numero_amostra || '',
                                 nome_produto: sample.nome_produto || sample.nome_amostra || '',
@@ -162,96 +157,27 @@ export default function CRM3Page() {
         return acc;
     }, {});
 
-    const handleDragEnd = async (result) => {
-        if (!result.destination) return;
-        const { draggableId, source, destination } = result;
-        if (source.droppableId === destination.droppableId) return;
+    const handleResultadoCliente = async (sampleId, variacaoId) => {
+        const form = resultadoForm[variacaoId] || {};
+        if (!form.resultado) return toast.error("Selecione o resultado do cliente");
+        if (form.resultado === "retrabalho" && !(form.feedback || "").trim())
+            return toast.error("Informe o feedback do cliente para o retrabalho");
 
-        const newStage = destination.droppableId;
-
-        // draggableId formato: sampleId:variacaoId ou sampleId (antigo)
-        const [sampleId, variacaoId] = draggableId.split(':');
-
-        // Require reason for retrabalho and reprovada
-        if (newStage === "retrabalho" || newStage === "reprovada") {
-            setPendingMove({ sampleId, variacaoId, stage: newStage });
-            setReason("");
-            setReasonOrigin("interna");
-            setFeedbackText("");
-            setReworkDirections("");
-            setShowReasonModal(true);
-            return;
-        }
-
+        setResultadoForm(prev => ({ ...prev, [variacaoId]: { ...prev[variacaoId], loading: true } }));
         try {
-            let data;
-            if (variacaoId) {
-                // Novo modelo com variações
-                const response = await api.put(`/crm/samples/${sampleId}/variacoes/${variacaoId}/move`, { status: newStage });
-                data = response.data;
-                toast.success(`Variação movida para ${data.to_status}`);
-            } else {
-                // Modelo antigo (compatibilidade)
-                const response = await api.put(`/crm/samples/${sampleId}/move`, { stage: newStage });
-                data = response.data;
-                toast.success(`Amostra movida para ${data.to_stage}`);
-            }
-
-            if (data.sku_created) {
-                toast.success(`SKU ${data.sku_created.codigo_interno} criado automaticamente!`, {
-                    duration: 5000,
-                    description: `Produto: ${data.sku_created.nome_produto}`,
-                });
-            }
-
+            await api.post(`/crm/samples/${sampleId}/variacoes/${variacaoId}/resultado-cliente`, {
+                resultado: form.resultado,
+                feedback_cliente: form.feedback || "",
+            });
+            toast.success("Resultado do cliente registrado!");
+            setResultadoForm(prev => { const n = { ...prev }; delete n[variacaoId]; return n; });
             loadSamples();
+            const { data } = await api.get(`/crm/samples/${sampleId}`);
+            setSelectedSample(data);
         } catch (e) {
             toast.error(formatApiError(e));
-        }
-    };
-
-    const confirmReason = async () => {
-        if (!pendingMove || !reason.trim()) return;
-        try {
-            let data;
-            if (pendingMove.stage === "retrabalho") {
-                const response = await api.post(`/crm/samples/${pendingMove.sampleId}/rework`, {
-                    motivo: reason,
-                    origem: reasonOrigin,
-                    variacao_id: pendingMove.variacaoId || undefined,
-                    feedback_cliente: feedbackText || reason,
-                    direcoes_retrabalho: reworkDirections,
-                });
-                data = response.data;
-                toast.success(`Retrabalho criado como amostra #${data.novo_numero}`);
-            } else if (pendingMove.variacaoId) {
-                // Novo modelo com variações
-                const response = await api.put(`/crm/samples/${pendingMove.sampleId}/variacoes/${pendingMove.variacaoId}/move`, {
-                    status: pendingMove.stage,
-                    motivo_retrabalho: reason,
-                    origem_retrabalho: reasonOrigin,
-                });
-                data = response.data;
-                toast.success(`Variação movida para ${data.to_status}`);
-            } else {
-                // Modelo antigo
-                const response = await api.put(`/crm/samples/${pendingMove.sampleId}/move`, {
-                    stage: pendingMove.stage,
-                    motivo_retrabalho: reason,
-                    origem_retrabalho: reasonOrigin,
-                    feedback_cliente: feedbackText,
-                    direcoes_retrabalho: reworkDirections,
-                });
-                data = response.data;
-                toast.success(`Amostra movida para ${data.to_stage}`);
-            }
-            setShowReasonModal(false);
-            setPendingMove(null);
-            setFeedbackText("");
-            setReworkDirections("");
-            loadSamples();
-        } catch (e) {
-            toast.error(formatApiError(e));
+        } finally {
+            setResultadoForm(prev => ({ ...prev, [variacaoId]: { ...prev[variacaoId], loading: false } }));
         }
     };
 
@@ -416,85 +342,76 @@ export default function CRM3Page() {
                         />
 
                         {view === "kanban" ? (
-            <DragDropContext onDragEnd={handleDragEnd}>
                 <div className="kanban-board" data-testid="crm3-kanban">
                     {STAGES.map((stage) => (
-                        <Droppable droppableId={stage.id} key={stage.id}>
-                            {(provided, snapshot) => (
-                                <div
-                                    ref={provided.innerRef}
-                                    {...provided.droppableProps}
-                                    className={`kanban-column rounded-lg ${snapshot.isDraggingOver ? "bg-accent/50" : "bg-muted/30"}`}
-                                    data-testid={`crm3-stage-${stage.id}`}
-                                >
-                                    <div className="p-3 border-b border-border">
-                                        <div className="flex items-center gap-2">
-                                            <div className={`w-2 h-2 rounded-full ${stage.color}`} />
-                                            <h3 className="font-heading font-medium text-sm truncate">{stage.label}</h3>
-                                            <span className="text-xs text-muted-foreground mono-num ml-auto">
-                                                {(filteredByStage[stage.id] || []).length}
-                                            </span>
-                                        </div>
-                                    </div>
-                                    <div className="p-2 space-y-2 min-h-[200px]">
-                                        {(filteredByStage[stage.id] || []).map((variacao, index) => {
-                                            const draggableId = variacao.sample_id + (variacao.id ? `:${variacao.id}` : '');
-                                            return (
-                                            <Draggable draggableId={draggableId} index={index} key={draggableId}>
-                                                {(provided, snapshot) => (
-                                                    <div
-                                                        ref={provided.innerRef}
-                                                        {...provided.draggableProps}
-                                                        className={`bg-card border border-border rounded-md p-3 cursor-pointer transition-transform duration-150 ${
-                                                            snapshot.isDragging ? "kanban-card-dragging" : "hover:-translate-y-0.5 hover:shadow-sm"
-                                                        }`}
-                                                        onClick={() => { 
-                                                            setSelectedSample(variacao.sample_completa); 
-                                                            setSelectedVariacao(variacao);
-                                                            setTab("briefing"); 
-                                                        }}
-                                                    >
-                                                        <div className="flex items-start justify-between gap-2">
-                                                            <div className="flex-1 min-w-0">
-                                                                <div className="flex items-center gap-2 mb-1">
-                                                                    <span className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-bold mono-num">
-                                                                        {String(variacao.codigo || variacao.sample_numero || '?')}
-                                                                    </span>
-                                                                </div>
-                                                                <p className="font-body font-medium text-sm truncate">
-                                                                    {String(variacao.nome_produto || '')}
-                                                                </p>
-                                                                {variacao.descricao_aplicacao && (
-                                                                    <p className="text-xs text-muted-foreground mt-1 truncate">
-                                                                        {String(variacao.descricao_aplicacao)}
-                                                                    </p>
-                                                                )}
-                                                                <p className="text-xs text-muted-foreground flex items-center gap-1 mt-1">
-                                                                    <FlaskConical className="h-3 w-3" />
-                                                                    {String(variacao.projeto_nome || '')}
-                                                                </p>
-                                                                <p className="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
-                                                                    <Building2 className="h-3 w-3" />
-                                                                    {String(variacao.cliente_nome || '')}
-                                                                </p>
-                                                            </div>
-                                                            <div {...provided.dragHandleProps} className="shrink-0">
-                                                                <GripVertical className="h-4 w-4 text-muted-foreground/50" />
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                )}
-                                            </Draggable>
-                                            );
-                                        })}
-                                        {provided.placeholder}
-                                    </div>
+                        <div
+                            key={stage.id}
+                            className="kanban-column rounded-lg bg-muted/30"
+                            data-testid={`crm3-stage-${stage.id}`}
+                        >
+                            <div className="p-3 border-b border-border">
+                                <div className="flex items-center gap-2">
+                                    <div className={`w-2 h-2 rounded-full ${stage.color}`} />
+                                    <h3 className="font-heading font-medium text-sm truncate">{stage.label}</h3>
+                                    <span className="text-xs text-muted-foreground mono-num ml-auto">
+                                        {(filteredByStage[stage.id] || []).length}
+                                    </span>
                                 </div>
-                            )}
-                        </Droppable>
+                            </div>
+                            <div className="p-2 space-y-2 min-h-[200px]">
+                                {(filteredByStage[stage.id] || []).map((variacao) => {
+                                    const statusLabel = variacao.status_pd_label || STAGE_LABELS[variacao.status] || variacao.status;
+                                    return (
+                                        <div
+                                            key={variacao.id || variacao.sample_id}
+                                            className="bg-card border border-border rounded-md p-3 cursor-pointer hover:-translate-y-0.5 hover:shadow-sm transition-transform duration-150"
+                                            onClick={() => {
+                                                setSelectedSample(variacao.sample_completa);
+                                                setSelectedVariacao(variacao);
+                                                setTab("briefing");
+                                            }}
+                                            data-testid={`crm3-card-${variacao.id}`}
+                                        >
+                                            <div className="flex items-start justify-between gap-2">
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-center gap-2 mb-1">
+                                                        <span className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-bold mono-num">
+                                                            {String(variacao.codigo || variacao.sample_numero || '?')}
+                                                        </span>
+                                                    </div>
+                                                    <p className="font-body font-medium text-sm truncate">
+                                                        {String(variacao.nome_produto || '')}
+                                                    </p>
+                                                    {variacao.descricao_aplicacao && (
+                                                        <p className="text-xs text-muted-foreground mt-1 truncate">
+                                                            {String(variacao.descricao_aplicacao)}
+                                                        </p>
+                                                    )}
+                                                    <p className="text-xs text-muted-foreground flex items-center gap-1 mt-1">
+                                                        <FlaskConical className="h-3 w-3" />
+                                                        {String(variacao.projeto_nome || '')}
+                                                    </p>
+                                                    <p className="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
+                                                        <Building2 className="h-3 w-3" />
+                                                        {String(variacao.cliente_nome || '')}
+                                                    </p>
+                                                    {/* Badge de status rico do P&D */}
+                                                    <div className="flex items-center gap-1 mt-1.5"
+                                                         data-testid={`variacao-status-badge-${variacao.id}`}>
+                                                        <span className="text-[10px] text-muted-foreground italic truncate max-w-[140px]">
+                                                            {statusLabel}
+                                                        </span>
+                                                        <Lock className="h-2.5 w-2.5 text-muted-foreground/60 shrink-0" title="Status controlado pelo P&D" />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
                     ))}
                 </div>
-            </DragDropContext>
                         ) : (
                             <ListView
                                 items={filteredVariacoes}
@@ -643,14 +560,25 @@ export default function CRM3Page() {
                                                 <Plus className="h-4 w-4 mr-1" /> Adicionar Variação
                                             </Button>
                                         </div>
-                                        {(selectedSample?.variacoes || []).map((v) => (
+                                        {(selectedSample?.variacoes || []).map((v) => {
+                                            const vForm = resultadoForm[v.id] || {};
+                                            const statusLabel = v.status_pd_label || STAGE_LABELS[v.status] || v.status;
+                                            return (
                                             <div key={v.id} className="border border-border rounded-lg p-3 space-y-2 bg-card">
                                                 <div className="flex items-center justify-between">
-                                                    <div className="flex items-center gap-2">
+                                                    <div className="flex items-center gap-2 flex-wrap">
                                                         <span className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs font-bold mono-num">
                                                             {v.codigo}
                                                         </span>
-                                                        <Badge variant="outline" className="text-[10px]">{STAGE_LABELS[v.status] || v.status}</Badge>
+                                                        {/* Status badge read-only — controlado pelo P&D */}
+                                                        <span
+                                                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border border-border bg-muted/50 text-muted-foreground"
+                                                            data-testid={`variacao-status-badge-${v.id}`}
+                                                            title="Status controlado pelo setor P&D"
+                                                        >
+                                                            {statusLabel}
+                                                            <Lock className="h-2.5 w-2.5 shrink-0" />
+                                                        </span>
                                                         {v.sku_id && <Badge className="text-[10px] bg-emerald-500">SKU</Badge>}
                                                     </div>
                                                     <Button
@@ -726,8 +654,68 @@ export default function CRM3Page() {
                                                         />
                                                     </div>
                                                 </div>
+                                                {/* Registrar resultado do cliente — somente quando variação está em "enviada" */}
+                                                {v.status === "enviada" && (
+                                                    <div
+                                                        className="mt-3 p-3 border border-purple-200 rounded-lg bg-purple-50 dark:bg-purple-950/20"
+                                                        data-testid="resultado-cliente-section"
+                                                    >
+                                                        <p className="text-xs font-semibold text-purple-800 dark:text-purple-300 mb-2">
+                                                            Registrar resultado do cliente
+                                                        </p>
+                                                        <div className="flex flex-col gap-1.5 mb-2">
+                                                            {["aprovada", "reprovada", "retrabalho"].map(opt => (
+                                                                <label
+                                                                    key={opt}
+                                                                    className={`flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer border text-xs font-medium capitalize transition-colors ${
+                                                                        vForm.resultado === opt
+                                                                            ? "border-purple-500 bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200"
+                                                                            : "border-border bg-card hover:border-purple-300"
+                                                                    }`}
+                                                                    data-testid={`resultado-option-${opt}`}
+                                                                >
+                                                                    <input
+                                                                        type="radio"
+                                                                        name={`resultado-${v.id}`}
+                                                                        value={opt}
+                                                                        checked={vForm.resultado === opt}
+                                                                        onChange={() => setResultadoForm(prev => ({
+                                                                            ...prev,
+                                                                            [v.id]: { ...prev[v.id], resultado: opt }
+                                                                        }))}
+                                                                        className="accent-purple-600"
+                                                                    />
+                                                                    {opt}
+                                                                </label>
+                                                            ))}
+                                                        </div>
+                                                        {(vForm.resultado === "retrabalho" || vForm.resultado === "reprovada") && (
+                                                            <Textarea
+                                                                className="text-xs mb-2"
+                                                                rows={2}
+                                                                placeholder="Feedback do cliente (obrigatório para retrabalho)..."
+                                                                value={vForm.feedback || ""}
+                                                                onChange={(e) => setResultadoForm(prev => ({
+                                                                    ...prev,
+                                                                    [v.id]: { ...prev[v.id], feedback: e.target.value }
+                                                                }))}
+                                                                data-testid="feedback-cliente-input"
+                                                            />
+                                                        )}
+                                                        <Button
+                                                            size="sm"
+                                                            className="w-full bg-purple-600 hover:bg-purple-700 text-white text-xs"
+                                                            onClick={() => handleResultadoCliente(selectedSample.id, v.id)}
+                                                            disabled={!vForm.resultado || vForm.loading}
+                                                            data-testid="btn-confirmar-resultado-cliente"
+                                                        >
+                                                            {vForm.loading ? "Registrando..." : "Confirmar Resultado"}
+                                                        </Button>
+                                                    </div>
+                                                )}
                                             </div>
-                                        ))}
+                                        );
+                                        })}
                                         {(!selectedSample?.variacoes || selectedSample.variacoes.length === 0) && (
                                             <p className="text-sm text-muted-foreground italic">Nenhuma variação (modelo antigo).</p>
                                         )}
@@ -813,58 +801,6 @@ export default function CRM3Page() {
                     )}
                 </SheetContent>
             </Sheet>
-
-            {/* Reason Modal (Retrabalho / Reprovada) */}
-            <Dialog open={showReasonModal} onOpenChange={(v) => { if (!v) { setShowReasonModal(false); setPendingMove(null); setFeedbackText(""); setReworkDirections(""); } }}>
-                <DialogContent className="max-w-md">
-                    <DialogHeader>
-                        <DialogTitle className="font-heading flex items-center gap-2">
-                            <AlertTriangle className={`h-5 w-5 ${pendingMove?.stage === "reprovada" ? "text-red-500" : "text-amber-500"}`} />
-                            {pendingMove?.stage === "reprovada" ? "Reprovar Amostra" : "Retrabalho"}
-                        </DialogTitle>
-                    </DialogHeader>
-                    <div className="space-y-3">
-                        <div>
-                            <Label>Motivo *</Label>
-                            <Textarea value={reason} onChange={(e) => setReason(e.target.value)}
-                                placeholder="Descreva o motivo..." rows={3} />
-                        </div>
-                        {pendingMove?.stage === "retrabalho" && (
-                            <div>
-                                <Label>Origem</Label>
-                                <Select value={reasonOrigin} onValueChange={setReasonOrigin}>
-                                    <SelectTrigger><SelectValue /></SelectTrigger>
-                                    <SelectContent>
-                                        <SelectItem value="interna">Interna (P&D)</SelectItem>
-                                        <SelectItem value="externa">Externa (Cliente)</SelectItem>
-                                    </SelectContent>
-                                </Select>
-                            </div>
-                        )}
-                        {pendingMove?.stage === "retrabalho" && (
-                            <>
-                                <div>
-                                    <Label>Feedback do Cliente *</Label>
-                                    <Textarea value={feedbackText} onChange={(e) => setFeedbackText(e.target.value)}
-                                        placeholder="O que o cliente aprovou ou rejeitou?" rows={3} />
-                                </div>
-                                <div>
-                                    <Label>DireÃ§Ãµes para Retrabalho *</Label>
-                                    <Textarea value={reworkDirections} onChange={(e) => setReworkDirections(e.target.value)}
-                                        placeholder="Ex: aumentar viscosidade, trocar fragrÃ¢ncia..." rows={3} />
-                                </div>
-                            </>
-                        )}
-                    </div>
-                    <DialogFooter>
-                        <Button variant="outline" onClick={() => { setShowReasonModal(false); setPendingMove(null); setFeedbackText(""); setReworkDirections(""); }}>Cancelar</Button>
-                        <Button variant={pendingMove?.stage === "reprovada" ? "destructive" : "default"}
-                            onClick={confirmReason} disabled={!reason.trim() || (pendingMove?.stage === "retrabalho" && (!feedbackText.trim() || !reworkDirections.trim()))}>
-                            Confirmar
-                        </Button>
-                    </DialogFooter>
-                </DialogContent>
-            </Dialog>
 
             {/* Add Variações Modal */}
             <Dialog open={showAddVariacoes} onOpenChange={setShowAddVariacoes}>

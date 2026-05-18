@@ -2369,12 +2369,8 @@ async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict)
     )
 
     logger.info(f"Created P&D card {card_id} for variação {variacao['codigo']}")
-
-    # Auto-create paired pd_request so clicking the card opens the full PDDetail screen
-    try:
-        await _ensure_pd_request_for_card(card, user)
-    except Exception as exc:  # pragma: no cover - non-fatal
-        logger.warning(f"Failed to auto-create pd_request for card {card_id}: {exc}")
+    # pd_request é criado sob demanda quando o formulador abre o card (GET /pd/cards/{id}).
+    # Não criamos aqui para evitar o log "Auto-created pd_request" em toda variação CRM.
 
 
 @crm_router.get("/samples")
@@ -2807,9 +2803,25 @@ async def update_variacao(sample_id: str, variacao_id: str, data: VariacaoUpdate
 
 @crm_router.put("/samples/{sample_id}/variacoes/{variacao_id}/move")
 async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, request: Request):
-    """Mover uma variação entre status"""
+    """Mover uma variação entre status — bloqueado para perfis comerciais (CRM é read-only)."""
     user = await _get_current_user(request)
-    
+
+    # REGRA DE NEGÓCIO: status da variação é controlado exclusivamente pelo P&D.
+    # Perfis comerciais não podem mover variações; apenas registram resultado do cliente
+    # via POST /samples/{id}/variacoes/{vid}/resultado-cliente.
+    _COMERCIAL_ROLES = {"vendedor", "sales_ops", "sucesso_cliente"}
+    from rbac import normalize_role
+    if normalize_role(user.get("role", "")) in _COMERCIAL_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "sem_permissao",
+                "message": "O status da variação é controlado pelo setor P&D. "
+                           "Para atualizar, o formulador deve mover o card no Pipeline P&D.",
+                "instrucao": "Acesse Pipeline P&D para ver o progresso desta amostra.",
+            },
+        )
+
     sample = await db.crm_samples.find_one(
         {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
@@ -2954,6 +2966,155 @@ async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, re
         "to_status": STAGE_LABELS.get(new_status, new_status),
         "sku_created": sku_created,
         "tasks_generated": new_tasks,
+    }
+
+
+# ======================================================================
+#  VARIAÇÃO — RESULTADO DO CLIENTE (único ponto de escrita comercial pós-envio)
+# ======================================================================
+
+class ResultadoClienteRequest(BaseModel):
+    resultado: str  # "aprovada" | "reprovada" | "retrabalho"
+    feedback_cliente: Optional[str] = None
+    direcoes_retrabalho: Optional[str] = None
+
+
+@crm_router.post("/samples/{sample_id}/variacoes/{variacao_id}/resultado-cliente")
+async def resultado_cliente(
+    sample_id: str, variacao_id: str, data: ResultadoClienteRequest, request: Request
+):
+    """Único ponto onde o Comercial pode registrar algo sobre a variação:
+    o resultado que o cliente deu (aprovada/reprovada/retrabalho).
+    Só permitido quando o status está em 'enviada' (amostra já no cliente).
+    """
+    user = await _get_current_user(request)
+
+    if data.resultado not in ("aprovada", "reprovada", "retrabalho"):
+        raise HTTPException(
+            status_code=422,
+            detail="resultado deve ser: aprovada, reprovada ou retrabalho",
+        )
+    if data.resultado == "retrabalho" and not (data.feedback_cliente or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="feedback_cliente é obrigatório quando resultado='retrabalho'",
+        )
+
+    tenant_id = user["tenant_id"]
+    sample = await db.crm_samples.find_one({"id": sample_id, "tenant_id": tenant_id}, {"_id": 0})
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    variacao = next((v for v in sample.get("variacoes", []) if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+
+    status_atual = variacao.get("status")
+    if status_atual != "enviada":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "status_invalido",
+                "message": (
+                    f"Resultado só pode ser registrado quando status='enviada'. "
+                    f"Status atual: '{status_atual}'"
+                ),
+                "status_atual": status_atual,
+            },
+        )
+
+    now = _now_iso()
+    novo_status_crm = data.resultado  # aprovada | reprovada | retrabalho
+    pd_label = {
+        "aprovada":    "Aprovado pelo Cliente",
+        "reprovada":   "Reprovado pelo Cliente",
+        "retrabalho":  "Retrabalho Solicitado",
+    }[data.resultado]
+
+    set_ops = {
+        "variacoes.$.status": novo_status_crm,
+        "variacoes.$.status_pd_label": pd_label,
+        "variacoes.$.feedback_cliente": data.feedback_cliente or "",
+        "variacoes.$.resultado_cliente_registrado_por": user["id"],
+        "variacoes.$.resultado_cliente_registrado_em": now,
+        "variacoes.$.updated_at": now,
+    }
+    if data.direcoes_retrabalho:
+        set_ops["variacoes.$.direcoes_retrabalho"] = data.direcoes_retrabalho
+    if data.resultado == "aprovada":
+        set_ops["variacoes.$.resultado"] = "aprovada"
+    if data.resultado == "reprovada":
+        set_ops["variacoes.$.resultado"] = "reprovada"
+
+    await db.crm_samples.update_one(
+        {"id": sample_id, "tenant_id": tenant_id, "variacoes.id": variacao_id},
+        {
+            "$set": set_ops,
+            "$push": {
+                "variacoes.$.historico_status": {
+                    "de": "enviada",
+                    "para": novo_status_crm,
+                    "data": now,
+                    "usuario": user["name"],
+                    "usuario_id": user["id"],
+                    "origem": "resultado_cliente",
+                }
+            },
+        },
+    )
+
+    # Notificar pd_card vinculado
+    pd_card = await db.pd_cards.find_one({"amostra_variacao_id": variacao_id, "tenant_id": tenant_id}, {"_id": 0})
+    pd_card_notificado = False
+    if pd_card:
+        novo_status_pd = {
+            "aprovada":   "aprovado_cliente",
+            "reprovada":  "reprovado_cliente",
+            "retrabalho": "retrabalho_solicitado_cliente",
+        }[data.resultado]
+        await db.pd_cards.update_one(
+            {"id": pd_card["id"], "tenant_id": tenant_id},
+            {
+                "$set": {
+                    "status_pd": novo_status_pd,
+                    "feedback_cliente": data.feedback_cliente or "",
+                    "direcoes_retrabalho": data.direcoes_retrabalho or "",
+                    "resultado_cliente": data.resultado,
+                    "updated_at": now,
+                },
+                "$push": {
+                    "historico_movimentacoes": {
+                        "de": pd_card.get("status_pd", ""),
+                        "para": novo_status_pd,
+                        "data": now,
+                        "usuario": user["name"],
+                        "usuario_id": user["id"],
+                        "observacao": f"Resultado do cliente: {pd_label}",
+                    }
+                },
+            },
+        )
+        pd_card_notificado = True
+        logger.info(f"Resultado cliente: variação {variacao_id} → {novo_status_crm} / pd_card {pd_card['id']} → {novo_status_pd}")
+
+    await audit_log(
+        tenant_id=tenant_id,
+        user_id=user["id"],
+        user_name=user.get("name", ""),
+        action="resultado_cliente_registrado",
+        entity_type="variacao",
+        entity_id=variacao_id,
+        before={"status": "enviada"},
+        after={"status": novo_status_crm, "resultado": data.resultado},
+        metadata={"sample_id": sample_id, "pd_card_id": pd_card["id"] if pd_card else None},
+    )
+
+    return {
+        "success": True,
+        "variacao_id": variacao_id,
+        "resultado": data.resultado,
+        "status_atualizado": novo_status_crm,
+        "pd_card_notificado": pd_card_notificado,
     }
 
 
@@ -3368,13 +3529,22 @@ PD_STATUS_LABELS = {
     "retrabalho_interno": "Retrabalho Interno"
 }
 
-# Mapeamento: Status P&D → Status CRM3 Variação
+# Mapeamento: Status P&D → Status CRM3 Variação (simplificado, retrocompatível)
 PD_TO_CRM_STATUS_MAP = {
     "solicitado": "solicitada",
     "em_desenvolvimento": "em_elaboracao",
     "em_testes": None,  # Não muda CRM3, só adiciona ao histórico
     "aguardando_aprovacao": "enviada",
     "retrabalho_interno": "retrabalho"
+}
+
+# Mapeamento rico: Status P&D → (status_CRM_simplificado, label_visível_ao_comercial)
+PD_CARD_STATUS_TO_CRM_DISPLAY = {
+    "solicitado":           ("solicitada",    "Aguardando P&D"),
+    "em_desenvolvimento":   ("em_elaboracao", "Em Desenvolvimento"),
+    "em_testes":            ("em_elaboracao", "Em Testes"),
+    "aguardando_aprovacao": ("enviada",       "Aguardando Aprovação CQ"),
+    "retrabalho_interno":   ("retrabalho",    "Em Retrabalho"),
 }
 
 @crm_router.get("/pd/cards")
@@ -3432,6 +3602,63 @@ async def get_pd_card(card_id: str, request: Request):
                 card["variacao"] = variacao
     
     return card
+
+
+@crm_router.post("/pd/cards/sync-all-to-crm")
+async def sync_all_pd_cards_to_crm(request: Request):
+    """Admin/lider_pd: re-sincroniza todos os pd_cards com suas variações CRM.
+    Usar uma vez para corrigir dados inconsistentes já no banco.
+    """
+    user = await _get_current_user(request)
+    require_roles(user, {"admin", "lider_pd"})
+
+    tenant_id = user["tenant_id"]
+    pd_cards = await db.pd_cards.find(
+        {"tenant_id": tenant_id, "amostra_variacao_id": {"$exists": True}},
+        {"_id": 0},
+    ).to_list(5000)
+
+    synced = 0
+    errors = 0
+    now = _now_iso()
+
+    for card in pd_cards:
+        try:
+            status_pd = card.get("status_pd", "solicitado")
+            crm_status, crm_label = PD_CARD_STATUS_TO_CRM_DISPLAY.get(
+                status_pd,
+                (PD_TO_CRM_STATUS_MAP.get(status_pd), PD_STATUS_LABELS.get(status_pd, status_pd)),
+            )
+            if not crm_status:
+                continue
+            result = await db.crm_samples.update_one(
+                {
+                    "id": card["amostra_id"],
+                    "tenant_id": tenant_id,
+                    "variacoes.id": card["amostra_variacao_id"],
+                },
+                {
+                    "$set": {
+                        "variacoes.$.status": crm_status,
+                        "variacoes.$.status_pd_label": crm_label,
+                        "variacoes.$.status_pd_raw": status_pd,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                    }
+                },
+            )
+            if result.matched_count:
+                synced += 1
+        except Exception as exc:
+            logger.error(f"sync-all error card {card.get('id')}: {exc}")
+            errors += 1
+
+    logger.info(f"sync-all-to-crm: {synced} synced, {errors} errors (tenant={tenant_id})")
+    return {
+        "synced": synced,
+        "errors": errors,
+        "total": len(pd_cards),
+        "message": f"Sincronizados {synced} de {len(pd_cards)} cards",
+    }
 
 
 class PDCardMove(BaseModel):
@@ -3514,18 +3741,24 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
             user,
         )
 
-    # SINCRONIZAÇÃO: Atualizar status da variação no CRM
+    # SINCRONIZAÇÃO: Atualizar status da variação no CRM (sentido único P&D → CRM)
     if card.get("amostra_id") and card.get("amostra_variacao_id"):
-        crm_status = PD_TO_CRM_STATUS_MAP.get(new_status)
-        
+        crm_status, crm_label = PD_CARD_STATUS_TO_CRM_DISPLAY.get(
+            new_status,
+            (PD_TO_CRM_STATUS_MAP.get(new_status), PD_STATUS_LABELS.get(new_status, new_status))
+        )
+
         if crm_status:
-            # Atualiza status e histórico
+            # Atualiza status, label rico e histórico
             await db.crm_samples.update_one(
                 {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
                 {
                     "$set": {
                         "variacoes.$.status": crm_status,
-                        "variacoes.$.updated_at": now
+                        "variacoes.$.status_pd_label": crm_label,
+                        "variacoes.$.status_pd_raw": new_status,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                        "variacoes.$.updated_at": now,
                     },
                     "$push": {
                         "variacoes.$.historico_status": {
@@ -3535,19 +3768,24 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
                             "usuario": user["name"],
                             "usuario_id": user["id"],
                             "sincronizado_pd": True,
-                            "status_pd": new_status
+                            "status_pd": new_status,
+                            "label_pd": crm_label,
                         }
                     }
                 }
             )
-            logger.info(f"Sincronizado P&D→CRM: Card {card_id} ({new_status}) → Variação {card['amostra_variacao_id']} ({crm_status})")
+            logger.info(f"Sincronizado P&D→CRM: Card {card_id} ({new_status}) → Variação {card['amostra_variacao_id']} ({crm_status} / {crm_label})")
         else:
-            # Apenas adiciona ao histórico sem mudar status (ex: em_testes)
+            # Apenas adiciona ao histórico sem mudar status (ex: em_testes sem mapeamento direto)
+            crm_label_obs = PD_CARD_STATUS_TO_CRM_DISPLAY.get(new_status, (None, PD_STATUS_LABELS.get(new_status, new_status)))[1]
             await db.crm_samples.update_one(
                 {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
                 {
                     "$set": {
-                        "variacoes.$.updated_at": now
+                        "variacoes.$.status_pd_label": crm_label_obs,
+                        "variacoes.$.status_pd_raw": new_status,
+                        "variacoes.$.ultima_atualizacao_pd": now,
+                        "variacoes.$.updated_at": now,
                     },
                     "$push": {
                         "variacoes.$.historico_status": {
@@ -3558,12 +3796,12 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
                             "usuario_id": user["id"],
                             "sincronizado_pd": True,
                             "status_pd": new_status,
-                            "observacao": f"P&D movido para: {PD_STATUS_LABELS.get(new_status, new_status)}"
+                            "observacao": f"P&D movido para: {crm_label_obs}",
                         }
                     }
                 }
             )
-            logger.info(f"Histórico P&D→CRM: Card {card_id} ({new_status}) adicionado ao histórico da variação {card['amostra_variacao_id']}")
+            logger.info(f"Histórico P&D→CRM: Card {card_id} ({new_status} / {crm_label_obs}) registrado na variação {card['amostra_variacao_id']}")
     
     updated = await db.pd_cards.find_one({"id": card_id}, {"_id": 0})
 
