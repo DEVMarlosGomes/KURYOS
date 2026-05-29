@@ -144,7 +144,7 @@ async def get_task(task_id: str, request: Request):
 async def create_task(data: TaskCreateInput, request: Request):
     user = await _get_current_user(request)
     if data.task_type not in TASK_TYPES:
-        raise HTTPException(status_code=400, detail=f"task_type invÃ¡lido: {data.task_type}")
+        raise HTTPException(status_code=400, detail=f"task_type inválido: {data.task_type}")
     if data.entity_type not in ENTITY_TYPES:
         raise HTTPException(status_code=400, detail=f"entity_type inválido: {data.entity_type}")
     task = await create_workflow_task(

@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
+import { getCurrentBackendUrl, toWebSocketUrl } from "@/lib/backend";
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,9 +11,10 @@ import { Badge } from "@/components/ui/badge";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { GripVertical, Building2, Calendar, Plus, Sparkles, ExternalLink } from "lucide-react";
+import { GripVertical, Building2, Calendar, Plus, Sparkles, ExternalLink, UserCircle2, X, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { useAuth } from "@/contexts/AuthContext";
 import PDSubNav from "@/components/PDSubNav";
 import ViewSwitcher from "@/components/ViewSwitcher";
 import FilterBar, { applyFilters } from "@/components/FilterBar";
@@ -24,9 +26,18 @@ const STAGES = [
     { id: "em_testes", label: "Em Testes", color: "bg-purple-400" },
     { id: "aguardando_aprovacao", label: "Aguardando Aprovação", color: "bg-yellow-400" },
     { id: "retrabalho_interno", label: "Retrabalho", color: "bg-red-400" },
+    { id: "aprovado", label: "Aprovado", color: "bg-green-500" },
+    { id: "concluido", label: "Concluído", color: "bg-emerald-600" },
 ];
 
+function initials(name) {
+    if (!name) return "?";
+    return name.split(" ").slice(0, 2).map(n => n[0]).join("").toUpperCase();
+}
+
 export default function PDPage() {
+    const { user: authUser } = useAuth();
+    const canAssignExecutor = authUser && ["admin", "lider_pd", "formulador", "engenharia_produto"].includes(authUser.role);
     const [cards, setCards] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
@@ -34,6 +45,11 @@ export default function PDPage() {
     const [filters, setFilters] = useState({});
     const [selectedCard, setSelectedCard] = useState(null);
     const [showResearch, setShowResearch] = useState(false);
+    const [executorDialog, setExecutorDialog] = useState(null); // { cardId, currentName }
+    const [executorSearch, setExecutorSearch] = useState("");
+    const [executorUsers, setExecutorUsers] = useState([]);
+    const [loadingExecutors, setLoadingExecutors] = useState(false);
+    const [assigningExecutor, setAssigningExecutor] = useState(false);
     const [researchForm, setResearchForm] = useState({
         project_name: "",
         objectives: "",
@@ -44,6 +60,7 @@ export default function PDPage() {
         deadline: "",
     });
     const [creatingResearch, setCreatingResearch] = useState(false);
+    const wsRef = useRef(null);
     const navigate = useNavigate();
 
     useEffect(() => {
@@ -66,6 +83,67 @@ export default function PDPage() {
     }, [search]);
 
     useEffect(() => { loadCards(); }, [loadCards]);
+
+    useEffect(() => {
+        const wsBackendUrl = toWebSocketUrl(getCurrentBackendUrl());
+        if (!wsBackendUrl) return undefined;
+
+        let disposed = false;
+        let reconnectTimer = null;
+
+        const connectWs = () => {
+            if (disposed) return;
+            try {
+                const ws = new WebSocket(`${wsBackendUrl}/api/ws`);
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.event !== "pd_card_moved") return;
+
+                        const incomingCard = msg.data?.card;
+                        if (!incomingCard?.id) return;
+
+                        setCards((current) => {
+                            const index = current.findIndex((card) => card.id === incomingCard.id);
+                            if (index === -1) {
+                                return [incomingCard, ...current];
+                            }
+                            const next = [...current];
+                            next[index] = { ...next[index], ...incomingCard };
+                            return next;
+                        });
+                    } catch {}
+                };
+
+                ws.onclose = () => {
+                    if (disposed) return;
+                    reconnectTimer = window.setTimeout(connectWs, 5000);
+                };
+
+                ws.onerror = () => {
+                    ws.close();
+                };
+
+                wsRef.current = ws;
+            } catch {
+                reconnectTimer = window.setTimeout(connectWs, 5000);
+            }
+        };
+
+        connectWs();
+
+        return () => {
+            disposed = true;
+            if (reconnectTimer) {
+                window.clearTimeout(reconnectTimer);
+            }
+            if (wsRef.current) {
+                wsRef.current.close();
+                wsRef.current = null;
+            }
+        };
+    }, []);
 
     const cardsByStage = STAGES.reduce((acc, stage) => {
         acc[stage.id] = cards.filter(c => c.status_pd === stage.id);
@@ -121,6 +199,30 @@ export default function PDPage() {
         } finally {
             setCreatingResearch(false);
         }
+    };
+
+    const openExecutorDialog = async (e, card) => {
+        e.stopPropagation();
+        setExecutorDialog({ cardId: card.id, currentName: card.executor_name });
+        setExecutorSearch("");
+        setExecutorUsers([]);
+        setLoadingExecutors(true);
+        try {
+            const { data } = await api.get("/users", { params: { roles: "admin,lider_pd,formulador,engenharia_produto,qa" } });
+            setExecutorUsers(Array.isArray(data) ? data : []);
+        } catch { setExecutorUsers([]); } finally { setLoadingExecutors(false); }
+    };
+
+    const assignExecutor = async (userId, userName) => {
+        if (!executorDialog) return;
+        setAssigningExecutor(true);
+        try {
+            await api.put(`/pd/pd-cards/${executorDialog.cardId}/executor`, { executor_id: userId, executor_name: userName });
+            toast.success(`Executor atribuído: ${userName}`);
+            setExecutorDialog(null);
+            loadCards();
+        } catch (err) { toast.error(formatApiError(err)); }
+        finally { setAssigningExecutor(false); }
     };
 
     const openCardDetail = async (card) => {
@@ -291,6 +393,27 @@ export default function PDPage() {
                                                                         Responsável: {String(card.responsavel_pd)}
                                                                     </p>
                                                                 )}
+                                                                {/* PD-13: Executor avatar */}
+                                                                <div className="flex items-center justify-between mt-2">
+                                                                    {card.executor_name ? (
+                                                                        <button
+                                                                            onClick={e => canAssignExecutor ? openExecutorDialog(e, card) : e.stopPropagation()}
+                                                                            className="flex items-center gap-1.5 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                                                                        >
+                                                                            <div className="h-5 w-5 rounded-full bg-primary/20 text-primary flex items-center justify-center text-[9px] font-bold">
+                                                                                {initials(card.executor_name)}
+                                                                            </div>
+                                                                            {card.executor_name.split(" ")[0]}
+                                                                        </button>
+                                                                    ) : canAssignExecutor ? (
+                                                                        <button
+                                                                            onClick={e => openExecutorDialog(e, card)}
+                                                                            className="text-[10px] text-muted-foreground/60 hover:text-muted-foreground transition-colors flex items-center gap-1"
+                                                                        >
+                                                                            <UserCircle2 className="h-3.5 w-3.5" /> Atribuir
+                                                                        </button>
+                                                                    ) : <span />}
+                                                                </div>
                                                             </div>
                                                             <div {...provided.dragHandleProps} className="shrink-0">
                                                                 <GripVertical className="h-4 w-4 text-muted-foreground/50" />
@@ -343,6 +466,54 @@ export default function PDPage() {
                     </>
                 );
             })()}
+
+            {/* PD-13: Executor assign dialog */}
+            <Dialog open={!!executorDialog} onOpenChange={(open) => !open && setExecutorDialog(null)}>
+                <DialogContent className="max-w-sm">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            <UserCircle2 className="h-4 w-4" /> Atribuir Executor
+                        </DialogTitle>
+                        <DialogDescription>Selecione quem vai executar este desenvolvimento.</DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-2">
+                        <Input
+                            value={executorSearch}
+                            onChange={e => setExecutorSearch(e.target.value)}
+                            placeholder="Filtrar por nome..."
+                            className="h-8 text-sm"
+                        />
+                        {loadingExecutors ? (
+                            <div className="flex items-center gap-2 text-xs text-muted-foreground py-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Carregando...</div>
+                        ) : (
+                            <div className="border rounded-md divide-y max-h-48 overflow-y-auto">
+                                {(executorUsers.filter(u => !executorSearch || u.name?.toLowerCase().includes(executorSearch.toLowerCase()))).map(u => (
+                                    <button
+                                        key={u.id}
+                                        onClick={() => assignExecutor(u.id, u.name)}
+                                        disabled={assigningExecutor}
+                                        className={`w-full flex items-center gap-2 p-2 text-sm hover:bg-muted/50 transition-colors ${executorDialog?.currentName === u.name ? "bg-primary/5 font-semibold" : ""}`}
+                                    >
+                                        <div className="h-6 w-6 rounded-full bg-primary/20 text-primary flex items-center justify-center text-[10px] font-bold shrink-0">
+                                            {initials(u.name)}
+                                        </div>
+                                        <span className="flex-1 text-left truncate">{u.name}</span>
+                                        <span className="text-[10px] text-muted-foreground">{u.role}</span>
+                                    </button>
+                                ))}
+                                {executorUsers.filter(u => !executorSearch || u.name?.toLowerCase().includes(executorSearch.toLowerCase())).length === 0 && (
+                                    <p className="text-xs text-muted-foreground text-center py-3">Nenhum usuário encontrado</p>
+                                )}
+                            </div>
+                        )}
+                        {executorDialog?.currentName && (
+                            <Button size="sm" variant="outline" className="w-full gap-1 text-xs text-muted-foreground" onClick={() => assignExecutor(null, null)}>
+                                <X className="h-3 w-3" /> Remover executor
+                            </Button>
+                        )}
+                    </div>
+                </DialogContent>
+            </Dialog>
 
             {/* Card Detail Sheet */}
             <Sheet open={!!selectedCard} onOpenChange={(open) => !open && setSelectedCard(null)}>

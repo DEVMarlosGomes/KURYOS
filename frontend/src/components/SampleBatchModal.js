@@ -5,6 +5,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Plus, Trash2 } from "lucide-react";
+import { FieldHint } from "@/components/ui/FieldHint";
 
 function formatSlugLabel(value) {
     if (!value) return "";
@@ -54,7 +55,7 @@ export default function SampleBatchModal({
                                     <div>
                                         <h3 className="text-lg font-semibold">Amostra {sampleIndex + 1}</h3>
                                         <p className="text-xs text-muted-foreground">
-                                            {sample.variacoes?.length || 0} variaÃ§Ã£o(Ãµes)
+                                            {sample.variacoes?.length || 0} variação(ões)
                                         </p>
                                     </div>
                                     {batchSamples.length > 1 && (
@@ -92,29 +93,33 @@ export default function SampleBatchModal({
                                         </Select>
                                     </div>
                                     <div className="space-y-2">
-                                        <Label>ParÃ¢metro de variaÃ§Ã£o</Label>
+                                        <Label><FieldHint hint="Define o critério que diferencia cada variação de amostra: fragrância, cor, concentração, etc.">Parâmetro de variação</FieldHint></Label>
                                         <Select
-                                            value={sample.parametro_variacao || ""}
-                                            onValueChange={(value) => updateSample(sampleIndex, "parametro_variacao", value)}
+                                            value={sample.parametro_variacao || "nenhuma"}
+                                            onValueChange={(value) => updateSample(sampleIndex, "parametro_variacao", value === "nenhuma" ? "" : value)}
                                         >
                                             <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
                                             <SelectContent>
+                                                <SelectItem value="nenhuma">Nenhuma</SelectItem>
                                                 {variationParams.map((option) => (
                                                     <SelectItem key={option} value={option}>{formatSlugLabel(option)}</SelectItem>
                                                 ))}
                                             </SelectContent>
                                         </Select>
                                     </div>
+                                    {sample.parametro_variacao && sample.parametro_variacao !== "" && (
                                     <div className="space-y-2">
-                                        <Label>Quantidade por variaÃ§Ã£o *</Label>
+                                        <Label><FieldHint hint="Quantidade de unidades produzidas para cada variação desta amostra.">Quantidade por variação *</FieldHint></Label>
                                         <Input
                                             type="number"
                                             value={sample.quantidade_por_variacao || ""}
                                             onChange={(event) => updateSample(sampleIndex, "quantidade_por_variacao", event.target.value)}
                                         />
                                     </div>
+                                    )}
+                                    {sample.parametro_variacao && sample.parametro_variacao !== "" && (
                                     <div className="space-y-2">
-                                        <Label>Unidade</Label>
+                                        <Label><FieldHint hint="Unidade de medida da quantidade por variação (g = gramas, mL = mililitros, un = unidades).">Unidade</FieldHint></Label>
                                         <Select
                                             value={sample.unidade_quantidade || "g"}
                                             onValueChange={(value) => updateSample(sampleIndex, "unidade_quantidade", value)}
@@ -127,6 +132,7 @@ export default function SampleBatchModal({
                                             </SelectContent>
                                         </Select>
                                     </div>
+                                    )}
                                     <div className="space-y-2">
                                         <Label>Prazo de entrega ao cliente *</Label>
                                         <Input
@@ -136,9 +142,9 @@ export default function SampleBatchModal({
                                         />
                                     </div>
                                     <div className="space-y-2">
-                                        <Label>ReferÃªncia de fÃ³rmula</Label>
+                                        <Label>Referência de fórmula</Label>
                                         <Input
-                                            placeholder="ObrigatÃ³ria em adaptaÃ§Ã£o"
+                                            placeholder="Obrigatória em adaptação"
                                             value={sample.referencia_formula || ""}
                                             onChange={(event) => updateSample(sampleIndex, "referencia_formula", event.target.value)}
                                         />
@@ -152,7 +158,7 @@ export default function SampleBatchModal({
                                         />
                                     </div>
                                     <div className="space-y-2 md:col-span-2">
-                                        <Label>Briefing especÃ­fico da amostra</Label>
+                                        <Label>Briefing específico da amostra</Label>
                                         <Textarea
                                             rows={3}
                                             value={sample.briefing_especifico || ""}
@@ -164,13 +170,13 @@ export default function SampleBatchModal({
                                 <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 space-y-4">
                                     <div className="flex items-center justify-between">
                                         <div>
-                                            <h4 className="text-sm font-semibold text-emerald-700">VariaÃ§Ãµes</h4>
+                                            <h4 className="text-sm font-semibold text-emerald-700">Variações</h4>
                                             <p className="text-xs text-emerald-700/80">
-                                                CÃ³digos previstos: {generateVariacaoLetters(sample.variacoes?.length || 0).map((letter) => `/${letter}`).join(" ")}
+                                                Códigos previstos: {generateVariacaoLetters(sample.variacoes?.length || 0).map((letter) => `/${letter}`).join(" ")}
                                             </p>
                                         </div>
                                         <Button variant="outline" size="sm" onClick={() => addVariacao(sampleIndex)}>
-                                            <Plus className="h-3.5 w-3.5 mr-1" /> Adicionar variaÃ§Ã£o
+                                            <Plus className="h-3.5 w-3.5 mr-1" /> Adicionar variação
                                         </Button>
                                     </div>
 
@@ -179,7 +185,7 @@ export default function SampleBatchModal({
                                             <div key={variacaoIndex} className="rounded-lg border border-emerald-200 bg-background p-3 space-y-3">
                                                 <div className="flex items-center justify-between">
                                                     <span className="text-xs font-semibold text-emerald-700">
-                                                        VariaÃ§Ã£o {generateVariacaoLetters(sample.variacoes.length)[variacaoIndex]}
+                                                        Variação {generateVariacaoLetters(sample.variacoes.length)[variacaoIndex]}
                                                     </span>
                                                     {sample.variacoes.length > 1 && (
                                                         <Button variant="ghost" size="sm" onClick={() => removeVariacao(sampleIndex, variacaoIndex)}>
@@ -188,19 +194,19 @@ export default function SampleBatchModal({
                                                     )}
                                                 </div>
                                                 <Input
-                                                    placeholder="DescriÃ§Ã£o da variaÃ§Ã£o"
+                                                    placeholder="Descrição da variação"
                                                     value={variacao.descricao_aplicacao || ""}
                                                     onChange={(event) => updateVariacao(sampleIndex, variacaoIndex, "descricao_aplicacao", event.target.value)}
                                                 />
                                                 <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
                                                     <Input
                                                         type="number"
-                                                        placeholder="% fragrÃ¢ncia"
+                                                        placeholder="% fragrância"
                                                         value={variacao.percentual_fragrancia || ""}
                                                         onChange={(event) => updateVariacao(sampleIndex, variacaoIndex, "percentual_fragrancia", event.target.value)}
                                                     />
                                                     <Input
-                                                        placeholder="Ref. fragrÃ¢ncia"
+                                                        placeholder="Ref. fragrância"
                                                         value={variacao.referencia_fragrancia || ""}
                                                         onChange={(event) => updateVariacao(sampleIndex, variacaoIndex, "referencia_fragrancia", event.target.value)}
                                                     />
@@ -213,7 +219,7 @@ export default function SampleBatchModal({
                                                 </div>
                                                 <Textarea
                                                     rows={2}
-                                                    placeholder="ObservaÃ§Ãµes especÃ­ficas"
+                                                    placeholder="Observações específicas"
                                                     value={variacao.observacoes_especificas || ""}
                                                     onChange={(event) => updateVariacao(sampleIndex, variacaoIndex, "observacoes_especificas", event.target.value)}
                                                 />

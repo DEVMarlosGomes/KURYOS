@@ -23,6 +23,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import ViewSwitcher from "@/components/ViewSwitcher";
 import FilterBar, { applyFilters } from "@/components/FilterBar";
 import ListView from "@/components/ListView";
+import { formatApiError } from "@/lib/formatError";
 
 function CRMSubNav({ active }) {
     const navigate = useNavigate();
@@ -59,14 +60,6 @@ const STAGES = [
     { id: "cliente_perdido", label: "Cliente Perdido", color: "bg-red-500" },
 ];
 
-const CANAL_OPTIONS = [
-    { value: "indicacao", label: "Indicação" },
-    { value: "linkedin", label: "LinkedIn" },
-    { value: "feira", label: "Feira" },
-    { value: "prospeccao_ativa", label: "Prospecção Ativa" },
-    { value: "inbound", label: "Inbound" },
-];
-
 const CATEGORIA_OPTIONS = [
     { value: "perfume", label: "Perfume" },
     { value: "hidratante", label: "Hidratante" },
@@ -75,11 +68,6 @@ const CATEGORIA_OPTIONS = [
     { value: "body_splash", label: "Body Splash" },
     { value: "skin_care", label: "Skin Care" },
     { value: "outro", label: "Outro" },
-];
-
-const ORIGEM_OPTIONS = [
-    { value: "cliente_pediu", label: "Cliente Pediu" },
-    { value: "nos_provocamos", label: "Nós Provocamos" },
 ];
 
 const LOSS_REASON_OPTIONS = [
@@ -111,13 +99,13 @@ const CANAL_GROUP_LABELS = {
     outros: "Outros",
 };
 
-const EMPTY_ADDITIONAL_CONTACT = { nome: "", cargo: "", whatsapp: "", email: "" };
+const EMPTY_ADDITIONAL_CONTACT = { nome: "", cargo: "", cargo_custom: "", whatsapp: "", email: "" };
 
 function createEmptyClient(defaultOwner = "") {
     return {
         nome_empresa: "",
         cnpj: "",
-        contato_principal: { nome: "", whatsapp: "", email: "" },
+        contato_principal: { nome: "", cargo: "", cargo_custom: "", whatsapp: "", email: "" },
         contatos_adicionais: [],
         canal_origem: "",
         categoria_interesse: [],
@@ -177,6 +165,11 @@ function formatSlugLabel(value) {
         .join(" ");
 }
 
+function flattenUniqueOptions(groups = {}, flatOptions = []) {
+    const groupedValues = Object.values(groups || {}).flatMap((values) => values || []);
+    return Array.from(new Set([...(groupedValues || []), ...(flatOptions || [])])).filter(Boolean);
+}
+
 export default function CRM1Page() {
     const { user } = useAuth();
     const [clients, setClients] = useState([]);
@@ -201,7 +194,10 @@ export default function CRM1Page() {
     const [newClient, setNewClient] = useState(createEmptyClient());
 
     const [lossReason, setLossReason] = useState("");
+    const [showJustification, setShowJustification] = useState(false);
+    const [justificationText, setJustificationText] = useState("");
     const [batchProjects, setBatchProjects] = useState([createEmptyProject()]);
+    const [batchProjectError, setBatchProjectError] = useState("");
 
     const loadClients = useCallback(async () => {
         try {
@@ -242,13 +238,17 @@ export default function CRM1Page() {
 
     const categoryGroups = useMemo(() => crmConstants?.categoria_interesse || {}, [crmConstants]);
     const channelGroups = useMemo(() => crmConstants?.canal_origem_grupos || {}, [crmConstants]);
+    const channelOptions = useMemo(
+        () => flattenUniqueOptions(channelGroups, crmConstants?.canal_origem || []),
+        [channelGroups, crmConstants]
+    );
     const effectiveCategoryGroups = useMemo(
         () => (Object.keys(categoryGroups).length ? categoryGroups : { categorias: CATEGORIA_OPTIONS.map((option) => option.value) }),
         [categoryGroups]
     );
     const effectiveChannelGroups = useMemo(
-        () => (Object.keys(channelGroups).length ? channelGroups : { outros: CANAL_OPTIONS.map((option) => option.value) }),
-        [channelGroups]
+        () => (Object.keys(channelGroups).length ? channelGroups : (channelOptions.length ? { outros: channelOptions } : {})),
+        [channelGroups, channelOptions]
     );
     const segmentOptions = crmConstants?.segmento || [];
     const porteOptions = crmConstants?.porte || [];
@@ -352,6 +352,7 @@ export default function CRM1Page() {
     const openProjectBatchModal = useCallback((client, shouldMoveClient = false) => {
         if (!client) return;
         setPendingProjectMove(shouldMoveClient ? { clientId: client.id, stage: "projeto_em_discussao" } : null);
+        setBatchProjectError("");
         setBatchClientId(client.id);
         setBatchProjects([createProjectDraftForClient(client)]);
         setShowBatchProjects(true);
@@ -374,6 +375,16 @@ export default function CRM1Page() {
             return;
         }
 
+        // Detect backward (retroactive) move — requires justification
+        const currentIdx = STAGE_ORDER.indexOf(client.stage);
+        const destIdx = STAGE_ORDER.indexOf(newStage);
+        if (destIdx < currentIdx) {
+            setPendingMove({ clientId: draggableId, stage: newStage });
+            setJustificationText("");
+            setShowJustification(true);
+            return;
+        }
+
         if (newStage === "projeto_em_discussao") {
             openProjectBatchModal(client, true);
             return;
@@ -383,10 +394,28 @@ export default function CRM1Page() {
             const { data } = await api.put(`/crm/clients/${draggableId}/move`, { stage: newStage });
             toast.success(`Cliente movido para ${data.to_stage}`);
 
+            setBatchProjectError("");
             loadClients();
         } catch (e) {
             const msg = e.response?.data?.detail || "Erro ao mover cliente";
             toast.error(msg);
+        }
+    };
+
+    const confirmBackwardMove = async () => {
+        if (!pendingMove || !justificationText.trim()) return;
+        try {
+            const { data } = await api.put(`/crm/clients/${pendingMove.clientId}/move`, {
+                stage: pendingMove.stage,
+                justificativa: justificationText.trim(),
+            });
+            toast.success(`Cliente movido para ${data.to_stage}`);
+            setShowJustification(false);
+            setPendingMove(null);
+            setJustificationText("");
+            loadClients();
+        } catch (e) {
+            toast.error(e.response?.data?.detail || "Erro ao mover cliente");
         }
     };
 
@@ -430,10 +459,12 @@ export default function CRM1Page() {
             && project.prazo_desejado_amostra
         ));
         if (valid.length === 0 || !batchClientId) {
-            toast.error("Preencha os campos obrigatÃ³rios do prÃ©-briefing em pelo menos um projeto.");
+            setBatchProjectError("Preencha os campos obrigatórios do pré-briefing em pelo menos um projeto.");
+            toast.error("Preencha os campos obrigatórios do pré-briefing em pelo menos um projeto.");
             return;
         }
         try {
+            setBatchProjectError("");
             const { data } = await api.post("/crm/projects/batch", {
                 cliente_id: batchClientId,
                 projects: valid.map((project) => ({
@@ -442,17 +473,26 @@ export default function CRM1Page() {
                     volume_estimado_pedido: project.volume_estimado_pedido ? parseInt(project.volume_estimado_pedido, 10) : null,
                 })),
             });
-            if (pendingProjectMove?.clientId === batchClientId) {
-                await api.put(`/crm/clients/${batchClientId}/move`, { stage: pendingProjectMove.stage });
-            }
+            // Projects created successfully — now try to advance the client stage separately.
+            // If the move fails the projects are already persisted, so we show a partial-success
+            // message instead of hiding them behind a generic error.
             toast.success(`${data.count} projeto(s) criado(s)!`);
             setShowBatchProjects(false);
             setPendingProjectMove(null);
             setBatchClientId(null);
             setBatchProjects([createEmptyProject({ responsavel_comercial: user?.id || "" })]);
+            if (pendingProjectMove?.clientId === batchClientId) {
+                try {
+                    await api.put(`/crm/clients/${batchClientId}/move`, { stage: pendingProjectMove.stage });
+                } catch (moveErr) {
+                    toast.error(`Projetos criados, mas não foi possível avançar o cliente: ${moveErr.response?.data?.detail || "erro desconhecido"}`);
+                }
+            }
             loadClients();
         } catch (e) {
-            toast.error(e.response?.data?.detail || "Erro ao criar projetos");
+            const message = formatApiError(e);
+            setBatchProjectError(message);
+            toast.error(message);
         }
     };
 
@@ -693,10 +733,23 @@ export default function CRM1Page() {
                                         <Input placeholder="Nome do contato" value={newClient.contato_principal.nome} onChange={(e) => updateMainContact("nome", e.target.value)} />
                                     </div>
                                     <div className="space-y-2">
+                                        <Label>Cargo</Label>
+                                        <Select value={newClient.contato_principal.cargo || ""} onValueChange={(v) => updateMainContact("cargo", v)}>
+                                            <SelectTrigger><SelectValue placeholder="Selecionar cargo" /></SelectTrigger>
+                                            <SelectContent>
+                                                {cargoOptions.map((c) => <SelectItem key={c} value={c}>{formatSlugLabel(c)}</SelectItem>)}
+                                                <SelectItem value="outro">Outro</SelectItem>
+                                            </SelectContent>
+                                        </Select>
+                                        {newClient.contato_principal.cargo === "outro" && (
+                                            <Input placeholder="Especifique o cargo" value={newClient.contato_principal.cargo_custom || ""} onChange={(e) => updateMainContact("cargo_custom", e.target.value)} />
+                                        )}
+                                    </div>
+                                    <div className="space-y-2">
                                         <Label>WhatsApp *</Label>
                                         <Input placeholder="+55 com DDD" value={newClient.contato_principal.whatsapp} onChange={(e) => updateMainContact("whatsapp", e.target.value)} />
                                     </div>
-                                    <div className="space-y-2 md:col-span-2">
+                                    <div className="space-y-2">
                                         <Label>E-mail</Label>
                                         <Input placeholder="contato@empresa.com" value={newClient.contato_principal.email} onChange={(e) => updateMainContact("email", e.target.value)} />
                                     </div>
@@ -720,14 +773,20 @@ export default function CRM1Page() {
                                         </div>
                                         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                                             <Input placeholder="Nome" value={contact.nome} onChange={(e) => updateAdditionalContact(index, "nome", e.target.value)} />
-                                            <Select value={contact.cargo || ""} onValueChange={(v) => updateAdditionalContact(index, "cargo", v)}>
-                                                <SelectTrigger><SelectValue placeholder="Cargo" /></SelectTrigger>
-                                                <SelectContent>
-                                                    {cargoOptions.map((option) => (
-                                                        <SelectItem key={option} value={option}>{formatSlugLabel(option)}</SelectItem>
-                                                    ))}
-                                                </SelectContent>
-                                            </Select>
+                                            <div className="space-y-2">
+                                                <Select value={contact.cargo || ""} onValueChange={(v) => updateAdditionalContact(index, "cargo", v)}>
+                                                    <SelectTrigger><SelectValue placeholder="Cargo" /></SelectTrigger>
+                                                    <SelectContent>
+                                                        {cargoOptions.map((option) => (
+                                                            <SelectItem key={option} value={option}>{formatSlugLabel(option)}</SelectItem>
+                                                        ))}
+                                                        <SelectItem value="outro">Outro</SelectItem>
+                                                    </SelectContent>
+                                                </Select>
+                                                {contact.cargo === "outro" && (
+                                                    <Input placeholder="Especifique o cargo" value={contact.cargo_custom || ""} onChange={(e) => updateAdditionalContact(index, "cargo_custom", e.target.value)} />
+                                                )}
+                                            </div>
                                             <Input placeholder="WhatsApp" value={contact.whatsapp} onChange={(e) => updateAdditionalContact(index, "whatsapp", e.target.value)} />
                                             <Input placeholder="E-mail" value={contact.email} onChange={(e) => updateAdditionalContact(index, "email", e.target.value)} />
                                         </div>
@@ -903,10 +962,38 @@ export default function CRM1Page() {
                 </DialogContent>
             </Dialog>
 
+            {/* Backward Move Justification Dialog */}
+            <Dialog open={showJustification} onOpenChange={(v) => { if (!v) { setShowJustification(false); setPendingMove(null); } }}>
+                <DialogContent className="max-w-md">
+                    <DialogHeader>
+                        <DialogTitle className="font-heading flex items-center gap-2">
+                            <AlertTriangle className="h-5 w-5 text-amber-500" /> Movimentação Retroativa
+                        </DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-3">
+                        <p className="text-sm text-muted-foreground">
+                            Você está movendo o cliente para um estágio anterior. Informe a justificativa para esta movimentação.
+                        </p>
+                        <Label>Justificativa *</Label>
+                        <Textarea
+                            rows={3}
+                            placeholder="Descreva o motivo da movimentação retroativa..."
+                            value={justificationText}
+                            onChange={(e) => setJustificationText(e.target.value)}
+                        />
+                    </div>
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => { setShowJustification(false); setPendingMove(null); }}>Cancelar</Button>
+                        <Button onClick={confirmBackwardMove} disabled={!justificationText.trim()}>Confirmar Movimentação</Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+
             {/* Batch Project Creation Modal */}
             <Dialog open={showBatchProjects} onOpenChange={(open) => {
                 setShowBatchProjects(open);
                 if (!open) {
+                    setBatchProjectError("");
                     setPendingProjectMove(null);
                     setBatchClientId(null);
                     setBatchProjects([createEmptyProject({ responsavel_comercial: user?.id || "" })]);
@@ -947,7 +1034,7 @@ export default function CRM1Page() {
                                             </Select>
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>ResponsÃ¡vel comercial *</Label>
+                                            <Label>Responsável comercial *</Label>
                                             <Select value={proj.responsavel_comercial} onValueChange={(v) => { const p = [...batchProjects]; p[idx] = { ...p[idx], responsavel_comercial: v }; setBatchProjects(p); }}>
                                                 <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
                                                 <SelectContent>
@@ -963,12 +1050,12 @@ export default function CRM1Page() {
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], ideia_conceito: e.target.value, briefing_resumido: e.target.value }; setBatchProjects(p); }} />
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>ReferÃªncia de mercado</Label>
-                                            <Input placeholder="Concorrente ou inspiraÃ§Ã£o" value={proj.referencia_mercado}
+                                            <Label>Referência de mercado</Label>
+                                            <Input placeholder="Concorrente ou inspiração" value={proj.referencia_mercado}
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], referencia_mercado: e.target.value }; setBatchProjects(p); }} />
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>PÃºblico-alvo</Label>
+                                            <Label>Público-alvo</Label>
                                             <Input placeholder="A quem o produto se destina" value={proj.publico_alvo}
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], publico_alvo: e.target.value }; setBatchProjects(p); }} />
                                         </div>
@@ -984,7 +1071,7 @@ export default function CRM1Page() {
                                             </Select>
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>Tipo de serviÃ§o *</Label>
+                                            <Label>Tipo de serviço *</Label>
                                             <Select value={proj.tipo_servico} onValueChange={(v) => { const p = [...batchProjects]; p[idx] = { ...p[idx], tipo_servico: v }; setBatchProjects(p); }}>
                                                 <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
                                                 <SelectContent>
@@ -995,7 +1082,7 @@ export default function CRM1Page() {
                                             </Select>
                                         </div>
                                         <div className="space-y-2">
-                                            <Label>Faixa de preÃ§o de venda (R$)</Label>
+                                            <Label>Faixa de preço de venda (R$)</Label>
                                             <Input type="number" value={proj.faixa_preco_venda}
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], faixa_preco_venda: e.target.value }; setBatchProjects(p); }} />
                                         </div>
@@ -1011,7 +1098,7 @@ export default function CRM1Page() {
                                         </div>
                                         <div className="space-y-2">
                                             <Label>Sensorial desejado</Label>
-                                            <Input placeholder="Textura, cor, fragrÃ¢ncia" value={proj.sensorial_desejado}
+                                            <Input placeholder="Textura, cor, fragrância" value={proj.sensorial_desejado}
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], sensorial_desejado: e.target.value }; setBatchProjects(p); }} />
                                         </div>
                                         <div className="space-y-2 md:col-span-2">
@@ -1020,7 +1107,7 @@ export default function CRM1Page() {
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], claims_desejados: e.target.value }; setBatchProjects(p); }} />
                                         </div>
                                         <div className="space-y-2 md:col-span-2">
-                                            <Label>RestriÃ§Ãµes tÃ©cnicas</Label>
+                                            <Label>Restrições técnicas</Label>
                                             <div className="flex flex-wrap gap-2">
                                                 {projectRestrictionOptions.map((option) => {
                                                     const active = (proj.restricoes_tecnicas || []).includes(option);
@@ -1046,7 +1133,7 @@ export default function CRM1Page() {
                                             </div>
                                         </div>
                                         <div className="space-y-2 md:col-span-2">
-                                            <Label>ObservaÃ§Ãµes livres</Label>
+                                            <Label>Observações livres</Label>
                                             <Textarea value={proj.observacoes_livres} rows={2}
                                                 onChange={(e) => { const p = [...batchProjects]; p[idx] = { ...p[idx], observacoes_livres: e.target.value }; setBatchProjects(p); }} />
                                         </div>
@@ -1057,9 +1144,14 @@ export default function CRM1Page() {
                         <Button variant="outline" className="w-full mt-3" onClick={() => setBatchProjects([...batchProjects, createProjectDraftForClient(clients.find((client) => client.id === batchClientId))])}>
                             <Plus className="h-4 w-4 mr-2" /> Adicionar Projeto
                         </Button>
+                        {batchProjectError && (
+                            <div className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                                {batchProjectError}
+                            </div>
+                        )}
                     </div>
                     <DialogFooter className="p-6 pt-3 border-t">
-                        <Button variant="outline" onClick={() => { setShowBatchProjects(false); setPendingProjectMove(null); setBatchClientId(null); setBatchProjects([createEmptyProject({ responsavel_comercial: user?.id || "" })]); }}>Cancelar</Button>
+                        <Button variant="outline" onClick={() => { setShowBatchProjects(false); setBatchProjectError(""); setPendingProjectMove(null); setBatchClientId(null); setBatchProjects([createEmptyProject({ responsavel_comercial: user?.id || "" })]); }}>Cancelar</Button>
                         <Button onClick={handleBatchProjectSubmit}>
                             Criar {batchProjects.filter((project) => project.nome_projeto.trim()).length} Projeto(s)
                         </Button>
@@ -1072,19 +1164,29 @@ export default function CRM1Page() {
 
 
 // ======= Client Detail Sheet =======
-function ClientDetailSheet({ client, onClose, onCreateProject }) {
+function ClientDetailSheet({ client, constants, onClose, onCreateProject }) {
     const [data, setData] = useState(null);
+    const [fullData, setFullData] = useState(null);
     const [editing, setEditing] = useState({});
     const [saving, setSaving] = useState(false);
     const [tab, setTab] = useState("info");
+    const detailChannelOptions = useMemo(
+        () => flattenUniqueOptions(constants?.canal_origem_grupos || {}, constants?.canal_origem || []),
+        [constants]
+    );
+    const detailLeadOriginOptions = constants?.origem_lead || [];
+    const detailCargoOptions = constants?.cargo_decisor || [];
 
     useEffect(() => {
         if (client) {
             setData({ ...client });
             setEditing({});
             setTab("info");
+            setFullData(null);
+            api.get(`/crm/clients/${client.id}/full`).then(({ data: fd }) => setFullData(fd)).catch(() => {});
         } else {
             setData(null);
+            setFullData(null);
         }
     }, [client]);
 
@@ -1136,8 +1238,11 @@ function ClientDetailSheet({ client, onClose, onCreateProject }) {
                 </SheetHeader>
                 <Separator />
                 <Tabs value={tab} onValueChange={setTab} className="flex-1 flex flex-col min-h-0">
-                    <TabsList className="mx-6 mt-3">
+                    <TabsList className="mx-6 mt-3 flex-wrap h-auto">
                         <TabsTrigger value="info">Dados</TabsTrigger>
+                        <TabsTrigger value="projetos">Projetos {fullData ? `(${fullData.projects?.length || 0})` : ""}</TabsTrigger>
+                        <TabsTrigger value="pedidos">Pedidos {fullData ? `(${fullData.orders?.length || 0})` : ""}</TabsTrigger>
+                        <TabsTrigger value="contatos">Contatos</TabsTrigger>
                         <TabsTrigger value="timeline">Histórico</TabsTrigger>
                     </TabsList>
 
@@ -1150,20 +1255,41 @@ function ClientDetailSheet({ client, onClose, onCreateProject }) {
                                     <div><Label className="text-xs">Empresa</Label><Input value={val("nome_empresa")} onChange={(e) => setVal("nome_empresa", e.target.value)} /></div>
                                     <div><Label className="text-xs">CNPJ</Label><Input value={val("cnpj")} onChange={(e) => setVal("cnpj", e.target.value)} /></div>
                                     <div><Label className="text-xs">Contato — Nome</Label><Input value={val("contato_principal")?.nome || data.contato_principal?.nome || ""} onChange={(e) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), nome: e.target.value })} /></div>
+                                    <div>
+                                        <Label className="text-xs">Contato — Cargo</Label>
+                                        <Select value={(val("contato_principal") ?? data.contato_principal)?.cargo || ""} onValueChange={(v) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), cargo: v })}>
+                                            <SelectTrigger><SelectValue placeholder="Cargo" /></SelectTrigger>
+                                            <SelectContent>
+                                                {(constants?.cargo_decisor || []).map((c) => <SelectItem key={c} value={c}>{formatSlugLabel(c)}</SelectItem>)}
+                                                <SelectItem value="outro">Outro</SelectItem>
+                                            </SelectContent>
+                                        </Select>
+                                        {((val("contato_principal") ?? data.contato_principal)?.cargo === "outro") && (
+                                            <Input className="mt-2" placeholder="Especifique o cargo" value={(val("contato_principal") ?? data.contato_principal)?.cargo_custom || ""} onChange={(e) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), cargo_custom: e.target.value })} />
+                                        )}
+                                    </div>
                                     <div><Label className="text-xs">Contato — WhatsApp</Label><Input value={val("contato_principal")?.whatsapp || data.contato_principal?.whatsapp || ""} onChange={(e) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), whatsapp: e.target.value })} /></div>
                                     <div><Label className="text-xs">Contato — Email</Label><Input value={val("contato_principal")?.email || data.contato_principal?.email || ""} onChange={(e) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), email: e.target.value })} /></div>
                                     <div>
                                         <Label className="text-xs">Canal de Origem</Label>
                                         <Select value={val("canal_origem")} onValueChange={(v) => setVal("canal_origem", v)}>
                                             <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
-                                            <SelectContent>{CANAL_OPTIONS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}</SelectContent>
+                                            <SelectContent>
+                                                {detailChannelOptions.map((value) => (
+                                                    <SelectItem key={value} value={value}>{formatSlugLabel(value)}</SelectItem>
+                                                ))}
+                                            </SelectContent>
                                         </Select>
                                     </div>
                                     <div>
                                         <Label className="text-xs flex items-center gap-1">Origem do Lead <Tag className="h-3 w-3 text-amber-500" /></Label>
                                         <Select value={val("origem_lead")} onValueChange={(v) => setVal("origem_lead", v)}>
                                             <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
-                                            <SelectContent>{ORIGEM_OPTIONS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}</SelectContent>
+                                            <SelectContent>
+                                                {detailLeadOriginOptions.map((value) => (
+                                                    <SelectItem key={value} value={value}>{formatSlugLabel(value)}</SelectItem>
+                                                ))}
+                                            </SelectContent>
                                         </Select>
                                     </div>
                                 </div>
@@ -1251,6 +1377,101 @@ function ClientDetailSheet({ client, onClose, onCreateProject }) {
                         </div>
                     </TabsContent>
 
+                    <TabsContent value="projetos" className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 mt-3">
+                        {!fullData ? (
+                            <p className="text-sm text-muted-foreground">Carregando...</p>
+                        ) : (fullData.projects || []).length === 0 ? (
+                            <p className="text-sm text-muted-foreground">Nenhum projeto encontrado.</p>
+                        ) : (
+                            <div className="space-y-3">
+                                {fullData.summary && (
+                                    <div className="rounded-lg border border-border bg-muted/40 p-3 grid grid-cols-3 gap-3 text-center text-xs mb-4">
+                                        <div><span className="block font-semibold text-base">{fullData.summary.projetos_ativos}</span>ativos</div>
+                                        <div><span className="block font-semibold text-base">{fullData.summary.total_projetos}</span>total</div>
+                                        <div><span className="block font-semibold text-base">{fullData.summary.total_amostras}</span>amostras</div>
+                                    </div>
+                                )}
+                                {(fullData.projects || []).map((proj) => (
+                                    <div key={proj.id} className="rounded-lg border border-border p-3 space-y-1">
+                                        <p className="font-medium text-sm">{proj.nome_projeto}</p>
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            <Badge variant="outline" className="text-[10px]">{proj.stage}</Badge>
+                                            {proj.categoria && <Badge variant="secondary" className="text-[10px]">{proj.categoria}</Badge>}
+                                        </div>
+                                        {proj.created_at && <p className="text-[10px] text-muted-foreground">{new Date(proj.created_at).toLocaleDateString("pt-BR")}</p>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </TabsContent>
+
+                    <TabsContent value="pedidos" className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 mt-3">
+                        {!fullData ? (
+                            <p className="text-sm text-muted-foreground">Carregando...</p>
+                        ) : (fullData.orders || []).length === 0 ? (
+                            <p className="text-sm text-muted-foreground">Nenhum pedido encontrado.</p>
+                        ) : (
+                            <div className="space-y-3">
+                                {fullData.summary?.item_mais_pedido && (
+                                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 text-xs">
+                                        <span className="font-semibold">Item mais pedido:</span> {fullData.summary.item_mais_pedido}
+                                    </div>
+                                )}
+                                {(fullData.orders || []).map((order) => (
+                                    <div key={order.id} className="rounded-lg border border-border p-3 space-y-1">
+                                        <div className="flex items-center justify-between">
+                                            <p className="font-medium text-sm">{order.numero_pedido}</p>
+                                            <Badge variant="outline" className="text-[10px]">{order.status}</Badge>
+                                        </div>
+                                        {order.total_pedido > 0 && (
+                                            <p className="text-xs text-muted-foreground">
+                                                R$ {Number(order.total_pedido).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}
+                                            </p>
+                                        )}
+                                        {order.created_at && <p className="text-[10px] text-muted-foreground">{new Date(order.created_at).toLocaleDateString("pt-BR")}</p>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </TabsContent>
+
+                    <TabsContent value="contatos" className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 mt-3">
+                        <div className="space-y-4">
+                            {data.contato_principal?.nome && (
+                                <div className="rounded-lg border border-border p-3 space-y-1">
+                                    <div className="flex items-center gap-2">
+                                        <p className="font-medium text-sm">{data.contato_principal.nome}</p>
+                                        {(data.contato_principal.cargo === "outro" ? data.contato_principal.cargo_custom : data.contato_principal.cargo) && (
+                                            <Badge variant="secondary" className="text-[10px]">
+                                                {data.contato_principal.cargo === "outro" ? data.contato_principal.cargo_custom : formatSlugLabel(data.contato_principal.cargo)}
+                                            </Badge>
+                                        )}
+                                        <Badge className="text-[10px] bg-primary/10 text-primary border-primary/20">Principal</Badge>
+                                    </div>
+                                    {data.contato_principal.whatsapp && <p className="text-xs text-muted-foreground">{data.contato_principal.whatsapp}</p>}
+                                    {data.contato_principal.email && <p className="text-xs text-muted-foreground">{data.contato_principal.email}</p>}
+                                </div>
+                            )}
+                            {(data.contatos_adicionais || []).map((c, idx) => (
+                                <div key={idx} className="rounded-lg border border-border p-3 space-y-1">
+                                    <div className="flex items-center gap-2">
+                                        <p className="font-medium text-sm">{c.nome || `Contato ${idx + 1}`}</p>
+                                        {(c.cargo === "outro" ? c.cargo_custom : c.cargo) && (
+                                            <Badge variant="secondary" className="text-[10px]">
+                                                {c.cargo === "outro" ? c.cargo_custom : formatSlugLabel(c.cargo)}
+                                            </Badge>
+                                        )}
+                                    </div>
+                                    {c.whatsapp && <p className="text-xs text-muted-foreground">{c.whatsapp}</p>}
+                                    {c.email && <p className="text-xs text-muted-foreground">{c.email}</p>}
+                                </div>
+                            ))}
+                            {!data.contato_principal?.nome && (!data.contatos_adicionais || data.contatos_adicionais.length === 0) && (
+                                <p className="text-sm text-muted-foreground">Nenhum contato cadastrado.</p>
+                            )}
+                        </div>
+                    </TabsContent>
+
                     <TabsContent value="timeline" className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 mt-3">
                         <div className="space-y-3">
                             {(data.historico_movimentacoes || []).slice().reverse().map((mov, idx) => (
@@ -1264,7 +1485,11 @@ function ClientDetailSheet({ client, onClose, onCreateProject }) {
                                         </p>
                                         <p className="text-xs text-muted-foreground">
                                             {mov.usuario} · {new Date(mov.data).toLocaleString("pt-BR")}
+                                            {mov.is_regression && <span className="ml-1 text-amber-600 font-medium">(retroativa)</span>}
                                         </p>
+                                        {mov.justificativa && (
+                                            <p className="text-xs text-muted-foreground italic mt-0.5">"{mov.justificativa}"</p>
+                                        )}
                                     </div>
                                 </div>
                             ))}

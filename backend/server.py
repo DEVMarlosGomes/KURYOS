@@ -78,6 +78,15 @@ db = client[db_name]
 app = FastAPI(title="CRM Kuryos API")
 router = APIRouter(prefix="/api")
 
+
+@app.middleware("http")
+async def force_utf8_json_responses(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type.lower() and "charset=" not in content_type.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
+
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only-change-me")
 if "JWT_SECRET" not in os.environ:
     missing_env_defaults.append("JWT_SECRET")
@@ -1806,10 +1815,10 @@ async def startup():
     await db.pd_pending_items.create_index([("tenant_id", 1), ("pd_request_id", 1), ("status", 1)])
     
     # Initialize P&D module
-    init_pd(db, get_current_user, new_id, now_iso, put_object)
+    init_pd(db, get_current_user, new_id, now_iso, put_object, broadcast_event_fn=ws_manager.broadcast)
     
     # Initialize CRM module
-    init_crm(db, get_current_user, new_id, now_iso)
+    init_crm(db, get_current_user, new_id, now_iso, ws_manager.broadcast)
 
     # Initialize Estoque module
     init_estoque(db, get_current_user, new_id, now_iso)

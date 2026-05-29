@@ -43,14 +43,16 @@ get_current_user = None
 new_id_func = None
 now_iso_func = None
 put_object_func = None
+_broadcast_event = None
 
-def init_pd(database, auth_func, id_func, iso_func, storage_func=None):
-    global db, get_current_user, new_id_func, now_iso_func, put_object_func
+def init_pd(database, auth_func, id_func, iso_func, storage_func=None, broadcast_event_fn=None):
+    global db, get_current_user, new_id_func, now_iso_func, put_object_func, _broadcast_event
     db = database
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
     put_object_func = storage_func
+    _broadcast_event = broadcast_event_fn
 
 def new_id():
     return new_id_func()
@@ -1307,6 +1309,16 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
             if not approval:
                 raise HTTPException(status_code=400, detail="Registre uma aprovação antes de mover para APROVADO.")
+            if not approval.get("approved_by_internal"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Aprovação interna pendente. O líder de P&D deve aprovar internamente antes de marcar como APROVADO.",
+                )
+            if not approval.get("approved_by_client"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Aprovação do cliente pendente. Registre a confirmação do cliente antes de marcar como APROVADO.",
+                )
     
     await db.pd_requests.update_one(
         {"id": req_id},
@@ -1320,6 +1332,8 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
         "IN_TESTS": "em_testes",
         "WAITING_APPROVAL": "aguardando_aprovacao",
         "REJECTED": "retrabalho_interno",
+        "APPROVED": "aprovado",
+        "COMPLETED": "concluido",
     }
     kanban_status = _PD_STATUS_TO_KANBAN.get(new_status)
     if kanban_status:
@@ -1327,6 +1341,49 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
             {"$set": {"status_pd": kanban_status, "updated_at": now_iso()}}
         )
+        # Reverse-sync: push the new stage label back into the CRM sample variation
+        try:
+            pd_card = await db.pd_cards.find_one(
+                {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
+                {"_id": 0, "amostra_id": 1, "amostra_variacao_id": 1}
+            )
+            if pd_card and pd_card.get("amostra_variacao_id"):
+                amostra_id = pd_card["amostra_id"]
+                variacao_id = pd_card["amostra_variacao_id"]
+                _PD_KANBAN_LABELS = {
+                    "solicitado": "Solicitado",
+                    "em_desenvolvimento": "Em Desenvolvimento",
+                    "em_testes": "Em Testes",
+                    "aguardando_aprovacao": "Aguardando Aprovação",
+                    "retrabalho_interno": "Retrabalho",
+                    "aprovado": "Aprovado",
+                    "concluido": "Concluído",
+                }
+                await db.crm_samples.update_one(
+                    {
+                        "id": amostra_id,
+                        "tenant_id": user["tenant_id"],
+                        "variacoes.id": variacao_id,
+                    },
+                    {"$set": {
+                        "variacoes.$.status_pd_raw": kanban_status,
+                        "variacoes.$.status_pd_label": _PD_KANBAN_LABELS.get(kanban_status, kanban_status),
+                        "updated_at": now_iso(),
+                    }}
+                )
+                if _broadcast_event:
+                    await _broadcast_event(
+                        user["tenant_id"],
+                        "crm_sample_pd_synced",
+                        {
+                            "amostra_id": amostra_id,
+                            "variacao_id": variacao_id,
+                            "status_pd_raw": kanban_status,
+                            "status_pd_label": _PD_KANBAN_LABELS.get(kanban_status, kanban_status),
+                        }
+                    )
+        except Exception as exc:
+            logger.warning(f"PD→CRM reverse sync failed for req {req_id}: {exc}")
 
     await db.pd_request_status_history.insert_one({
         "id": new_id(),
@@ -2280,6 +2337,9 @@ async def list_samples(dev_id: str, request: Request):
 @pd_router.put("/samples/{sample_id}")
 async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
     user = await get_current_user(request)
+    existing = await db.pd_samples.find_one({"id": sample_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
@@ -2287,6 +2347,21 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
     if update_fields.get("sent_to_client") == True:
         update_fields["sent_at"] = now_iso()
         update_fields.setdefault("internal_approved", True)
+    
+    sent_to_client = bool(update_fields.get("sent_to_client", existing.get("sent_to_client")))
+    internal_approved = bool(update_fields.get("internal_approved", existing.get("internal_approved")))
+
+    if "client_approved" in update_fields:
+        if not sent_to_client:
+            raise HTTPException(
+                status_code=409,
+                detail="Amostra precisa ser enviada ao cliente antes de registrar aprovação externa.",
+            )
+        if not internal_approved:
+            raise HTTPException(
+                status_code=409,
+                detail="Aprovação interna pendente antes da aprovação do cliente.",
+            )
     
     result = await db.pd_samples.update_one({"id": sample_id}, {"$set": update_fields})
     if result.matched_count == 0:
@@ -3894,8 +3969,11 @@ class StockMovementCreate(BaseModel):
 
 class UpdateCreate(BaseModel):
     mensagem: str
-    tipo: Optional[str] = "observacao"  # observacao, status, pendencia_resolvida, chegada_material
+    tipo: Optional[str] = "observacao"  # observacao, status, pendencia_resolvida, chegada_material, solicitacao_mp, solicitacao_fragrancia, recebimento
     visivel_comercial: bool = True
+    item_solicitado: Optional[str] = None
+    fornecedor: Optional[str] = None
+    previsao_entrega: Optional[str] = None  # ISO date
 
 class PendingItemCreate(BaseModel):
     tipo: str  # fragrancia, mp, insumo, amostra, outro
@@ -4385,6 +4463,11 @@ async def create_update(req_id: str, data: UpdateCreate, request: Request):
         "tipo": data.tipo or "observacao",
         "mensagem": data.mensagem.strip(),
         "visivel_comercial": bool(data.visivel_comercial),
+        "item_solicitado": (data.item_solicitado or "").strip() or None,
+        "fornecedor": (data.fornecedor or "").strip() or None,
+        "previsao_entrega": data.previsao_entrega or None,
+        "recebido": False,
+        "recebido_em": None,
         "user_id": user["id"],
         "user_name": user["name"],
         "user_role": user.get("role", ""),
@@ -4835,7 +4918,7 @@ async def update_fornecedor(f_id: str, data: FornecedorUpdate, request: Request)
     user = await get_current_user(request)
     existing = await db.homologacao_fornecedores.find_one({"id": f_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not existing:
-        raise HTTPException(status_code=404, detail="Fornecedor nÃ£o encontrado")
+        raise HTTPException(status_code=404, detail="Fornecedor não encontrado")
     fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
@@ -5216,3 +5299,717 @@ async def homologacao_dashboard(request: Request):
             ],
         },
     }
+
+
+# ============================================================
+# PD-07: FORMULA COST VERSIONS (per-formula snapshots)
+# ============================================================
+
+class FormulaCostVersionCreate(BaseModel):
+    custo_embalagem: float = 0.0
+    custo_mao_obra: float = 0.0
+
+def _formula_cost_view(versions: List[dict], user: dict) -> dict:
+    is_comercial = can_view_commercial_costs(user) or has_role(user, COMERCIAL_FULL)
+    if is_comercial:
+        return {
+            "versions": versions,
+            "_role_view": "comercial",
+        }
+    return {
+        "versions": [{"versao": v["versao"], "custo_mp_total": v["custo_mp_total"], "created_at": v["created_at"]} for v in versions],
+        "_role_view": "pd",
+    }
+
+@pd_router.get("/formulas/{formula_id}/costs")
+async def get_formula_cost_versions(formula_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    if not formula:
+        raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+    versions = await db.formula_cost_versions.find(
+        {"formula_id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return _formula_cost_view(versions, user)
+
+@pd_router.post("/formulas/{formula_id}/costs")
+async def save_formula_cost_version(formula_id: str, data: FormulaCostVersionCreate, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE | COMERCIAL_FULL)
+    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    if not formula:
+        raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+
+    # Derive custo_mp_total from current formula items
+    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(500)
+    custo_mp_total = round(sum(it.get("cost_brl", 0) or 0 for it in items), 4)
+
+    existing_count = await db.formula_cost_versions.count_documents({"formula_id": formula_id, "tenant_id": user["tenant_id"]})
+    versao = f"v{existing_count + 1}"
+
+    custo_total = round(custo_mp_total + data.custo_embalagem + data.custo_mao_obra, 4)
+
+    version_doc = {
+        "id": new_id(),
+        "formula_id": formula_id,
+        "tenant_id": user["tenant_id"],
+        "versao": versao,
+        "criado_por": user["id"],
+        "criado_por_nome": user["name"],
+        "custo_mp_total": custo_mp_total,
+        "custo_embalagem": data.custo_embalagem,
+        "custo_mao_obra": data.custo_mao_obra,
+        "custo_total": custo_total,
+        "created_at": now_iso(),
+    }
+    await db.formula_cost_versions.insert_one(version_doc)
+    version_doc.pop("_id", None)
+
+    # Return role-filtered view
+    versions = await db.formula_cost_versions.find(
+        {"formula_id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return _formula_cost_view(versions, user)
+
+
+# ============================================================
+# PD-08: FORMULA PROCEDURE PHASES
+# ============================================================
+
+class ProcedurePhaseCreate(BaseModel):
+    nome_fase: str
+    temperatura: Optional[str] = None
+    instrucoes: Optional[str] = None
+    observacoes: Optional[str] = None
+    ordem: int = 0
+
+class ProcedurePhaseUpdate(BaseModel):
+    nome_fase: Optional[str] = None
+    temperatura: Optional[str] = None
+    instrucoes: Optional[str] = None
+    observacoes: Optional[str] = None
+    ordem: Optional[int] = None
+
+class PhasesReorder(BaseModel):
+    phase_ids: List[str]  # ordered list of phase IDs
+
+@pd_router.get("/formulas/{formula_id}/phases")
+async def list_formula_phases(formula_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    phases = await db.formula_procedure_phases.find(
+        {"formula_id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("ordem", 1).to_list(100)
+    return phases
+
+@pd_router.post("/formulas/{formula_id}/phases")
+async def create_formula_phase(formula_id: str, data: ProcedurePhaseCreate, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    if not formula:
+        raise HTTPException(status_code=404, detail="Fórmula não encontrada")
+    max_order_doc = await db.formula_procedure_phases.find_one(
+        {"formula_id": formula_id}, {"_id": 0, "ordem": 1}, sort=[("ordem", -1)]
+    )
+    auto_order = (max_order_doc["ordem"] + 1) if max_order_doc else 0
+    phase = {
+        "id": new_id(),
+        "formula_id": formula_id,
+        "tenant_id": user["tenant_id"],
+        "nome_fase": data.nome_fase.strip(),
+        "temperatura": (data.temperatura or "").strip() or None,
+        "instrucoes": (data.instrucoes or "").strip() or None,
+        "observacoes": (data.observacoes or "").strip() or None,
+        "ordem": data.ordem if data.ordem > 0 else auto_order,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.formula_procedure_phases.insert_one(phase)
+    phase.pop("_id", None)
+    return phase
+
+@pd_router.put("/formula-phases/{phase_id}")
+async def update_formula_phase(phase_id: str, data: ProcedurePhaseUpdate, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    existing = await db.formula_procedure_phases.find_one({"id": phase_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Fase não encontrada")
+    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    updates["updated_at"] = now_iso()
+    await db.formula_procedure_phases.update_one({"id": phase_id}, {"$set": updates})
+    return {**existing, **updates}
+
+@pd_router.delete("/formula-phases/{phase_id}")
+async def delete_formula_phase(phase_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    result = await db.formula_procedure_phases.delete_one({"id": phase_id, "tenant_id": user["tenant_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Fase não encontrada")
+    return {"message": "Fase removida"}
+
+@pd_router.put("/formulas/{formula_id}/phases/reorder")
+async def reorder_formula_phases(formula_id: str, data: PhasesReorder, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    for idx, phase_id in enumerate(data.phase_ids):
+        await db.formula_procedure_phases.update_one(
+            {"id": phase_id, "formula_id": formula_id, "tenant_id": user["tenant_id"]},
+            {"$set": {"ordem": idx, "updated_at": now_iso()}}
+        )
+    phases = await db.formula_procedure_phases.find(
+        {"formula_id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    ).sort("ordem", 1).to_list(100)
+    return phases
+
+
+# ============================================================
+# PD-09: TECH SHEET PDF FOR CRM SAMPLE (no monetary values)
+# ============================================================
+
+_TECH_SHEET_ROLES = PD_FULL | {"pcp", "supervisor", "vendedor", "sales_ops"}
+
+@pd_router.get("/samples/{crm_sample_id}/tech-sheet.pdf")
+async def generate_sample_tech_sheet(crm_sample_id: str, request: Request):
+    """Operational tech sheet for a CRM sample — never includes monetary values."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    user = await get_current_user(request)
+    require_roles(user, _TECH_SHEET_ROLES)
+
+    sample = await db.crm_samples.find_one({"id": crm_sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not sample:
+        raise HTTPException(status_code=404, detail="Amostra não encontrada")
+
+    # Find the PD card linked to this sample
+    pd_card = await db.pd_cards.find_one({"amostra_id": crm_sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    formula = None
+    items_safe = []
+    phases = []
+
+    if pd_card and pd_card.get("pd_request_id"):
+        dev = await db.pd_developments.find_one({"pd_request_id": pd_card["pd_request_id"]}, {"_id": 0})
+        if dev:
+            formula = await db.pd_formulas.find_one(
+                {"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)]
+            )
+            if formula:
+                raw_items = await db.pd_formula_items.find(
+                    {"formula_id": formula["id"]}, {"_id": 0}
+                ).to_list(500)
+                # NEVER include monetary values — select only safe fields
+                for it in raw_items:
+                    items_safe.append({
+                        "ingredient_name": it.get("ingredient_name", ""),
+                        "inci": it.get("inci", "") or "",
+                        "fornecedor": it.get("fornecedor", "") or "",
+                        "percentage": it.get("percentage", 0),
+                        "phase": it.get("phase", "") or "",
+                    })
+                phases = await db.formula_procedure_phases.find(
+                    {"formula_id": formula["id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
+                ).sort("ordem", 1).to_list(50)
+
+    tenant = await db.tenants.find_one({"id": user["tenant_id"]}, {"_id": 0})
+    org_name = tenant["name"] if tenant else "Kuryos"
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=25*mm, bottomMargin=20*mm, leftMargin=20*mm, rightMargin=20*mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('TSTitle', parent=styles['Title'], fontSize=20, spaceAfter=4, textColor=rl_colors.HexColor('#0A0A0B'))
+    subtitle_style = ParagraphStyle('TSSubtitle', parent=styles['Normal'], fontSize=11, textColor=rl_colors.HexColor('#737373'), spaceAfter=8)
+    heading_style = ParagraphStyle('TSHeading', parent=styles['Heading2'], fontSize=12, spaceAfter=6, spaceBefore=12, textColor=rl_colors.HexColor('#0A0A0B'))
+    normal_style = ParagraphStyle('TSNormal', parent=styles['Normal'], fontSize=9.5, spaceAfter=3, leading=13)
+    small_style = ParagraphStyle('TSSmall', parent=styles['Normal'], fontSize=8, textColor=rl_colors.HexColor('#737373'))
+
+    elements = []
+    elements.append(Paragraph("FICHA TÉCNICA OPERACIONAL", title_style))
+    elements.append(Paragraph(f"{org_name} — Documento de Uso Interno", subtitle_style))
+    elements.append(HRFlowable(width="100%", thickness=1, color=rl_colors.HexColor('#E5E5E5'), spaceAfter=8))
+
+    # Product identification
+    elements.append(Paragraph("1. IDENTIFICAÇÃO", heading_style))
+    amostra_num = sample.get("numero_amostra") or sample.get("id", "")
+    info_data = [
+        ["Produto:", sample.get("nome_produto", "—")],
+        ["Nº Amostra:", amostra_num],
+        ["Tipo:", sample.get("tipo_amostra", "—")],
+        ["Data:", datetime.now(timezone.utc).strftime("%d/%m/%Y")],
+        ["Responsável P&D:", pd_card.get("responsavel_pd", "—") if pd_card else "—"],
+    ]
+    it = Table(info_data, colWidths=[40*mm, 130*mm])
+    it.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9.5),
+        ('TEXTCOLOR', (0, 0), (0, -1), rl_colors.HexColor('#737373')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(it)
+
+    # Formula (NO PRICES)
+    if items_safe:
+        vol = formula.get("volume", 0) or 0
+        vu = formula.get("volume_unit", "mL")
+        elements.append(Paragraph(f"2. FORMULAÇÃO — v{formula.get('version', 1)}", heading_style))
+        header = ["Ingrediente", "INCI", "Fase", f"% Fórmula", f"Qtd/Lote ({vu})"]
+        rows = [header]
+        total_pct = 0
+        for itm in items_safe:
+            pct = itm["percentage"]
+            total_pct += pct
+            qty = f"{vol * pct / 100:.3f}" if vol > 0 else "—"
+            rows.append([itm["ingredient_name"], itm["inci"] or "—", itm["phase"] or "—", f"{pct:.3f}", qty])
+        rows.append(["TOTAL", "", "", f"{total_pct:.2f}", f"{vol:.0f}" if vol > 0 else "—"])
+        ft = Table(rows, colWidths=[50*mm, 35*mm, 20*mm, 20*mm, 26*mm])
+        ft.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#0A0A0B')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -2), 0.5, rl_colors.HexColor('#E5E5E5')),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('LINEABOVE', (0, -1), (-1, -1), 1, rl_colors.HexColor('#0A0A0B')),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+            ('TOPPADDING', (0, 0), (-1, 0), 6),
+        ]))
+        elements.append(ft)
+
+    # Procedure phases
+    if phases:
+        elements.append(Paragraph("3. PROCEDIMENTO DE MANIPULAÇÃO", heading_style))
+        for phase in phases:
+            phase_title = phase["nome_fase"]
+            if phase.get("temperatura"):
+                phase_title += f" — Temperatura: {phase['temperatura']}"
+            elements.append(Paragraph(f"<b>{phase_title}</b>", normal_style))
+            if phase.get("instrucoes"):
+                elements.append(Paragraph(phase["instrucoes"], normal_style))
+            if phase.get("observacoes"):
+                elements.append(Paragraph(f"<i>Obs: {phase['observacoes']}</i>", small_style))
+            elements.append(Spacer(1, 4*mm))
+
+    elements.append(Spacer(1, 16*mm))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=rl_colors.HexColor('#E5E5E5'), spaceAfter=4))
+    elements.append(Paragraph(
+        f"Gerado em {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC — {org_name} — DOCUMENTO OPERACIONAL (SEM VALORES MONETÁRIOS)",
+        small_style
+    ))
+
+    doc.build(elements)
+    buffer.seek(0)
+    safe_name = (sample.get("nome_produto", "amostra") or "amostra").replace(" ", "_").replace("/", "-")
+    filename = f"tech_sheet_{safe_name}_{amostra_num}.pdf"
+    return StreamingResponse(buffer, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+# ============================================================
+# PD-10: MARK UPDATE AS RECEIVED
+# ============================================================
+
+@pd_router.put("/updates/{up_id}/received")
+async def mark_update_received(up_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    existing = await db.pd_updates.find_one({"id": up_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Atualização não encontrada")
+    await db.pd_updates.update_one(
+        {"id": up_id},
+        {"$set": {"recebido": True, "recebido_em": now_iso(), "recebido_por": user["id"], "recebido_por_nome": user["name"]}}
+    )
+    return {**existing, "recebido": True, "recebido_em": now_iso()}
+
+
+# ============================================================
+# PD-12: BATCH MANIPULATION ORDER
+# ============================================================
+
+class BatchManipulationCreate(BaseModel):
+    amostra_ids: List[str]
+    observacao: Optional[str] = None
+    volume_por_amostra_ml: float = 15.0
+
+@pd_router.post("/batch-manipulation")
+async def create_batch_manipulation(data: BatchManipulationCreate, request: Request):
+    """Generate a shared-base manipulation order for a batch of samples."""
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+
+    if not data.amostra_ids:
+        raise HTTPException(status_code=400, detail="Selecione ao menos uma amostra")
+
+    vol = data.volume_por_amostra_ml
+    n_amostras = len(data.amostra_ids)
+
+    # Collect formula items per sample
+    sample_items: dict = {}  # amostra_id → list of items
+    sample_labels: dict = {}
+    for amostra_id in data.amostra_ids:
+        card = await db.pd_cards.find_one({"amostra_id": amostra_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+        sample = await db.crm_samples.find_one({"id": amostra_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+        label = sample.get("numero_amostra") or amostra_id
+        if sample and sample.get("variacoes"):
+            # Try to get variacao codigo
+            for v in sample["variacoes"]:
+                if v.get("id") == card.get("amostra_variacao_id"):
+                    label = f"{label}/{v.get('codigo', '')}"
+                    break
+        sample_labels[amostra_id] = label
+
+        items = []
+        if card and card.get("pd_request_id"):
+            dev = await db.pd_developments.find_one({"pd_request_id": card["pd_request_id"]}, {"_id": 0})
+            if dev:
+                formula = await db.pd_formulas.find_one(
+                    {"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)]
+                )
+                if formula:
+                    items = await db.pd_formula_items.find(
+                        {"formula_id": formula["id"]}, {"_id": 0}
+                    ).to_list(500)
+        sample_items[amostra_id] = items
+
+    # Find common ingredients (ingredient_name appears in ALL samples)
+    if not sample_items or not any(sample_items.values()):
+        raise HTTPException(status_code=400, detail="Nenhuma fórmula encontrada para as amostras selecionadas")
+
+    all_ingredient_sets = [
+        {it["ingredient_name"].strip().lower() for it in items}
+        for items in sample_items.values() if items
+    ]
+    if not all_ingredient_sets:
+        raise HTTPException(status_code=400, detail="Nenhuma fórmula ativa encontrada")
+
+    common_names = set.intersection(*all_ingredient_sets) if len(all_ingredient_sets) > 1 else all_ingredient_sets[0]
+
+    # Build base compartilhada (use percentual from first sample's formula)
+    first_items = next(v for v in sample_items.values() if v)
+    base_items = []
+    for it in first_items:
+        if it["ingredient_name"].strip().lower() in common_names:
+            pct = it.get("percentage", 0) or 0
+            qty_ml = round(vol * n_amostras * (pct / 100), 3)
+            base_items.append({
+                "mp": it["ingredient_name"],
+                "fornecedor": it.get("fornecedor", "") or "",
+                "percentual": pct,
+                "qtd_ml": qty_ml,
+                "unidade": "mL",
+            })
+
+    # Build per-variation additions (ingredients NOT in common base)
+    ingredientes_por_variacao: dict = {}
+    for amostra_id, items in sample_items.items():
+        label = sample_labels[amostra_id]
+        variation_items = []
+        for it in items:
+            if it["ingredient_name"].strip().lower() not in common_names:
+                pct = it.get("percentage", 0) or 0
+                qty_ml = round(vol * (pct / 100), 3)
+                variation_items.append({
+                    "mp": it["ingredient_name"],
+                    "fornecedor": it.get("fornecedor", "") or "",
+                    "percentual": pct,
+                    "qtd_ml": qty_ml,
+                    "unidade": "mL",
+                })
+        ingredientes_por_variacao[label] = variation_items
+
+    # Generate order number
+    count = await db.pd_batch_orders.count_documents({"tenant_id": user["tenant_id"]})
+    ordem_numero = f"OM-{datetime.now(timezone.utc).year}-{str(count + 1).zfill(5)}"
+
+    order_doc = {
+        "id": new_id(),
+        "tenant_id": user["tenant_id"],
+        "ordem_numero": ordem_numero,
+        "amostra_ids": data.amostra_ids,
+        "volume_por_amostra_ml": vol,
+        "n_amostras": n_amostras,
+        "base_compartilhada": base_items,
+        "ingredientes_por_variacao": ingredientes_por_variacao,
+        "observacao": data.observacao or "",
+        "criado_por": user["id"],
+        "criado_por_nome": user["name"],
+        "created_at": now_iso(),
+    }
+    await db.pd_batch_orders.insert_one(order_doc)
+    order_doc.pop("_id", None)
+
+    # Move all linked PD cards to em_desenvolvimento
+    for amostra_id in data.amostra_ids:
+        await db.pd_cards.update_many(
+            {"amostra_id": amostra_id, "tenant_id": user["tenant_id"]},
+            {"$set": {"status_pd": "em_desenvolvimento", "updated_at": now_iso()}}
+        )
+
+    return {**order_doc, "amostras_atualizadas": data.amostra_ids}
+
+
+@pd_router.get("/batch-manipulation")
+async def list_batch_orders(request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    orders = await db.pd_batch_orders.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return orders
+
+
+# ============================================================
+# PD-13: EXECUTOR ASSIGNMENT ON PD CARDS
+# ============================================================
+
+class ExecutorAssign(BaseModel):
+    executor_id: Optional[str] = None
+    executor_name: Optional[str] = None
+
+@pd_router.put("/pd-cards/{card_id}/executor")
+async def assign_executor(card_id: str, data: ExecutorAssign, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    card = await db.pd_cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not card:
+        raise HTTPException(status_code=404, detail="Card P&D não encontrado")
+    updates = {
+        "executor_id": data.executor_id,
+        "executor_name": data.executor_name,
+        "atribuido_em": now_iso(),
+        "atribuido_por": user["id"],
+        "atribuido_por_nome": user["name"],
+        "updated_at": now_iso(),
+    }
+    await db.pd_cards.update_one({"id": card_id}, {"$set": updates})
+    return {**card, **updates}
+
+
+# ============================================================
+# PD-16: LAB STOCK ALERT ON CRM SAMPLE CREATION (helper)
+# ============================================================
+
+async def check_lab_stock_for_product(produto_nome: str, tenant_id: str) -> Optional[dict]:
+    """Returns an alert if a finished sample already exists in lab stock."""
+    if not produto_nome:
+        return None
+    from datetime import date as date_cls
+    today_str = date_cls.today().isoformat()
+    item = await db.pd_stock_items.find_one({
+        "tenant_id": tenant_id,
+        "categoria": "amostra_acabada",
+        "nome": {"$regex": produto_nome.strip()[:40], "$options": "i"},
+        "quantidade_atual": {"$gt": 0},
+    }, {"_id": 0})
+    if not item:
+        return None
+    # Check validity
+    validade = item.get("validade")
+    if validade and validade < today_str:
+        return None
+    return {
+        "alerta": f"Há amostra em estoque: {item['nome']}",
+        "quantidade": item["quantidade_atual"],
+        "unidade": item.get("unidade_medida", "un"),
+        "localizacao": item.get("localizacao", ""),
+        "validade": validade,
+        "stock_item_id": item["id"],
+    }
+
+@pd_router.get("/stock/check-product")
+async def check_product_in_stock(produto_nome: str, request: Request):
+    """Check if a finished sample with this name exists in lab stock."""
+    user = await get_current_user(request)
+    require_roles(user, PD_READ)
+    alert = await check_lab_stock_for_product(produto_nome, user["tenant_id"])
+    return {"alert": alert}
+
+
+# ============================================================
+# PD-17: LINK INTERNAL RESEARCH TO CRM PROJECT
+# ============================================================
+
+class LinkToCRMProject(BaseModel):
+    crm_project_id: str
+    crm_client_id: Optional[str] = None
+    crm_client_name: Optional[str] = None
+
+@pd_router.put("/requests/{req_id}/link-to-crm")
+async def link_internal_research_to_crm(req_id: str, data: LinkToCRMProject, request: Request):
+    """Link an internal research request to a CRM project, converting it to a client-originated request."""
+    user = await get_current_user(request)
+    require_roles(user, PD_WRITE)
+    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not pd_req:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    if not pd_req.get("is_internal_research"):
+        raise HTTPException(status_code=400, detail="Esta solicitação já está vinculada a um projeto CRM")
+
+    # Verify CRM project exists
+    crm_project = await db.crm_projects.find_one({"id": data.crm_project_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not crm_project:
+        raise HTTPException(status_code=404, detail="Projeto CRM não encontrado")
+
+    old_origem = "interno"
+    updates = {
+        "is_internal_research": False,
+        "crm_project_id": data.crm_project_id,
+        "client_card_id": data.crm_client_id or crm_project.get("cliente_id"),
+        "client_name": data.crm_client_name or crm_project.get("cliente_nome", ""),
+        "vinculado_em": now_iso(),
+        "vinculado_por": user["id"],
+        "updated_at": now_iso(),
+    }
+    await db.pd_requests.update_one({"id": req_id}, {"$set": updates})
+
+    # Also update the pd_card
+    await db.pd_cards.update_many(
+        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
+        {"$set": {
+            "cliente_id": updates["client_card_id"],
+            "cliente": updates["client_name"],
+            "crm_project_id": data.crm_project_id,
+            "updated_at": now_iso(),
+        }}
+    )
+
+    # Audit log
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user["name"],
+            action="LINK_INTERNAL_TO_CRM",
+            resource_type="pd_request",
+            resource_id=req_id,
+            details={
+                "old_origem": old_origem,
+                "new_crm_project_id": data.crm_project_id,
+                "crm_project_name": crm_project.get("nome_projeto", ""),
+            }
+        )
+    except Exception:
+        pass
+
+    updated = await db.pd_requests.find_one({"id": req_id}, {"_id": 0})
+    return updated
+
+
+# ======================================================================
+#  PD-18: SAMPLE VARIATION LABEL PDF (A4, 2×2, 4 labels per page)
+# ======================================================================
+
+@pd_router.get("/samples/{variacao_id}/label.pdf")
+async def generate_sample_label(variacao_id: str, request: Request):
+    """Generate A4 sheet with 4 identical labels (2×2) for a sample variation."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
+    from datetime import date
+
+    user = await get_current_user(request)
+    if user["role"] not in (PD_FULL | {"admin"}):
+        raise HTTPException(status_code=403, detail="Acesso negado")
+
+    # Find the variation inside crm_samples
+    sample = await db.crm_samples.find_one(
+        {"tenant_id": user["tenant_id"], "variacoes.id": variacao_id},
+        {"_id": 0}
+    )
+    if not sample:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+
+    variacao = next((v for v in sample.get("variacoes", []) if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+
+    # Build label data
+    numero_amostra = f"{sample.get('numero_amostra', '?')}/{variacao.get('letra', 'A')}"
+    nome_produto = sample.get("nome_produto", "")
+    produto_tipo = sample.get("categoria", sample.get("tipo_amostra", ""))
+    responsavel = sample.get("responsavel_pd", "")
+    now_date = date.today()
+    data_fabricacao = now_date.strftime("%d/%m/%Y")
+    val_month = now_date.month + 6
+    val_year = now_date.year + (val_month - 1) // 12
+    val_month = ((val_month - 1) % 12) + 1
+    validade_date = now_date.replace(year=val_year, month=val_month)
+    data_validade = validade_date.strftime("%d/%m/%Y")
+    observacoes = variacao.get("observacoes_especificas", "") or sample.get("observacao_tecnica", "")
+
+    # PDF generation: A4, four 9.5cm×6cm labels in a 2×2 grid
+    buffer = io.BytesIO()
+    page_w, page_h = A4  # points
+    c = rl_canvas.Canvas(buffer, pagesize=A4)
+
+    label_w = 95 * mm
+    label_h = 60 * mm
+    margin_x = (page_w - 2 * label_w) / 2
+    margin_y = (page_h - 2 * label_h) / 2
+
+    positions = [
+        (margin_x, margin_y + label_h),            # top-left
+        (margin_x + label_w, margin_y + label_h),   # top-right
+        (margin_x, margin_y),                        # bottom-left
+        (margin_x + label_w, margin_y),              # bottom-right
+    ]
+
+    border_color = rl_colors.HexColor("#222222")
+    bg_header = rl_colors.HexColor("#0A0A0B")
+
+    def draw_label(x, y):
+        c.setStrokeColor(border_color)
+        c.setLineWidth(0.8)
+        c.rect(x, y, label_w, label_h)
+
+        c.setFillColor(bg_header)
+        c.rect(x, y + label_h - 10 * mm, label_w, 10 * mm, fill=1, stroke=0)
+
+        c.setFillColor(rl_colors.white)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(x + 3 * mm, y + label_h - 6 * mm, "KURYOS BEAUTY")
+        c.setFont("Helvetica", 7)
+        c.drawRightString(x + label_w - 3 * mm, y + label_h - 6 * mm, f"Nr {numero_amostra}")
+
+        row_h = 7.5 * mm
+        rows = [
+            ("Produto:", nome_produto[:40]),
+            ("Tipo:", produto_tipo.replace("_", " ").title()[:40] if produto_tipo else "-"),
+            ("Responsavel:", responsavel[:40] if responsavel else "-"),
+            ("Fabricacao:", data_fabricacao),
+            ("Validade:", data_validade),
+            ("Obs:", (observacoes[:55] if observacoes else "-")),
+        ]
+        c.setFillColor(rl_colors.black)
+        for i, (label_txt, value_txt) in enumerate(rows):
+            row_y = y + label_h - 10 * mm - (i + 1) * row_h + 2.5 * mm
+            c.setFont("Helvetica-Bold", 6.5)
+            c.drawString(x + 3 * mm, row_y, label_txt)
+            c.setFont("Helvetica", 6.5)
+            c.drawString(x + 26 * mm, row_y, value_txt)
+
+        c.setStrokeColor(rl_colors.HexColor("#CCCCCC"))
+        c.setDash(2, 2)
+        c.setLineWidth(0.3)
+        c.rect(x + 1 * mm, y + 1 * mm, label_w - 2 * mm, label_h - 2 * mm)
+        c.setDash()
+
+    for px, py in positions:
+        draw_label(px, py)
+
+    c.showPage()
+    c.save()
+
+    buffer.seek(0)
+    filename = f"etiqueta_{numero_amostra.replace('/', '-')}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
+import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd";
 import { useParams, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import api from "@/lib/api";
@@ -15,6 +16,7 @@ import { Switch } from "@/components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { BACKEND_URL } from "@/lib/backend";
+import { FieldHint } from "@/components/ui/FieldHint";
 import {
   ArrowLeft, FlaskConical, Clock, Plus, Trash2, CheckCircle2, XCircle,
   Loader2, ArrowRight, FileText, DollarSign, Beaker, Package, History,
@@ -191,6 +193,61 @@ export default function PDDetail() {
   const pendingCount = (pending || []).filter(p => p.status === "pendente").length;
   const isInternalResearch = !!req.is_internal_research;
   const canViewCommercial = authUser && ["admin", "compras"].includes(authUser.role);
+  const canLinkToCRM = authUser && ["admin", "lider_pd", "formulador", "engenharia_produto", "vendedor", "sales_ops"].includes(authUser.role);
+  const [showLinkCRM, setShowLinkCRM] = useState(false);
+  const [crmProjectSearch, setCrmProjectSearch] = useState("");
+  const [crmProjects, setCrmProjects] = useState([]);
+  const [crmSearchLoading, setCrmSearchLoading] = useState(false);
+  const [linkingCRM, setLinkingCRM] = useState(false);
+  const [selectedCRMProject, setSelectedCRMProject] = useState(null);
+
+  const searchCRMProjects = useCallback(async (q) => {
+    if (!q || q.length < 2) { setCrmProjects([]); return; }
+    setCrmSearchLoading(true);
+    try {
+      const { data } = await api.get("/crm/projects", { params: { search: q, limit: 10 } });
+      setCrmProjects(Array.isArray(data.items || data) ? (data.items || data) : []);
+    } catch { setCrmProjects([]); } finally { setCrmSearchLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => searchCRMProjects(crmProjectSearch), 300);
+    return () => clearTimeout(t);
+  }, [crmProjectSearch, searchCRMProjects]);
+
+  const linkToCRM = async () => {
+    if (!selectedCRMProject) return toast.error("Selecione um projeto CRM");
+    setLinkingCRM(true);
+    try {
+      await api.put(`/pd/requests/${id}/link-to-crm`, {
+        crm_project_id: selectedCRMProject.id,
+        crm_client_id: selectedCRMProject.client_id || selectedCRMProject.crm_client_id,
+        crm_client_name: selectedCRMProject.client_name || selectedCRMProject.crm_client_name || "",
+      });
+      toast.success("Pesquisa vinculada ao projeto CRM!");
+      setShowLinkCRM(false);
+      fetchData();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao vincular"); }
+    finally { setLinkingCRM(false); }
+  };
+
+  const canDownloadTechSheet = authUser && ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "pcp", "supervisor", "vendedor", "sales_ops"].includes(authUser.role);
+
+  const downloadTechSheet = async () => {
+    if (!req.crm_sample_id) return toast.error("Amostra CRM não vinculada");
+    try {
+      const response = await api.get(`/pd/samples/${req.crm_sample_id}/tech-sheet.pdf`, { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `ficha_tecnica_${req.project_name?.replace(/\s/g, "_") || "pd"}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      toast.success("Ficha técnica gerada (sem valores monetários)!");
+    } catch (err) { toast.error("Erro ao gerar ficha técnica"); }
+  };
 
   return (
     <div className="h-full overflow-auto">
@@ -233,24 +290,103 @@ export default function PDDetail() {
                 Ficha Técnica PDF
               </Button>
             )}
+            {hasDev && req.crm_sample_id && canDownloadTechSheet && (
+              <Button size="sm" variant="outline" onClick={downloadTechSheet} className="gap-1.5 border-sky-300 text-sky-700 hover:bg-sky-50">
+                <FileText className="h-3.5 w-3.5" />
+                Ficha Técnica (sem custos)
+              </Button>
+            )}
+            {isInternalResearch && canLinkToCRM && !req.crm_project_id && (
+              <Button size="sm" variant="outline" onClick={() => setShowLinkCRM(true)} className="gap-1.5 border-purple-300 text-purple-700 hover:bg-purple-50">
+                <GitBranch className="h-3.5 w-3.5" />
+                Vincular a projeto CRM
+              </Button>
+            )}
+            {req.crm_project_id && (
+              <Badge className="bg-purple-500/10 text-purple-700 border-purple-300 text-[10px] gap-1">
+                <GitBranch className="h-3 w-3" /> Vinculado ao CRM
+              </Badge>
+            )}
             {canEdit && BACKWARD_TRANSITIONS[req.status] && (
               <Button size="sm" variant="outline" onClick={() => { setBackwardJustification(""); setShowBackwardDialog(true); }} className="gap-1.5 text-muted-foreground border-dashed">
                 <ArrowLeft className="h-3.5 w-3.5" /> Retroceder
               </Button>
             )}
-            {canEdit && allowedNext.map(ns => (
-              <Button
-                key={ns}
-                size="sm"
-                variant={ns === "REJECTED" ? "destructive" : "default"}
-                onClick={() => handleStatusChange(ns)}
-                className="gap-1.5"
-              >
-                {ns === "REJECTED" ? <XCircle className="h-3.5 w-3.5" /> : <ArrowRight className="h-3.5 w-3.5" />}
-                {STATUS_CONFIG[ns]?.label}
-              </Button>
-            ))}
+            {canEdit && allowedNext.map(ns => {
+              const isEntrega = req.status === "IN_TESTS" && ns === "WAITING_APPROVAL";
+              const label = isEntrega ? "Entregar ao Comercial" : STATUS_CONFIG[ns]?.label;
+              const Icon = ns === "REJECTED" ? XCircle : isEntrega ? Send : ArrowRight;
+              return (
+                <Button
+                  key={ns}
+                  size="sm"
+                  variant={ns === "REJECTED" ? "destructive" : "default"}
+                  onClick={() => handleStatusChange(ns)}
+                  className="gap-1.5"
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {label}
+                </Button>
+              );
+            })}
           </div>
+
+          {/* PD-17: Link to CRM modal */}
+          {showLinkCRM && (
+            <Dialog open onOpenChange={(open) => !open && setShowLinkCRM(false)}>
+              <DialogContent className="max-w-lg">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <GitBranch className="h-4 w-4 text-purple-500" /> Vincular a Projeto CRM
+                  </DialogTitle>
+                  <DialogDescription>
+                    Associe esta pesquisa interna a um projeto existente no CRM Comercial.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-3">
+                  <div>
+                    <Label>Buscar projeto CRM</Label>
+                    <Input
+                      value={crmProjectSearch}
+                      onChange={e => { setCrmProjectSearch(e.target.value); setSelectedCRMProject(null); }}
+                      placeholder="Nome do projeto ou cliente..."
+                      className="mt-1"
+                    />
+                  </div>
+                  {crmSearchLoading && <p className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" /> Buscando...</p>}
+                  {crmProjects.length > 0 && (
+                    <div className="border rounded-md divide-y max-h-48 overflow-y-auto">
+                      {crmProjects.map(p => (
+                        <button
+                          key={p.id}
+                          onClick={() => setSelectedCRMProject(p)}
+                          className={`w-full flex items-start gap-2 p-2.5 text-left hover:bg-muted/50 transition-colors text-sm ${selectedCRMProject?.id === p.id ? "bg-primary/10 border-l-2 border-primary" : ""}`}
+                        >
+                          <div className="flex-1 min-w-0">
+                            <p className="font-medium truncate">{p.name || p.nome_projeto || p.produto}</p>
+                            <p className="text-xs text-muted-foreground truncate">{p.client_name || p.cliente}</p>
+                          </div>
+                          {selectedCRMProject?.id === p.id && <CheckCircle2 className="h-4 w-4 text-primary shrink-0 mt-0.5" />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {selectedCRMProject && (
+                    <div className="p-2 rounded border border-primary/30 bg-primary/5 text-sm">
+                      <span className="font-medium">Selecionado:</span> {selectedCRMProject.name || selectedCRMProject.nome_projeto} — {selectedCRMProject.client_name || selectedCRMProject.cliente}
+                    </div>
+                  )}
+                </div>
+                <DialogFooter>
+                  <Button variant="ghost" onClick={() => setShowLinkCRM(false)}>Cancelar</Button>
+                  <Button onClick={linkToCRM} disabled={!selectedCRMProject || linkingCRM} className="gap-1.5">
+                    {linkingCRM ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <GitBranch className="h-3.5 w-3.5" />}
+                    Vincular
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
 
           {showBackwardDialog && (
             <Dialog open onOpenChange={(open) => !open && setShowBackwardDialog(false)}>
@@ -334,7 +470,7 @@ export default function PDDetail() {
 
           <TabsContent value="samples">
             {hasDev ? (
-              <SamplesTab devId={dev.id} samples={samples} formulas={formulas} onRefresh={fetchData} canEdit={canEdit} />
+              <SamplesTab devId={dev.id} samples={samples} formulas={formulas} onRefresh={fetchData} canEdit={canEdit} productName={req.project_name || ""} />
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
@@ -354,7 +490,7 @@ export default function PDDetail() {
 
           <TabsContent value="costs">
             {hasDev ? (
-              <CostsTab devId={dev.id} costVersions={cost_versions} formulas={formulas} formulaCostData={formula_cost_data} onRefresh={fetchData} canEdit={canEdit} />
+              <CostsTab devId={dev.id} costVersions={cost_versions} formulas={formulas} formulaCostData={formula_cost_data} onRefresh={fetchData} canEdit={canEdit} canViewCommercial={canViewCommercial} />
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
@@ -859,9 +995,20 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
         )}
       </div>
 
-      {/* Right: Timeline */}
-      <div>
+      {/* Right: Progress Timeline + History */}
+      <div className="space-y-4">
         <Card className="sticky top-6">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <CheckCircle className="h-4 w-4 text-green-500" />
+              Progresso
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <SampleProgressTimeline req={req} formulas={formulas} tests={tests} samples={samples} approval={approval} />
+          </CardContent>
+        </Card>
+        <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base flex items-center gap-2">
               <History className="h-4 w-4" />
@@ -1324,6 +1471,11 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
 
                 {f.notes && <p className="text-xs text-muted-foreground italic">{f.notes}</p>}
 
+                {/* PD-08: Phase editor */}
+                <div className="border rounded-md p-3 bg-muted/20">
+                  <FormulaPhaseEditor formulaId={f.id} canEdit={canEdit} />
+                </div>
+
                 {/* Spreadsheet-like table with cost columns */}
                 <div className="border rounded-md overflow-hidden">
                   <table className="w-full text-sm">
@@ -1518,7 +1670,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         placeholder="Fornecedor" className="h-8 text-sm" />
                     </div>
                     <div className="w-20">
-                      <Label className="text-[11px] text-muted-foreground">%Fórmula</Label>
+                      <Label className="text-[11px] text-muted-foreground"><FieldHint hint="Percentual em massa deste ingrediente na fórmula total. A soma de todos os ingredientes deve ser 100%.">%Fórmula</FieldHint></Label>
                       <Input type="number" step="0.001" value={newItem.percentage}
                         onChange={e => setNewItem(p => ({ ...p, percentage: e.target.value }))}
                         placeholder="0.000" className="h-8 text-sm font-mono" />
@@ -3138,7 +3290,7 @@ function TestsTab({ devId, labResults, onRefresh, canEdit }) {
               <Input value={form.ph.faixa_aceitavel || ""} onChange={e => updateField("ph", "faixa_aceitavel", e.target.value)} placeholder="Ex: 5.0 - 6.0" disabled={!canEdit} />
             </div>
             <div>
-              <Label className="text-xs text-muted-foreground">Temperatura (°C)</Label>
+              <Label className="text-xs text-muted-foreground"><FieldHint hint="Temperatura da amostra no momento da medição de pH. Deve ser registrada pois afeta o resultado.">Temperatura (°C)</FieldHint></Label>
               <Input value={form.ph.temperatura || ""} onChange={e => updateField("ph", "temperatura", e.target.value)} placeholder="Ex: 25" disabled={!canEdit} />
             </div>
             <div>
@@ -3172,7 +3324,7 @@ function TestsTab({ devId, labResults, onRefresh, canEdit }) {
               <Input value={form.viscosidade.spindle || ""} onChange={e => updateField("viscosidade", "spindle", e.target.value)} placeholder="Ex: S64 / 20 rpm" disabled={!canEdit} />
             </div>
             <div>
-              <Label className="text-xs text-muted-foreground">Temperatura (°C)</Label>
+              <Label className="text-xs text-muted-foreground"><FieldHint hint="Temperatura da amostra durante a medição. Viscosidade varia com temperatura — registrar garante reprodutibilidade.">Temperatura (°C)</FieldHint></Label>
               <Input value={form.viscosidade.temperatura || ""} onChange={e => updateField("viscosidade", "temperatura", e.target.value)} placeholder="Ex: 25" disabled={!canEdit} />
             </div>
             <div className="col-span-2">
@@ -3265,19 +3417,37 @@ function TestsTab({ devId, labResults, onRefresh, canEdit }) {
 }
 
 /* ============ SAMPLES TAB ============ */
-function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
+function SamplesTab({ devId, samples, formulas, onRefresh, canEdit, productName }) {
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({ formula_version: formulas[0]?.version || 1, sent_to_client: false, feedback: "" });
   const [editingId, setEditingId] = useState(null);
   const [editFeedback, setEditFeedback] = useState("");
   const [sampleVolume, setSampleVolume] = useState(15);
   const [showOrderId, setShowOrderId] = useState(null);
+  const [stockAlert, setStockAlert] = useState(null); // { found, items }
+  const [checkingStock, setCheckingStock] = useState(false);
+
+  const handleNewSample = async () => {
+    if (!productName) { setShowCreate(true); return; }
+    setCheckingStock(true);
+    try {
+      const { data } = await api.get("/pd/stock/check-product", { params: { produto_nome: productName } });
+      if (data.found) {
+        setStockAlert(data);
+      } else {
+        setShowCreate(true);
+      }
+    } catch {
+      setShowCreate(true);
+    } finally { setCheckingStock(false); }
+  };
 
   const createSample = async () => {
     try {
       await api.post(`/pd/developments/${devId}/samples`, form);
       toast.success("Amostra registrada!");
       setShowCreate(false);
+      setStockAlert(null);
       onRefresh();
     } catch (err) { toast.error("Erro ao registrar amostra"); }
   };
@@ -3316,11 +3486,38 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit }) {
             />
             <span className="text-xs text-muted-foreground">mL</span>
           </div>
-          <Button size="sm" onClick={() => setShowCreate(true)} className="gap-1.5" disabled={!canEdit}>
-            <Plus className="h-3.5 w-3.5" /> Nova Amostra
+          <Button size="sm" onClick={handleNewSample} className="gap-1.5" disabled={!canEdit || checkingStock}>
+            {checkingStock ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />} Nova Amostra
           </Button>
         </div>
       </div>
+
+      {/* PD-16: Stock check alert */}
+      {stockAlert && (
+        <Card className="border-amber-300 bg-amber-50/50 dark:bg-amber-950/20">
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-600 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-semibold text-sm text-amber-800 dark:text-amber-300">Produto encontrado no estoque do lab!</p>
+                <p className="text-xs text-amber-700 dark:text-amber-400 mt-0.5">
+                  Já existe {stockAlert.count} unidade(s) de "{productName}" em estoque ({stockAlert.items?.map(i => `${i.quantidade} ${i.unidade}`).join(", ")}).
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">Deseja usar o estoque existente ou criar uma nova amostra?</p>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={() => { setStockAlert(null); toast.info("Use o módulo de Estoque para dar baixa."); }} className="gap-1 border-amber-300 text-amber-700">
+                <Package className="h-3 w-3" /> Usar estoque existente
+              </Button>
+              <Button size="sm" onClick={() => { setStockAlert(null); setShowCreate(true); }} className="gap-1">
+                <Plus className="h-3 w-3" /> Criar nova amostra mesmo assim
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setStockAlert(null)}>Cancelar</Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {showCreate && (
         <Card className="border-primary/50">
@@ -3523,7 +3720,7 @@ function ManipulacaoOrder({ formulaId, sampleVolume }) {
 }
 
 /* ============ COSTS TAB — P&D view (ingredient costs + submit to Compras) ============ */
-function CostsTab({ devId, costVersions, formulas, formulaCostData, onRefresh, canEdit }) {
+function CostsTab({ devId, costVersions, formulas, formulaCostData, onRefresh, canEdit, canViewCommercial }) {
   const v1 = costVersions?.v1 || {};
   const v2summary = costVersions?.v2 || null;
   const totalFinal = costVersions?.total_final;
@@ -3745,7 +3942,127 @@ function CostsTab({ devId, costVersions, formulas, formulaCostData, onRefresh, c
           </CardContent>
         </Card>
       )}
+
+      {/* PD-07: Per-formula cost snapshots */}
+      {formulas.map(f => (
+        <FormulaCostVersionsPanel key={f.id} formula={f} canViewCommercial={canViewCommercial} canEdit={canEdit} />
+      ))}
     </div>
+  );
+}
+
+/* ============ PD-07: FORMULA COST VERSIONS PANEL ============ */
+function FormulaCostVersionsPanel({ formula, canViewCommercial, canEdit }) {
+  const [versions, setVersions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showSave, setShowSave] = useState(false);
+  const [saveForm, setSaveForm] = useState({ custo_embalagem: "", custo_mao_obra: "" });
+  const [saving, setSaving] = useState(false);
+
+  const fetchVersions = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get(`/pd/formulas/${formula.id}/costs`);
+      setVersions(Array.isArray(data) ? data : []);
+    } catch { setVersions([]); } finally { setLoading(false); }
+  }, [formula.id]);
+
+  useEffect(() => { fetchVersions(); }, [fetchVersions]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.post(`/pd/formulas/${formula.id}/costs`, {
+        custo_embalagem: parseFloat(saveForm.custo_embalagem) || 0,
+        custo_mao_obra: parseFloat(saveForm.custo_mao_obra) || 0,
+      });
+      toast.success("Versão de custo salva!");
+      setShowSave(false);
+      setSaveForm({ custo_embalagem: "", custo_mao_obra: "" });
+      fetchVersions();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao salvar versão");
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <Card className="border-purple-200/50">
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <History className="h-3.5 w-3.5 text-purple-500" />
+            Versões de Custo — {formula.name}
+            <Badge variant="outline" className="text-[9px]">v{formula.version}</Badge>
+          </CardTitle>
+          {canEdit && (
+            <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => setShowSave(s => !s)}>
+              <Plus className="h-3 w-3" /> Salvar versão de custo
+            </Button>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {showSave && (
+          <div className="p-3 border rounded-md bg-muted/30 space-y-2">
+            {canViewCommercial && (
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Label className="text-xs">Custo Embalagem (R$/un)</Label>
+                  <Input type="number" step="0.01" value={saveForm.custo_embalagem} onChange={e => setSaveForm(f => ({ ...f, custo_embalagem: e.target.value }))} className="h-7 text-xs mt-0.5" placeholder="0.00" />
+                </div>
+                <div>
+                  <Label className="text-xs">Custo Mão de Obra (R$/un)</Label>
+                  <Input type="number" step="0.01" value={saveForm.custo_mao_obra} onChange={e => setSaveForm(f => ({ ...f, custo_mao_obra: e.target.value }))} className="h-7 text-xs mt-0.5" placeholder="0.00" />
+                </div>
+              </div>
+            )}
+            {!canViewCommercial && (
+              <p className="text-xs text-muted-foreground italic">Snapshot de custo de MP gerado automaticamente a partir dos itens da fórmula.</p>
+            )}
+            <div className="flex gap-2">
+              <Button size="sm" onClick={handleSave} disabled={saving} className="gap-1.5 h-7 text-xs">
+                <Save className="h-3 w-3" /> {saving ? "Salvando..." : "Salvar Snapshot"}
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setShowSave(false)} className="h-7 text-xs">Cancelar</Button>
+            </div>
+          </div>
+        )}
+        {loading ? (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground py-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Carregando...</div>
+        ) : versions.length === 0 ? (
+          <p className="text-xs text-muted-foreground italic">Nenhuma versão de custo registrada ainda.</p>
+        ) : (
+          <div className="space-y-2">
+            {versions.map((v, i) => (
+              <div key={v.id} className={`flex items-start gap-3 p-2 rounded border ${i === 0 ? "border-purple-200 bg-purple-50/30 dark:bg-purple-950/20" : "bg-muted/20"}`}>
+                <div className="flex flex-col items-center mt-0.5">
+                  <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold border ${i === 0 ? "bg-purple-500 text-white border-purple-500" : "bg-muted text-muted-foreground border-border"}`}>
+                    v{v.versao}
+                  </div>
+                  {i < versions.length - 1 && <div className="w-px flex-1 bg-border mt-0.5" style={{ minHeight: 8 }} />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-semibold text-green-700">MP: R$ {(v.custo_mp_total || 0).toFixed(2)}</span>
+                    {canViewCommercial && v.custo_embalagem != null && (
+                      <>
+                        <span className="text-xs text-muted-foreground">Embal.: R$ {(v.custo_embalagem || 0).toFixed(2)}</span>
+                        <span className="text-xs text-muted-foreground">M.O.: R$ {(v.custo_mao_obra || 0).toFixed(2)}</span>
+                        <span className="text-xs font-bold text-primary">Total: R$ {(v.custo_total || 0).toFixed(2)}</span>
+                      </>
+                    )}
+                    {i === 0 && <Badge className="text-[9px] bg-purple-500/10 text-purple-700 border-purple-300">Mais recente</Badge>}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground mt-0.5">
+                    {v.created_by_name && <>{v.created_by_name} • </>}{new Date(v.created_at).toLocaleDateString("pt-BR")}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -4160,6 +4477,220 @@ function EmptyState({ icon: Icon, title, subtitle }) {
   );
 }
 
+/* ============ PD-08: FORMULA PHASE EDITOR ============ */
+function FormulaPhaseEditor({ formulaId, canEdit }) {
+  const [phases, setPhases] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [addForm, setAddForm] = useState({ titulo: "", descricao: "", temperatura: "" });
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const fetchPhases = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get(`/pd/formulas/${formulaId}/phases`);
+      setPhases(Array.isArray(data) ? data : []);
+    } catch { setPhases([]); } finally { setLoading(false); }
+  }, [formulaId]);
+
+  useEffect(() => { fetchPhases(); }, [fetchPhases]);
+
+  const addPhase = async () => {
+    if (!addForm.titulo.trim()) return toast.error("Título da fase é obrigatório");
+    setSaving(true);
+    try {
+      await api.post(`/pd/formulas/${formulaId}/phases`, addForm);
+      setAddForm({ titulo: "", descricao: "", temperatura: "" });
+      setShowAdd(false);
+      fetchPhases();
+    } catch (err) { toast.error(err.response?.data?.detail || "Erro ao adicionar fase"); }
+    finally { setSaving(false); }
+  };
+
+  const saveEdit = async (phaseId) => {
+    try {
+      await api.put(`/pd/formula-phases/${phaseId}`, editForm);
+      setEditingId(null);
+      fetchPhases();
+    } catch (err) { toast.error("Erro ao salvar"); }
+  };
+
+  const deletePhase = async (phaseId) => {
+    if (!window.confirm("Remover esta fase?")) return;
+    try { await api.delete(`/pd/formula-phases/${phaseId}`); fetchPhases(); }
+    catch (err) { toast.error("Erro ao remover"); }
+  };
+
+  const onDragEnd = async (result) => {
+    if (!result.destination || result.destination.index === result.source.index) return;
+    const reordered = Array.from(phases);
+    const [moved] = reordered.splice(result.source.index, 1);
+    reordered.splice(result.destination.index, 0, moved);
+    setPhases(reordered);
+    try {
+      await api.put(`/pd/formulas/${formulaId}/phases/reorder`, { phase_ids: reordered.map(p => p.id) });
+    } catch { fetchPhases(); }
+  };
+
+  if (loading) return <div className="flex items-center gap-2 text-xs text-muted-foreground py-2"><Loader2 className="h-3.5 w-3.5 animate-spin" /> Carregando fases...</div>;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold flex items-center gap-1.5 text-muted-foreground uppercase tracking-wide">
+          <ClipboardList className="h-3.5 w-3.5" /> Fases de Elaboração
+        </span>
+        {canEdit && (
+          <Button size="sm" variant="ghost" className="h-6 text-xs gap-1" onClick={() => setShowAdd(s => !s)}>
+            <Plus className="h-3 w-3" /> Adicionar fase
+          </Button>
+        )}
+      </div>
+
+      {showAdd && (
+        <div className="p-2 border rounded bg-muted/30 space-y-2">
+          <Input value={addForm.titulo} onChange={e => setAddForm(f => ({ ...f, titulo: e.target.value }))} placeholder="Título da fase (ex: Fase A, Aquosa...)" className="h-7 text-xs" />
+          <div className="grid grid-cols-2 gap-2">
+            <Input value={addForm.temperatura} onChange={e => setAddForm(f => ({ ...f, temperatura: e.target.value }))} placeholder="Temperatura (ex: 80°C)" className="h-7 text-xs" />
+            <Textarea value={addForm.descricao} onChange={e => setAddForm(f => ({ ...f, descricao: e.target.value }))} placeholder="Instruções de elaboração..." rows={2} className="text-xs" />
+          </div>
+          <div className="flex gap-1.5">
+            <Button size="sm" className="h-7 text-xs gap-1" onClick={addPhase} disabled={saving}><Save className="h-3 w-3" /> Salvar</Button>
+            <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => setShowAdd(false)}>Cancelar</Button>
+          </div>
+        </div>
+      )}
+
+      {phases.length === 0 && !showAdd && (
+        <p className="text-xs text-muted-foreground italic py-1">Nenhuma fase definida. {canEdit ? "Adicione fases de elaboração para este produto." : ""}</p>
+      )}
+
+      <DragDropContext onDragEnd={onDragEnd}>
+        <Droppable droppableId={`phases-${formulaId}`}>
+          {(provided) => (
+            <div ref={provided.innerRef} {...provided.droppableProps} className="space-y-1">
+              {phases.map((phase, idx) => (
+                <Draggable key={phase.id} draggableId={phase.id} index={idx} isDragDisabled={!canEdit}>
+                  {(drag, snapshot) => (
+                    <div
+                      ref={drag.innerRef}
+                      {...drag.draggableProps}
+                      className={`flex items-start gap-2 p-2 rounded border text-xs ${snapshot.isDragging ? "bg-muted shadow-md" : "bg-background hover:bg-muted/30"}`}
+                    >
+                      {canEdit && (
+                        <div {...drag.dragHandleProps} className="mt-0.5 cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground">
+                          <Layers className="h-3.5 w-3.5" />
+                        </div>
+                      )}
+                      <div className="flex items-center justify-center h-5 w-5 rounded-full bg-primary/10 text-primary font-bold text-[10px] shrink-0 mt-0.5">
+                        {idx + 1}
+                      </div>
+                      {editingId === phase.id ? (
+                        <div className="flex-1 space-y-1">
+                          <Input value={editForm.titulo} onChange={e => setEditForm(f => ({ ...f, titulo: e.target.value }))} className="h-6 text-xs" />
+                          <div className="grid grid-cols-2 gap-1">
+                            <Input value={editForm.temperatura || ""} onChange={e => setEditForm(f => ({ ...f, temperatura: e.target.value }))} placeholder="Temp." className="h-6 text-xs" />
+                            <Textarea value={editForm.descricao || ""} onChange={e => setEditForm(f => ({ ...f, descricao: e.target.value }))} rows={2} className="text-xs" />
+                          </div>
+                          <div className="flex gap-1">
+                            <button onClick={() => saveEdit(phase.id)} className="text-green-600 hover:text-green-700"><Save className="h-3 w-3" /></button>
+                            <button onClick={() => setEditingId(null)} className="text-muted-foreground hover:text-red-500"><X className="h-3 w-3" /></button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex-1 min-w-0">
+                          <span className="font-semibold">{phase.titulo}</span>
+                          {phase.temperatura && <span className="ml-1.5 text-muted-foreground">({phase.temperatura})</span>}
+                          {phase.descricao && <p className="text-muted-foreground mt-0.5 whitespace-pre-wrap">{phase.descricao}</p>}
+                        </div>
+                      )}
+                      {canEdit && editingId !== phase.id && (
+                        <div className="flex gap-1 shrink-0">
+                          <button onClick={() => { setEditingId(phase.id); setEditForm({ titulo: phase.titulo, descricao: phase.descricao || "", temperatura: phase.temperatura || "" }); }} className="text-muted-foreground hover:text-blue-500"><Pencil className="h-3 w-3" /></button>
+                          <button onClick={() => deletePhase(phase.id)} className="text-muted-foreground hover:text-red-500"><Trash2 className="h-3 w-3" /></button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </Draggable>
+              ))}
+              {provided.placeholder}
+            </div>
+          )}
+        </Droppable>
+      </DragDropContext>
+    </div>
+  );
+}
+
+/* ============ PD-11: 9-STAGE PROGRESS TIMELINE ============ */
+const PIPELINE_STAGES = [
+  { id: "solicitacao", label: "Solicitação recebida", icon: ClipboardList, color: "text-blue-500" },
+  { id: "contato_fornecedores", label: "Contato fornecedores", icon: Building2, color: "text-indigo-500" },
+  { id: "formulacao", label: "Formulação", icon: Beaker, color: "text-purple-500" },
+  { id: "testes", label: "Testes em Lab", icon: TestTube, color: "text-cyan-500" },
+  { id: "ficha_tecnica", label: "Ficha Técnica", icon: FileText, color: "text-sky-500" },
+  { id: "estabilidades", label: "Estabilidades", icon: Thermometer, color: "text-orange-500" },
+  { id: "entregue_comercial", label: "Entregue ao Comercial", icon: Send, color: "text-amber-500" },
+  { id: "enviada_cliente", label: "Enviada ao Cliente", icon: Package, color: "text-rose-500" },
+  { id: "aprovacao_cliente", label: "Aprovação do Cliente", icon: ThumbsUp, color: "text-green-500" },
+];
+
+function computeTimelineStages(req, formulas = [], tests = [], samples = [], approval = null) {
+  const s = req.status;
+  const advanced = ["IN_TESTS", "WAITING_APPROVAL", "APPROVED", "COMPLETED"].includes(s);
+  const veryAdvanced = ["WAITING_APPROVAL", "APPROVED", "COMPLETED"].includes(s);
+  return [
+    { ...PIPELINE_STAGES[0], done: true, current: s === "OPEN" },
+    { ...PIPELINE_STAGES[1], done: s !== "OPEN", current: s === "IN_PROGRESS" && formulas.length === 0 },
+    { ...PIPELINE_STAGES[2], done: formulas.length > 0, current: s === "IN_PROGRESS" && formulas.length > 0 },
+    { ...PIPELINE_STAGES[3], done: advanced, current: s === "IN_TESTS" },
+    { ...PIPELINE_STAGES[4], done: veryAdvanced, current: false },
+    { ...PIPELINE_STAGES[5], done: veryAdvanced, current: false },
+    { ...PIPELINE_STAGES[6], done: veryAdvanced, current: s === "WAITING_APPROVAL" },
+    { ...PIPELINE_STAGES[7], done: veryAdvanced && samples.length > 0, current: false },
+    { ...PIPELINE_STAGES[8], done: ["APPROVED", "COMPLETED"].includes(s) || !!approval?.approved_by_client, current: ["APPROVED", "COMPLETED"].includes(s) },
+  ];
+}
+
+function SampleProgressTimeline({ req, formulas, tests, samples, approval }) {
+  const stages = computeTimelineStages(req, formulas, tests, samples, approval);
+  return (
+    <div className="space-y-0">
+      {stages.map((stage, i) => {
+        const Icon = stage.icon;
+        const isLast = i === stages.length - 1;
+        return (
+          <div key={stage.id} className="flex gap-3">
+            <div className="flex flex-col items-center">
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center border-2 shrink-0 transition-all ${
+                stage.done
+                  ? "bg-green-500 border-green-500 text-white"
+                  : stage.current
+                  ? "bg-primary border-primary text-primary-foreground animate-pulse"
+                  : "bg-muted border-border text-muted-foreground"
+              }`}>
+                {stage.done ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Icon className="h-3 w-3" />}
+              </div>
+              {!isLast && <div className={`w-px flex-1 my-0.5 ${stage.done ? "bg-green-400" : "bg-border"}`} style={{ minHeight: 16 }} />}
+            </div>
+            <div className={`pb-3 ${isLast ? "" : ""}`}>
+              <p className={`text-xs font-medium leading-tight mt-1 ${stage.done ? "text-foreground" : stage.current ? "text-primary font-semibold" : "text-muted-foreground"}`}>
+                {stage.label}
+              </p>
+              {stage.current && (
+                <p className="text-[10px] text-primary/70 mt-0.5">Etapa atual</p>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ============ UPDATES TAB (Atualizações + Pendências) ============ */
 const PENDING_TYPES = [
   { id: "fragrancia", label: "Fragrância", icon: "🌸" },
@@ -4180,6 +4711,9 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
   const [showNewUpdate, setShowNewUpdate] = useState(false);
   const [newUpdateMsg, setNewUpdateMsg] = useState("");
   const [newUpdateVisible, setNewUpdateVisible] = useState(true);
+  const [newUpdateItemSolicitado, setNewUpdateItemSolicitado] = useState("");
+  const [newUpdateFornecedor, setNewUpdateFornecedor] = useState("");
+  const [newUpdatePrevisaoEntrega, setNewUpdatePrevisaoEntrega] = useState("");
   const [showNewPending, setShowNewPending] = useState(false);
   const [pendingForm, setPendingForm] = useState({
     tipo: "fragrancia",
@@ -4196,11 +4730,14 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
     try {
       await api.post(`/pd/requests/${reqId}/updates`, {
         mensagem: newUpdateMsg,
-        tipo: "observacao",
+        tipo: newUpdateItemSolicitado ? "material_request" : "observacao",
         visivel_comercial: newUpdateVisible,
+        ...(newUpdateItemSolicitado && { item_solicitado: newUpdateItemSolicitado }),
+        ...(newUpdateFornecedor && { fornecedor: newUpdateFornecedor }),
+        ...(newUpdatePrevisaoEntrega && { previsao_entrega: newUpdatePrevisaoEntrega }),
       });
       toast.success("Atualização publicada");
-      setNewUpdateMsg("");
+      setNewUpdateMsg(""); setNewUpdateItemSolicitado(""); setNewUpdateFornecedor(""); setNewUpdatePrevisaoEntrega("");
       setShowNewUpdate(false);
       onRefresh();
     } catch (err) {
@@ -4208,6 +4745,14 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const markUpdateReceived = async (upId) => {
+    try {
+      await api.put(`/pd/updates/${upId}/received`);
+      toast.success("Marcado como recebido");
+      onRefresh();
+    } catch (err) { toast.error("Erro ao marcar recebido"); }
   };
 
   const deleteUpdate = async (upId) => {
@@ -4415,6 +4960,20 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
                 rows={3}
                 placeholder="Ex: Solicitada fragrância para Ginger em 13/04. Previsão de recebimento em 20/04."
               />
+              <div className="grid grid-cols-3 gap-2 p-2 bg-amber-50/60 dark:bg-amber-950/20 rounded border border-dashed border-amber-200">
+                <div>
+                  <Label className="text-[10px] text-amber-700">Item Solicitado</Label>
+                  <Input value={newUpdateItemSolicitado} onChange={e => setNewUpdateItemSolicitado(e.target.value)} placeholder="Ex: Fragrância Ginger" className="h-7 text-xs mt-0.5" />
+                </div>
+                <div>
+                  <Label className="text-[10px] text-amber-700">Fornecedor</Label>
+                  <Input value={newUpdateFornecedor} onChange={e => setNewUpdateFornecedor(e.target.value)} placeholder="Nome do fornecedor" className="h-7 text-xs mt-0.5" />
+                </div>
+                <div>
+                  <Label className="text-[10px] text-amber-700">Previsão de Entrega</Label>
+                  <Input type="date" value={newUpdatePrevisaoEntrega} onChange={e => setNewUpdatePrevisaoEntrega(e.target.value)} className="h-7 text-xs mt-0.5" />
+                </div>
+              </div>
               <div className="flex items-center justify-between flex-wrap gap-2">
                 <label className="flex items-center gap-2 text-xs">
                   <Switch checked={newUpdateVisible} onCheckedChange={setNewUpdateVisible} />
@@ -4455,6 +5014,28 @@ function UpdatesTab({ reqId, updates, pending, onRefresh, canEdit }) {
                       )}
                     </div>
                     <p className="text-sm mt-1 whitespace-pre-wrap">{u.mensagem}</p>
+                    {u.item_solicitado && (
+                      <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                        <Badge className="bg-amber-500/10 text-amber-700 border-amber-300 text-[10px] gap-1">
+                          <Package className="h-2.5 w-2.5" /> {u.item_solicitado}
+                        </Badge>
+                        {u.fornecedor && <span className="text-[10px] text-muted-foreground">{u.fornecedor}</span>}
+                        {u.previsao_entrega && (
+                          <Badge variant="outline" className="text-[10px] gap-1">
+                            <Clock className="h-2.5 w-2.5" /> {new Date(u.previsao_entrega).toLocaleDateString("pt-BR")}
+                          </Badge>
+                        )}
+                        {u.recebido ? (
+                          <Badge className="bg-green-500/10 text-green-700 border-green-300 text-[10px] gap-1">
+                            <CheckCircle2 className="h-2.5 w-2.5" /> Recebido em {u.recebido_em ? new Date(u.recebido_em).toLocaleDateString("pt-BR") : ""}
+                          </Badge>
+                        ) : canEdit && (
+                          <Button size="sm" variant="outline" className="h-6 text-[10px] gap-1 border-green-300 text-green-700 hover:bg-green-50" onClick={() => markUpdateReceived(u.id)}>
+                            <CheckCircle2 className="h-3 w-3" /> Marcar recebido
+                          </Button>
+                        )}
+                      </div>
+                    )}
                   </div>
                   {canEdit && !isSystemType && (
                     <Button size="icon" variant="ghost" className="h-6 w-6 shrink-0" onClick={() => deleteUpdate(u.id)}>

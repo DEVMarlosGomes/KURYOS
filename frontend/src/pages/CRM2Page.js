@@ -11,7 +11,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConical, ExternalLink } from "lucide-react";
+import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConical, ExternalLink, ShoppingCart } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import SampleBatchModal from "@/components/SampleBatchModal";
@@ -308,6 +308,20 @@ export default function CRM2Page() {
         }
     };
 
+    const handleReorder = async (clienteId) => {
+        try {
+            const { data } = await api.get(`/api/orders/reorder/${clienteId}`);
+            navigate("/orders/new", { state: { draft: data } });
+        } catch (e) {
+            if (e.response?.status === 404) {
+                toast.info("Nenhum pedido anterior encontrado. Criando novo pedido em branco.");
+                navigate("/orders/new", { state: { clienteId } });
+            } else {
+                toast.error(formatApiError(e));
+            }
+        }
+    };
+
     const handleDragEnd = async (result) => {
         if (!result.destination) return;
         const { draggableId, source, destination } = result;
@@ -499,6 +513,18 @@ export default function CRM2Page() {
                                                                     </span>
                                                                 )}
                                                             </div>
+                                                            {project.stage === "pedido_aprovado" && project.cliente_id && (
+                                                                <div className="mt-2 pt-2 border-t border-border">
+                                                                    <Button
+                                                                        size="sm"
+                                                                        variant="outline"
+                                                                        className="w-full gap-1.5 text-xs text-emerald-700 border-emerald-300 hover:bg-emerald-50"
+                                                                        onClick={(e) => { e.stopPropagation(); handleReorder(project.cliente_id); }}
+                                                                    >
+                                                                        <ShoppingCart className="h-3.5 w-3.5" /> Nova Reposição
+                                                                    </Button>
+                                                                </div>
+                                                            )}
                                                         </div>
                                                     )}
                                                 </Draggable>

@@ -285,6 +285,37 @@ async def get_order(order_id: str, request: Request):
     return order
 
 
+@orders_router.get("/reorder/{client_card_id}")
+async def get_reorder_draft(client_card_id: str, request: Request):
+    """Return a pre-populated draft order based on the most recent order for a CRM client card."""
+    user = await get_current_user(request)
+    last_order = await db.orders.find_one(
+        {"client_card_id": client_card_id, "tenant_id": user["tenant_id"]},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+    if not last_order:
+        raise HTTPException(status_code=404, detail="Nenhum pedido anterior encontrado para este cliente")
+
+    numero = await _generate_order_number(user["tenant_id"])
+    draft = {
+        **last_order,
+        "id": None,
+        "numero_pedido": numero,
+        "data_pedido": now_iso(),
+        "status": "rascunho",
+        "observacoes": "",
+        "auto_created": False,
+        "is_reorder_draft": True,
+        "reorder_from": last_order["id"],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+    }
+    return draft
+
+
 @orders_router.post("")
 async def create_order(data: OrderCreate, request: Request):
     user = await get_current_user(request)

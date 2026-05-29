@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { toast } from "sonner";
-import { UserPlus, Shield, Trash2, Mail, Copy } from "lucide-react";
+import { UserPlus, Shield, Trash2, Mail, Copy, Plus, Pencil, ToggleLeft, ToggleRight } from "lucide-react";
 
 const ROLE_LABELS = { admin: "Admin", gestor: "Gestor", vendedor: "Vendedor" };
 const ROLE_COLORS = { admin: "bg-primary text-primary-foreground", gestor: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300", vendedor: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300" };
@@ -23,10 +23,17 @@ export default function TeamPage() {
     const [inviteForm, setInviteForm] = useState({ email: "", name: "", role: "vendedor" });
     const [inviteResult, setInviteResult] = useState(null);
     const [emailLogs, setEmailLogs] = useState([]);
+    const [leadSources, setLeadSources] = useState([]);
+    const [lsLoading, setLsLoading] = useState(false);
+    const [showAddSource, setShowAddSource] = useState(false);
+    const [addSourceForm, setAddSourceForm] = useState({ nome: "", valor: "", grupo: "" });
+    const [editingSource, setEditingSource] = useState(null);
+    const [editSourceForm, setEditSourceForm] = useState({ nome: "", grupo: "" });
 
     useEffect(() => {
         loadUsers();
         loadEmailLogs();
+        loadLeadSources();
     }, []);
 
     const loadUsers = async () => {
@@ -74,6 +81,47 @@ export default function TeamPage() {
             loadUsers();
         } catch (e) {
             toast.error(e.response?.data?.detail || "Erro ao remover");
+        }
+    };
+
+    const loadLeadSources = async () => {
+        setLsLoading(true);
+        try {
+            const { data } = await api.get("/crm/config/lead-sources");
+            setLeadSources(data);
+        } catch {} finally { setLsLoading(false); }
+    };
+
+    const createLeadSource = async () => {
+        if (!addSourceForm.nome || !addSourceForm.valor) return;
+        try {
+            await api.post("/crm/config/lead-sources", addSourceForm);
+            toast.success("Canal criado");
+            setShowAddSource(false);
+            setAddSourceForm({ nome: "", valor: "", grupo: "" });
+            loadLeadSources();
+        } catch (e) {
+            toast.error(e.response?.data?.detail || "Erro ao criar");
+        }
+    };
+
+    const updateLeadSource = async (id, patch) => {
+        try {
+            await api.patch(`/crm/config/lead-sources/${id}`, patch);
+            toast.success("Atualizado");
+            setEditingSource(null);
+            loadLeadSources();
+        } catch (e) {
+            toast.error(e.response?.data?.detail || "Erro ao atualizar");
+        }
+    };
+
+    const toggleLeadSource = async (src) => {
+        try {
+            await api.patch(`/crm/config/lead-sources/${src.id}`, { ativo: !src.ativo });
+            loadLeadSources();
+        } catch (e) {
+            toast.error(e.response?.data?.detail || "Erro");
         }
     };
 
@@ -162,6 +210,73 @@ export default function TeamPage() {
                             </Card>
                         ))}
                     </div>
+                </>
+            )}
+
+            {isAdmin && (
+                <>
+                    <Separator className="mb-6" />
+                    <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-lg font-heading font-semibold">Canais de Origem do Lead</h2>
+                        <Button size="sm" variant="outline" onClick={() => setShowAddSource(true)}>
+                            <Plus className="h-3.5 w-3.5 mr-1" /> Novo Canal
+                        </Button>
+                    </div>
+                    {lsLoading ? (
+                        <div className="h-8 w-32 bg-muted animate-pulse rounded" />
+                    ) : (
+                        <div className="space-y-1 mb-8">
+                            {leadSources.map(src => (
+                                <div key={src.id} className={`flex items-center gap-3 p-2 rounded-md border text-sm ${!src.ativo ? "opacity-50" : ""}`}>
+                                    <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono flex-shrink-0">{src.valor}</code>
+                                    {editingSource === src.id ? (
+                                        <>
+                                            <Input className="h-7 text-xs flex-1" value={editSourceForm.nome}
+                                                onChange={e => setEditSourceForm(f => ({ ...f, nome: e.target.value }))} />
+                                            <Input className="h-7 text-xs w-36" value={editSourceForm.grupo} placeholder="grupo"
+                                                onChange={e => setEditSourceForm(f => ({ ...f, grupo: e.target.value }))} />
+                                            <Button size="sm" className="h-7 text-xs" onClick={() => updateLeadSource(src.id, editSourceForm)}>Salvar</Button>
+                                            <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => setEditingSource(null)}>Cancelar</Button>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <span className="flex-1 font-medium">{src.nome}</span>
+                                            <span className="text-xs text-muted-foreground">{src.grupo || "—"}</span>
+                                            <button className="text-muted-foreground hover:text-foreground" onClick={() => { setEditingSource(src.id); setEditSourceForm({ nome: src.nome, grupo: src.grupo || "" }); }}>
+                                                <Pencil className="h-3.5 w-3.5" />
+                                            </button>
+                                            <button className={`${src.ativo ? "text-green-500" : "text-muted-foreground"} hover:opacity-70`} onClick={() => toggleLeadSource(src)} title={src.ativo ? "Desativar" : "Ativar"}>
+                                                {src.ativo ? <ToggleRight className="h-4 w-4" /> : <ToggleLeft className="h-4 w-4" />}
+                                            </button>
+                                        </>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    <Dialog open={showAddSource} onOpenChange={setShowAddSource}>
+                        <DialogContent>
+                            <DialogHeader><DialogTitle className="font-heading">Novo Canal de Origem</DialogTitle></DialogHeader>
+                            <div className="space-y-4">
+                                <div className="space-y-1.5">
+                                    <Label>Nome de exibição *</Label>
+                                    <Input value={addSourceForm.nome} onChange={e => setAddSourceForm(f => ({ ...f, nome: e.target.value }))} placeholder="Ex: Indicação de parceiro" />
+                                </div>
+                                <div className="space-y-1.5">
+                                    <Label>Valor/slug * <span className="text-xs text-muted-foreground">(imutável após criação)</span></Label>
+                                    <Input value={addSourceForm.valor} onChange={e => setAddSourceForm(f => ({ ...f, valor: e.target.value.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "") }))} placeholder="ex: indicacao_parceiro_tech" />
+                                </div>
+                                <div className="space-y-1.5">
+                                    <Label>Grupo</Label>
+                                    <Input value={addSourceForm.grupo} onChange={e => setAddSourceForm(f => ({ ...f, grupo: e.target.value }))} placeholder="ex: indicacao" />
+                                </div>
+                            </div>
+                            <DialogFooter>
+                                <Button variant="outline" onClick={() => setShowAddSource(false)}>Cancelar</Button>
+                                <Button onClick={createLeadSource} disabled={!addSourceForm.nome || !addSourceForm.valor}>Criar Canal</Button>
+                            </DialogFooter>
+                        </DialogContent>
+                    </Dialog>
                 </>
             )}
 

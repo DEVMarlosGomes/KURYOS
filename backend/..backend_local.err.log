@@ -1,0 +1,32 @@
+INFO:     Will watch for changes in these directories: ['C:\\Users\\MARLOS\\Downloads\\KURYOS\\backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [9184] using WatchFiles
+2026-05-23 14:46:04,636 - server - WARNING - Using local development defaults for: MONGO_URL, DB_NAME, JWT_SECRET
+INFO:     Started server process [18168]
+INFO:     Waiting for application startup.
+2026-05-23 14:46:04,821 - server - WARNING - No EMERGENT_LLM_KEY for storage
+2026-05-23 14:46:04,842 - crm_routes - INFO - CRM module initialized
+2026-05-23 14:46:04,843 - estoque_routes - INFO - Estoque module initialized
+2026-05-23 14:46:04,853 - workflow_engine - INFO - Workflow engine initialized
+2026-05-23 14:46:04,854 - workflow_routes - INFO - Workflow routes initialized
+2026-05-23 14:46:06,998 - server - INFO - CRM Kuryos API started
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'tests\test_e2e_10clients_senior.py'. Reloading...
+2026-05-23 14:59:14,042 - server - INFO - User invited: test_vendedor_e2e@kuryos.test with temp password: Kuryosd9f619!
+2026-05-23 15:54:54,650 - crm_routes - INFO - Batch created 1 projects for client 3dd9d2ad-d39f-4a1a-8055-eb362ce45506
+2026-05-23 15:57:45,769 - crm_routes - INFO - Batch created 1 projects for client b847d110-a262-4229-b3d5-6167473a061f
+2026-05-23 15:57:45,878 - crm_routes - INFO - Batch created 1 projects for client a02b0774-1a02-4b7c-95e8-df6419448c52
+2026-05-23 15:57:46,242 - crm_routes - INFO - Batch created 1 projects for client d792a5b5-e4fa-425c-ac1c-9ac6ad8a2092
+2026-05-23 15:57:46,599 - crm_routes - INFO - Batch created 1 projects for client 79c2db64-204e-4f5e-861d-9b336250b7a7
+2026-05-23 15:57:47,071 - crm_routes - INFO - Batch created 1 projects for client 63fc947e-5a0f-42b7-8e2f-ae33c038c654
+2026-05-23 15:57:49,601 - crm_routes - INFO - Batch created 1 projects for client 8edd17fd-9f8e-4308-bdc2-264b780b8a67
+2026-05-23 15:57:49,986 - crm_routes - INFO - Batch created 1 projects for client 493b7dd8-f8a5-4a76-b4c5-b6ba07c0499f
+2026-05-23 16:02:07,181 - crm_routes - INFO - Batch created 1 projects for client dbf9ac65-89c4-44db-8404-5f5bac41590b
+2026-05-23 16:02:07,290 - crm_routes - INFO - Batch created 1 projects for client dedbc3c6-1186-4080-9ded-05e9a2fa5466
+2026-05-23 16:02:07,648 - crm_routes - INFO - Batch created 1 projects for client d8dcebdc-3ce5-4e94-b73b-7173dcfb323d
+2026-05-23 16:02:08,011 - crm_routes - INFO - Batch created 1 projects for client 2fe114c7-3f44-470b-b9d2-aeca20a6ceca
+2026-05-23 16:02:08,481 - crm_routes - INFO - Batch created 1 projects for client f886b955-4c03-49ab-9e3e-110fedbc943b
+2026-05-23 16:02:11,022 - crm_routes - INFO - Batch created 1 projects for client 1d536d1d-e810-4932-8ba3-6975da9dde6c
+2026-05-23 16:02:11,403 - crm_routes - INFO - Batch created 1 projects for client 45143fb3-cf95-4eb8-bbe5-fe877700d172
+2026-05-23 16:02:41,368 - crm_routes - INFO - Batch created 1 projects for client f5708693-0779-49a6-bc23-43ea7302160b
+2026-05-23 16:02:41,467 - crm_routes - INFO - Batch created 1 projects for client cf4d776f-fb87-4e73-848b-e53f09cc03bb

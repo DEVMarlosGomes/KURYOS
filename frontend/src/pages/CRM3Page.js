@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
+import { getCurrentBackendUrl, toWebSocketUrl } from "@/lib/backend";
+import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,7 +14,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter
 } from "@/components/ui/dialog";
-import { Building2, FlaskConical, AlertTriangle, ChevronRight, Trash2, Plus, X, Lock } from "lucide-react";
+import { Building2, FlaskConical, AlertTriangle, ChevronRight, Trash2, Plus, X, Lock, Printer } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import ViewSwitcher from "@/components/ViewSwitcher";
@@ -57,6 +59,8 @@ const STAGES = [
 const STAGE_LABELS = Object.fromEntries(STAGES.map(s => [s.id, s.label]));
 
 export default function CRM3Page() {
+    const { user: authUser } = useAuth();
+    const wsRef = useRef(null);
     const [samples, setSamples] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
@@ -98,6 +102,65 @@ export default function CRM3Page() {
     }, [search]);
 
     useEffect(() => { loadSamples(); }, [loadSamples]);
+
+    // WebSocket: receive PD→CRM stage sync events
+    useEffect(() => {
+        const wsBackendUrl = toWebSocketUrl(getCurrentBackendUrl());
+        if (!wsBackendUrl) return undefined;
+
+        let disposed = false;
+        let reconnectTimer = null;
+
+        const connectWs = () => {
+            if (disposed) return;
+            try {
+                const ws = new WebSocket(`${wsBackendUrl}/api/ws`);
+
+                ws.onmessage = (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.event !== "crm_sample_pd_synced") return;
+
+                        const { amostra_id, variacao_id, status_pd_raw, status_pd_label } = msg.data || {};
+                        if (!amostra_id || !variacao_id) return;
+
+                        setSamples((current) =>
+                            current.map((sample) => {
+                                if (sample.id !== amostra_id) return sample;
+                                return {
+                                    ...sample,
+                                    variacoes: (sample.variacoes || []).map((v) =>
+                                        v.id === variacao_id
+                                            ? { ...v, status_pd_raw, status_pd_label }
+                                            : v
+                                    ),
+                                };
+                            })
+                        );
+                    } catch {}
+                };
+
+                ws.onclose = () => {
+                    if (disposed) return;
+                    reconnectTimer = window.setTimeout(connectWs, 5000);
+                };
+
+                ws.onerror = () => { ws.close(); };
+
+                wsRef.current = ws;
+            } catch {
+                reconnectTimer = window.setTimeout(connectWs, 5000);
+            }
+        };
+
+        connectWs();
+
+        return () => {
+            disposed = true;
+            clearTimeout(reconnectTimer);
+            wsRef.current?.close();
+        };
+    }, []);
 
     // Agrupar variações por estágio
     const variacoesByStage = STAGES.reduce((acc, stage) => {
@@ -327,6 +390,21 @@ export default function CRM3Page() {
                     },
                 ];
                 const filteredVariacoes = applyFilters(allVariacoes, filters, filterFields);
+                const canPrintLabel = authUser && ["admin","lider_pd","formulador","qa","engenharia_produto"].includes(authUser.role);
+
+                const printLabel = async (e, variacaoId, codigo) => {
+                    e.stopPropagation();
+                    try {
+                        const res = await api.get(`/pd/samples/${variacaoId}/label.pdf`, { responseType: "blob" });
+                        const url = URL.createObjectURL(new Blob([res.data], { type: "application/pdf" }));
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `etiqueta_${String(codigo || variacaoId).replace("/", "-")}.pdf`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    } catch { toast.error("Erro ao gerar etiqueta"); }
+                };
+
                 const filteredByStage = STAGES.reduce((acc, s) => {
                     acc[s.id] = filteredVariacoes.filter((v) => v.status === s.id);
                     return acc;
@@ -403,6 +481,15 @@ export default function CRM3Page() {
                                                         </span>
                                                         <Lock className="h-2.5 w-2.5 text-muted-foreground/60 shrink-0" title="Status controlado pelo P&D" />
                                                     </div>
+                                                    {canPrintLabel && (
+                                                        <button
+                                                            className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                                                            onClick={(e) => printLabel(e, variacao.id, variacao.codigo)}
+                                                            title="Imprimir etiqueta"
+                                                        >
+                                                            <Printer className="h-3 w-3" /> Etiqueta
+                                                        </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>

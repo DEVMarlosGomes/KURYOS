@@ -74,9 +74,9 @@ def seed_client(admin_client, reset_state):
         "nome_empresa": "TEST_ERPv3 ClienteA",
         "cnpj": "00.000.000/0001-91",
         "contato_principal": {"nome": "João Teste", "whatsapp": "11999990000", "email": "TEST_erpv3_clientea@example.com"},
-        "canal_origem": "site",
-        "categoria_interesse": ["skincare"],
-        "origem_lead": "organico",
+        "canal_origem": "formulario_site",
+        "categoria_interesse": ["hidratante_facial"],
+        "origem_lead": "site",
     }
     r = admin_client.post(f"{API}/crm/clients", json=payload, timeout=30)
     assert r.status_code in (200, 201), f"create client: {r.status_code} {r.text}"
@@ -271,6 +271,51 @@ def test_move_variacao_to_retrabalho_is_blocked(admin_client, seed_samples):
         pytest.skip("variacao id not exposed in response")
     r = admin_client.put(f"{API}/crm/samples/{s['id']}/variacoes/{vid}/move", json={"status": "retrabalho"})
     assert r.status_code == 400, f"expected 400, got {r.status_code} {r.text}"
+
+
+def test_variacao_requires_client_result_before_approval(admin_client, seed_samples):
+    samples = _extract_samples(seed_samples)
+    s = samples[0]
+    variacoes = s.get("variacoes") or []
+    if len(variacoes) < 2:
+        pytest.skip("need a second variacao to test approval gating")
+
+    vid = variacoes[1].get("id")
+    if not vid:
+        pytest.skip("variacao id not exposed in response")
+
+    r1 = admin_client.put(
+        f"{API}/crm/samples/{s['id']}/variacoes/{vid}/move",
+        json={"status": "em_elaboracao"},
+    )
+    assert r1.status_code == 200, r1.text
+
+    r2 = admin_client.put(
+        f"{API}/crm/samples/{s['id']}/variacoes/{vid}/move",
+        json={"status": "enviada"},
+    )
+    assert r2.status_code == 200, r2.text
+
+    blocked = admin_client.put(
+        f"{API}/crm/samples/{s['id']}/variacoes/{vid}/move",
+        json={"status": "aprovada"},
+    )
+    assert blocked.status_code == 422, blocked.text
+    assert "resultado do cliente" in blocked.text.lower() or "aprovação direta" in blocked.text.lower()
+
+    approved = admin_client.post(
+        f"{API}/crm/samples/{s['id']}/variacoes/{vid}/resultado-cliente",
+        json={"resultado": "aprovada", "feedback_cliente": "cliente aprovou"},
+    )
+    assert approved.status_code == 200, approved.text
+
+    refreshed = admin_client.get(f"{API}/crm/samples/{s['id']}")
+    assert refreshed.status_code == 200, refreshed.text
+    payload = refreshed.json()
+    updated_var = next(v for v in payload.get("variacoes", []) if v.get("id") == vid)
+    assert updated_var["status"] == "aprovada"
+    assert updated_var.get("aprovacao_interna") is True
+    assert updated_var.get("aprovacao_externa") is True
 
 
 def test_pd_card_stage_gating_cq_approval(admin_client, seed_samples):
