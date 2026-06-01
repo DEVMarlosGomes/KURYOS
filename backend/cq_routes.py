@@ -2646,6 +2646,54 @@ async def comunicar_fornecedor(
     return HTMLResponse(content=html_content, status_code=200)
 
 
+# ── GET /api/cq/retencoes ─────────────────────────────────────────────────────
+@cq_router.get("/retencoes")
+async def listar_retencoes(
+    request: Request,
+    status: Optional[str] = Query(None),
+    ra_id: Optional[str] = Query(None),
+    lote_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    user = await get_current_user(request)
+    require_roles(user, CQ_READ)
+    tenant_id = user["tenant_id"]
+
+    query: Dict[str, Any] = {"tenant_id": tenant_id}
+    if status:
+        query["status"] = status
+    if ra_id:
+        query["ra_id"] = ra_id
+    if lote_id:
+        query["lote_id"] = lote_id
+
+    cursor = (
+        db.cq_retencoes.find(query, {"_id": 0})
+        .sort("created_at", -1)
+        .skip(offset)
+        .limit(limit)
+    )
+    items = await cursor.to_list(limit)
+    total = await db.cq_retencoes.count_documents(query)
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ── GET /api/cq/retencoes/{ret_id} ────────────────────────────────────────────
+@cq_router.get("/retencoes/{ret_id}")
+async def detalhe_retencao(ret_id: str, request: Request):
+    user = await get_current_user(request)
+    require_roles(user, CQ_READ)
+
+    ret = await db.cq_retencoes.find_one(
+        {"id": ret_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not ret:
+        raise HTTPException(status_code=404, detail="Amostra de retenção não encontrada")
+    return ret
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #   405 GUARDS — no DELETE on any CQ collection
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2954,7 +3002,9 @@ async def criar_instrumento(data: InstrumentoCreate, request: Request):
 
     proxima_calibracao = None
     if data.ultima_calibracao:
-        proxima_calibracao = _add_days_iso(data.ultima_calibracao, data.frequencia_calibracao_dias)
+        # +1: freq=180 means "valid for 180 days starting on calibration day",
+        # so the next calibration is due on day freq+1 after the last one.
+        proxima_calibracao = _add_days_iso(data.ultima_calibracao, data.frequencia_calibracao_dias + 1)
 
     # Status at creation: vencido if proxima_calibracao is already in the past
     status_inicial = "calibrado"
@@ -3058,9 +3108,10 @@ async def registrar_calibracao(
             detail="resultado deve ser 'aprovado' ou 'reprovado'",
         )
 
-    # Recalculate proxima_calibracao from the new calibration date
+    # Recalculate proxima_calibracao from the new calibration date (+1 for same
+    # convention: freq=180 means valid through day 180, due on day 181).
     proxima_calibracao = _add_days_iso(
-        data.data_calibracao, instr["frequencia_calibracao_dias"]
+        data.data_calibracao, instr["frequencia_calibracao_dias"] + 1
     )
     novo_status = "calibrado" if data.resultado == "aprovado" else "bloqueado"
 
