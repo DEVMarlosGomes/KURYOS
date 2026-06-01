@@ -42,8 +42,9 @@ from crm_routes import crm_router, init_crm, run_alert_scheduler
 from estoque_routes import estoque_router, init_estoque
 from orders_routes import orders_router, init_orders
 from kickoff_routes import kickoff_router, init_kickoff
-from compras_routes import compras_router, init_compras
+from compras_routes import compras_router, init_compras, create_compras_indexes
 from contratos_routes import contratos_router, init_contratos
+from cq_routes import cq_router, init_cq, create_cq_indexes
 from workflow_engine import init_workflow, run_workflow_notification_scheduler
 from workflow_routes import workflow_router, init_workflow_routes
 from rbac import (
@@ -1827,7 +1828,13 @@ async def startup():
     init_orders(db, get_current_user, new_id, now_iso)
     init_kickoff(db, get_current_user, new_id, now_iso)
     init_compras(db, get_current_user, new_id, now_iso)
+    await create_compras_indexes()
     init_contratos(db, get_current_user, new_id, now_iso)
+
+    # Initialize CQ (Controle de Qualidade) module
+    init_cq(db, get_current_user, new_id, now_iso, broadcast_event_fn=ws_manager.broadcast)
+    await create_cq_indexes()
+
     await db.orders.create_index([("tenant_id", 1), ("status", 1)])
     await db.orders.create_index([("tenant_id", 1), ("pd_request_id", 1)])
     await db.orders.create_index([("tenant_id", 1), ("created_at", -1)])
@@ -1919,6 +1926,7 @@ app.include_router(workflow_router)
 app.include_router(kickoff_router)
 app.include_router(compras_router)
 app.include_router(contratos_router)
+app.include_router(cq_router)
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):

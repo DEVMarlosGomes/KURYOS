@@ -4,7 +4,7 @@ import { useTheme } from "@/App";
 import {
     LayoutDashboard, Kanban, Users, LogOut, Moon, Sun, FlaskConical, Building2,
     Package, ChevronDown, ChevronRight, ShieldCheck, BarChart3, Warehouse, ClipboardList,
-    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText
+    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText, Microscope
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -83,6 +83,22 @@ const NAV_MODULES = [
         roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "gestor"],
     },
     {
+        key: "cq",
+        type: "group",
+        label: "Controle de Qualidade",
+        icon: Microscope,
+        basePaths: ["/cq"],
+        roles: ["admin", "qa", "lider_pd", "formulador", "engenharia_produto", "compras", "sales_ops"],
+        children: [
+            { path: "/cq",                       label: "Dashboard CQ" },
+            { path: "/cq/registros-analise",     label: "Registros de Análise" },
+            { path: "/cq/checklists",            label: "Checklists" },
+            { path: "/cq/rncs",                  label: "Não Conformidades" },
+            { path: "/cq/retencoes",             label: "Retenções" },
+            { path: "/cq/instrumentos",          label: "Instrumentos" },
+        ],
+    },
+    {
         key: "orders",
         type: "link",
         path: "/orders",
@@ -92,11 +108,19 @@ const NAV_MODULES = [
     },
     {
         key: "compras",
-        type: "link",
-        path: "/compras",
+        type: "group",
         label: "Compras",
         icon: Package,
+        basePaths: ["/compras"],
         roles: ["admin", "compras", "engenharia_produto", "lider_pd", "qa", "sales_ops"],
+        children: [
+            { path: "/compras", label: "Dashboard" },
+            { path: "/compras/fornecedores", label: "Fornecedores" },
+            { path: "/compras/itens", label: "Itens" },
+            { path: "/compras/mrp", label: "MRP" },
+            { path: "/compras/pos", label: "Pedidos de Compra" },
+            { path: "/compras/estoque-projetado", label: "Estoque Projetado" },
+        ],
     },
     {
         key: "contratos",

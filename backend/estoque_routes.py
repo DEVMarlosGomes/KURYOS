@@ -9,6 +9,8 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 import logging
 
+from cq_routes import cq_verificar_lote_aprovado, cq_verificar_liberacao_palete
+
 logger = logging.getLogger(__name__)
 
 estoque_router = APIRouter(prefix="/api/estoque")
@@ -319,6 +321,13 @@ async def create_movimento(data: MovimentoCreate, request: Request):
         )
 
     item = await _get_item_or_404(data.item_id, user["tenant_id"])
+
+    # CQ hard stops — check lote status before any movement
+    if data.referencia:
+        await cq_verificar_lote_aprovado(db, user["tenant_id"], data.referencia)
+    if data.tipo == "SAIDA_EXPEDICAO" and data.referencia:
+        await cq_verificar_liberacao_palete(db, user["tenant_id"], data.referencia)
+
     quantidade_antes = item.get("quantidade_atual", 0)
     delta = data.quantidade if data.tipo in MOVIMENTOS_ENTRADA else -data.quantidade
     quantidade_depois = quantidade_antes + delta

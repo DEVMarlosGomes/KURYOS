@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 import io
 import logging
 
+from cq_routes import (
+    cq_verificar_assepsia_manipulacao,
+    cq_verificar_assepsia_envase,
+    cq_verificar_setup_linha,
+)
+
 logger = logging.getLogger(__name__)
 
 orders_router = APIRouter(prefix="/api/orders")
@@ -369,6 +375,15 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
 
     if "status" in payload and payload["status"] not in ORDER_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido. Permitidos: {ORDER_STATUSES}")
+
+    # CQ hard stops — verify CK prerequisites before starting production
+    if payload.get("status") == "em_producao":
+        op_tipo = existing.get("tipo", "")
+        if op_tipo == "manipulacao":
+            await cq_verificar_assepsia_manipulacao(db, user["tenant_id"], order_id)
+        elif op_tipo == "envase":
+            await cq_verificar_assepsia_envase(db, user["tenant_id"], order_id)
+            await cq_verificar_setup_linha(db, user["tenant_id"], order_id)
 
     for key in ("numero_pedido", "data_pedido", "status", "observacoes"):
         if key in payload:

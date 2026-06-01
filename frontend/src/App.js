@@ -21,9 +21,29 @@ import KickoffsListPage from "@/pages/KickoffsListPage";
 import SKUsPage from "@/pages/SKUsPage";
 import TasksPage from "@/pages/TasksPage";
 import AuditLogPage from "@/pages/AuditLogPage";
+import CQDashboard from "@/pages/CQDashboard";
+import CQListaRA from "@/pages/CQListaRA";
+import CQDetalheRA from "@/pages/CQDetalheRA";
+import CQListaChecklists from "@/pages/CQListaChecklists";
+import CQPreencherChecklist from "@/pages/CQPreencherChecklist";
+import CQListaRNCs from "@/pages/CQListaRNCs";
+import CQDetalheRNC from "@/pages/CQDetalheRNC";
+import CQRetencoes from "@/pages/CQRetencoes";
+import CQInstrumentos from "@/pages/CQInstrumentos";
 import OrdersPage from "@/pages/OrdersPage";
 import OrderDetail from "@/pages/OrderDetail";
 import ComprasPage from "@/pages/ComprasPage";
+import ComprasDashboard from "@/pages/ComprasDashboard";
+import ComprasFornecedores from "@/pages/ComprasFornecedores";
+import ComprasFornecedorDetalhe from "@/pages/ComprasFornecedorDetalhe";
+import ComprasItens from "@/pages/ComprasItens";
+import ComprasItemDetalhe from "@/pages/ComprasItemDetalhe";
+import ComprasMRP from "@/pages/ComprasMRP";
+import ComprasMRPRevisao from "@/pages/ComprasMRPRevisao";
+import ComprasCotacao from "@/pages/ComprasCotacao";
+import ComprasPOLista from "@/pages/ComprasPOLista";
+import ComprasPODetalhe from "@/pages/ComprasPODetalhe";
+import ComprasEstoqueProjetado from "@/pages/ComprasEstoqueProjetado";
 import ContratosPage from "@/pages/ContratosPage";
 import Sidebar from "@/components/Sidebar";
 import RoleGuard, { ROLE_GROUPS } from "@/components/RoleGuard";
@@ -66,6 +86,7 @@ function AppLayout() {
     const ADMIN_ONLY = ROLE_GROUPS.ADMIN_ONLY;
     const AUDIT_ROLES = [...ROLE_GROUPS.DOC_REVIEWERS, "sales_ops"];
     const KICKOFF_ROLES = [...new Set([...COMERCIAL, ...PD_FULL])];
+    const CQ_ROLES = ["admin", "qa", "lider_pd", "formulador", "engenharia_produto", "compras", "sales_ops"];
     const COMPRAS_ROLES = ["admin", "compras", "engenharia_produto", "lider_pd", "qa", "sales_ops"];
     const CONTRATOS_ROLES = ["admin", "sales_ops", "vendedor", "compras", "lider_pd", "qa", "engenharia_produto", "sucesso_cliente"];
 
@@ -94,9 +115,28 @@ function AppLayout() {
                     <Route path="/tasks" element={<TasksPage />} />
                     <Route path="/orders" element={<OrdersPage />} />
                     <Route path="/orders/:id" element={<OrderDetail />} />
-                    <Route path="/compras" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPage /></RoleGuard>} />
+                    <Route path="/compras" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasDashboard /></RoleGuard>} />
+                    <Route path="/compras/fornecedores" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasFornecedores /></RoleGuard>} />
+                    <Route path="/compras/fornecedores/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasFornecedorDetalhe /></RoleGuard>} />
+                    <Route path="/compras/itens" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasItens /></RoleGuard>} />
+                    <Route path="/compras/itens/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasItemDetalhe /></RoleGuard>} />
+                    <Route path="/compras/mrp" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasMRP /></RoleGuard>} />
+                    <Route path="/compras/mrp/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasMRPRevisao /></RoleGuard>} />
+                    <Route path="/compras/cotacao/:demanda_id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasCotacao /></RoleGuard>} />
+                    <Route path="/compras/pos" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPOLista /></RoleGuard>} />
+                    <Route path="/compras/pos/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPODetalhe /></RoleGuard>} />
+                    <Route path="/compras/estoque-projetado" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasEstoqueProjetado /></RoleGuard>} />
                     <Route path="/contratos" element={<RoleGuard allowed={CONTRATOS_ROLES}><ContratosPage /></RoleGuard>} />
                     <Route path="/audit" element={<RoleGuard allowed={AUDIT_ROLES}><AuditLogPage /></RoleGuard>} />
+                    <Route path="/cq" element={<RoleGuard allowed={CQ_ROLES}><CQDashboard /></RoleGuard>} />
+                    <Route path="/cq/registros-analise" element={<RoleGuard allowed={CQ_ROLES}><CQListaRA /></RoleGuard>} />
+                    <Route path="/cq/registros-analise/:id" element={<RoleGuard allowed={CQ_ROLES}><CQDetalheRA /></RoleGuard>} />
+                    <Route path="/cq/checklists" element={<RoleGuard allowed={CQ_ROLES}><CQListaChecklists /></RoleGuard>} />
+                    <Route path="/cq/checklists/:id" element={<RoleGuard allowed={CQ_ROLES}><CQPreencherChecklist /></RoleGuard>} />
+                    <Route path="/cq/rncs" element={<RoleGuard allowed={CQ_ROLES}><CQListaRNCs /></RoleGuard>} />
+                    <Route path="/cq/rncs/:id" element={<RoleGuard allowed={CQ_ROLES}><CQDetalheRNC /></RoleGuard>} />
+                    <Route path="/cq/retencoes" element={<RoleGuard allowed={CQ_ROLES}><CQRetencoes /></RoleGuard>} />
+                    <Route path="/cq/instrumentos" element={<RoleGuard allowed={CQ_ROLES}><CQInstrumentos /></RoleGuard>} />
                     <Route path="/team" element={<RoleGuard allowed={ADMIN_ONLY}><TeamPage /></RoleGuard>} />
                 </Routes>
             </main>
