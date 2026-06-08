@@ -28,7 +28,7 @@ export default function ComprasCotacao() {
         try {
             const [dRes, fornRes] = await Promise.all([
                 api.get(`/api/compras/demandas/${demanda_id}`).catch(() => ({ data: null })),
-                api.get("/api/compras/fornecedores", { params: { limit: 200 } }),
+                api.get("/compras/fornecedores", { params: { limit: 200 } }),
             ]);
             const d = dRes.data;
             setDemanda(d);
@@ -82,7 +82,7 @@ export default function ComprasCotacao() {
                     frete_rateado: 0,
                 }],
             };
-            const { data } = await api.post("/api/compras/pos", poBody);
+            const { data } = await api.post("/compras/pos", poBody);
             toast.success(`PO criada — rascunho`);
             nav(`/compras/pos/${data.id}`);
         } catch (e) { toast.error(e.response?.data?.detail || "Erro ao criar PO"); }

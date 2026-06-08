@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head><title>KURYOS — Reset de conexão</title>
+<style>body{font-family:sans-serif;padding:40px;text-align:center;background:#0f172a;color:#f1f5f9;}
+button{background:#3b82f6;color:white;border:none;padding:12px 24px;border-radius:8px;font-size:16px;cursor:pointer;margin:8px;}
+button:hover{background:#2563eb;} .ok{color:#22c55e;font-size:18px;} .err{color:#ef4444;}</style>
+</head>
+<body>
+<h2>KURYOS — Resetar conexão com backend</h2>
+<p>Clique no botão para limpar a URL em cache e forçar conexão com <strong>localhost:8000</strong></p>
+<button onclick="reset()">Resetar e Entrar</button>
+<div id="msg"></div>
+<script>
+function reset() {
+  try {
+    localStorage.removeItem('kuryos.backend_url');
+    localStorage.setItem('kuryos.backend_url', 'http://localhost:8000');
+    document.getElementById('msg').innerHTML = '<p class="ok">✓ Resetado! Redirecionando para o sistema...</p>';
+    setTimeout(() => { window.location.href = '/'; }, 1500);
+  } catch(e) {
+    document.getElementById('msg').innerHTML = '<p class="err">Erro: ' + e.message + '</p>';
+  }
+}
+// Auto-reset
+reset();
+</script>
+</body>
+</html>

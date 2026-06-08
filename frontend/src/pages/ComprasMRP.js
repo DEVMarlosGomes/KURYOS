@@ -32,7 +32,7 @@ export default function ComprasMRP() {
         try {
             const params = { limit: 50 };
             if (statusFiltro && statusFiltro !== "all") params.status = statusFiltro;
-            const { data } = await api.get("/api/compras/mrp", { params });
+            const { data } = await api.get("/compras/mrp", { params });
             setRodadas(data.rodadas || []);
             setTotal(data.total || 0);
         } catch { toast.error("Erro ao carregar rodadas MRP"); }
@@ -44,7 +44,7 @@ export default function ComprasMRP() {
     const calcular = async () => {
         setCalculando(true);
         try {
-            const { data } = await api.post("/api/compras/mrp/calcular", { ops_input: [] });
+            const { data } = await api.post("/compras/mrp/calcular", { ops_input: [] });
             toast.success(`Rodada ${data.numero_mrp} criada — ${data.itens_sugeridos?.length ?? 0} itens sugeridos`);
             carregar();
         } catch (e) {

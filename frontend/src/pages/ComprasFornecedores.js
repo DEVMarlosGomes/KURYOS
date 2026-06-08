@@ -33,7 +33,7 @@ function NovoFornecedorDialog({ open, onClose, onCreated }) {
         if (!form.razao_social.trim() || !form.cnpj.trim()) { toast.error("Razão social e CNPJ são obrigatórios"); return; }
         setSaving(true);
         try {
-            const { data } = await api.post("/api/compras/fornecedores", form);
+            const { data } = await api.post("/compras/fornecedores", form);
             toast.success(`Fornecedor ${data.codigo_interno} criado`);
             onCreated(data);
             onClose();
@@ -89,7 +89,7 @@ export default function ComprasFornecedores() {
             const params = { limit: 100 };
             if (q) params.q = q;
             if (statusHom && statusHom !== "all") params.status_homologacao = statusHom;
-            const { data } = await api.get("/api/compras/fornecedores", { params });
+            const { data } = await api.get("/compras/fornecedores", { params });
             setItems(data.fornecedores || []);
             setTotal(data.total || 0);
         } catch { toast.error("Erro ao carregar fornecedores"); }

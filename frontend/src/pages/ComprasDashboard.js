@@ -69,7 +69,7 @@ export default function ComprasDashboard() {
     const carregar = useCallback(async () => {
         setLoading(true);
         try {
-            const { data } = await api.get("/api/compras/dashboard");
+            const { data } = await api.get("/compras/dashboard");
             setDash(data);
         } catch {
             toast.error("Erro ao carregar dashboard de compras");

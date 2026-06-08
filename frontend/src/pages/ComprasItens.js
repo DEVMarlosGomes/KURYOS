@@ -19,7 +19,7 @@ function NovoItemDialog({ open, onClose, onCreated }) {
         setSaving(true);
         try {
             const body = { ...form, lead_time_dias: parseInt(form.lead_time_dias) || 0, estoque_minimo: form.estoque_minimo ? parseFloat(form.estoque_minimo) : null };
-            const { data } = await api.post("/api/compras/itens", body);
+            const { data } = await api.post("/compras/itens", body);
             toast.success(`Item ${data.codigo_interno} criado`);
             onCreated(data); onClose();
         } catch (e) { toast.error(e.response?.data?.detail || "Erro ao criar item"); }
@@ -83,7 +83,7 @@ export default function ComprasItens() {
             const params = { limit: 200 };
             if (q) params.q = q;
             if (categoria && categoria !== "all") params.categoria = categoria;
-            const { data } = await api.get("/api/compras/itens", { params });
+            const { data } = await api.get("/compras/itens", { params });
             setItems(data.itens || []);
             setTotal(data.total || 0);
         } catch { toast.error("Erro ao carregar itens"); }

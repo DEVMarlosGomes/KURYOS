@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Plus, Loader2, ChevronRight } from "lucide-react";
+import { Plus, Loader2, ChevronRight, AlertTriangle } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -26,6 +26,7 @@ const CK_TYPES = ["CK-1", "CK-2", "CK-3", "CK-4", "CK-5", "CK-6", "CK-7", "CK-8"
 
 const EMPTY_FORM = {
     tipo: "",
+    nome: "",
     op_id: "",
     op_numero: "",
     lote_id: "",
@@ -77,7 +78,9 @@ export default function CQListaChecklists() {
             setForm(EMPTY_FORM);
             load();
         } catch (e) {
-            toast.error(e.response?.data?.detail || "Erro ao criar checklist");
+            const detail = e.response?.data?.detail;
+            const msg = typeof detail === "object" ? detail.message : detail;
+            toast.error(msg || "Erro ao criar checklist");
         } finally {
             setSaving(false);
         }
@@ -142,6 +145,7 @@ export default function CQListaChecklists() {
                             <tr>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">Nº CK</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">Tipo</th>
+                                <th className="text-left px-4 py-3 font-medium text-muted-foreground">Nome</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">OP</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground hidden md:table-cell">NCs</th>
@@ -153,7 +157,7 @@ export default function CQListaChecklists() {
                         <tbody className="divide-y divide-border">
                             {items.length === 0 ? (
                                 <tr>
-                                    <td colSpan={8} className="text-center py-10 text-muted-foreground">
+                                    <td colSpan={9} className="text-center py-10 text-muted-foreground">
                                         Nenhum checklist encontrado.
                                     </td>
                                 </tr>
@@ -174,6 +178,7 @@ export default function CQListaChecklists() {
                                                 {ck.tipo}
                                             </span>
                                         </td>
+                                        <td className="px-4 py-3 text-sm font-medium">{ck.nome || <span className="text-muted-foreground text-xs">—</span>}</td>
                                         <td className="px-4 py-3 text-xs">{ck.op_numero || "—"}</td>
                                         <td className="px-4 py-3">
                                             <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[ck.status] || "bg-gray-100 text-gray-700"}`}>
@@ -216,6 +221,19 @@ export default function CQListaChecklists() {
                                 </SelectContent>
                             </Select>
                         </div>
+                        <div className="space-y-2">
+                            <Label>Nome / Descrição</Label>
+                            <Input value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} placeholder="Ex: Recebimento MP Fragrância Lote 123" />
+                        </div>
+                        {form.tipo === "CK-7" && (
+                            <div className="flex items-start gap-2 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-3">
+                                <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 shrink-0" />
+                                <p className="text-xs text-amber-800 dark:text-amber-200">
+                                    <strong>Pré-requisito:</strong> CK-7 (Liberação de Palete) exige que exista um{" "}
+                                    <strong>Registro de Análise de Produto Acabado aprovado</strong> para o Lote informado. Preencha o campo "Lote ID" com o lote correto antes de criar.
+                                </p>
+                            </div>
+                        )}
                         {form.tipo === "CK-1" && (
                             <div className="space-y-2">
                                 <Label>Subtipo de Insumo</Label>

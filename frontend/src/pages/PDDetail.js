@@ -111,6 +111,12 @@ export default function PDDetail() {
   const [activeTab, setActiveTab] = useState("overview");
   const [showBackwardDialog, setShowBackwardDialog] = useState(false);
   const [backwardJustification, setBackwardJustification] = useState("");
+  const [showLinkCRM, setShowLinkCRM] = useState(false);
+  const [crmProjectSearch, setCrmProjectSearch] = useState("");
+  const [crmProjects, setCrmProjects] = useState([]);
+  const [crmSearchLoading, setCrmSearchLoading] = useState(false);
+  const [linkingCRM, setLinkingCRM] = useState(false);
+  const [selectedCRMProject, setSelectedCRMProject] = useState(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -125,6 +131,20 @@ export default function PDDetail() {
   }, [id, navigate]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  const searchCRMProjects = useCallback(async (q) => {
+    if (!q || q.length < 2) { setCrmProjects([]); return; }
+    setCrmSearchLoading(true);
+    try {
+      const { data: d } = await api.get("/crm/projects", { params: { search: q, limit: 10 } });
+      setCrmProjects(Array.isArray(d.items || d) ? (d.items || d) : []);
+    } catch { setCrmProjects([]); } finally { setCrmSearchLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => searchCRMProjects(crmProjectSearch), 300);
+    return () => clearTimeout(t);
+  }, [crmProjectSearch, searchCRMProjects]);
 
   const handleStatusChange = async (newStatus, { isBackward = false, comment = "" } = {}) => {
     if (!isBackward) {
@@ -194,26 +214,6 @@ export default function PDDetail() {
   const isInternalResearch = !!req.is_internal_research;
   const canViewCommercial = authUser && ["admin", "compras"].includes(authUser.role);
   const canLinkToCRM = authUser && ["admin", "lider_pd", "formulador", "engenharia_produto", "vendedor", "sales_ops"].includes(authUser.role);
-  const [showLinkCRM, setShowLinkCRM] = useState(false);
-  const [crmProjectSearch, setCrmProjectSearch] = useState("");
-  const [crmProjects, setCrmProjects] = useState([]);
-  const [crmSearchLoading, setCrmSearchLoading] = useState(false);
-  const [linkingCRM, setLinkingCRM] = useState(false);
-  const [selectedCRMProject, setSelectedCRMProject] = useState(null);
-
-  const searchCRMProjects = useCallback(async (q) => {
-    if (!q || q.length < 2) { setCrmProjects([]); return; }
-    setCrmSearchLoading(true);
-    try {
-      const { data } = await api.get("/crm/projects", { params: { search: q, limit: 10 } });
-      setCrmProjects(Array.isArray(data.items || data) ? (data.items || data) : []);
-    } catch { setCrmProjects([]); } finally { setCrmSearchLoading(false); }
-  }, []);
-
-  useEffect(() => {
-    const t = setTimeout(() => searchCRMProjects(crmProjectSearch), 300);
-    return () => clearTimeout(t);
-  }, [crmProjectSearch, searchCRMProjects]);
 
   const linkToCRM = async () => {
     if (!selectedCRMProject) return toast.error("Selecione um projeto CRM");
@@ -330,6 +330,28 @@ export default function PDDetail() {
               );
             })}
           </div>
+
+          {/* Banner: próximo passo após aprovação */}
+          {(req.status === "APPROVED" || req.status === "COMPLETED") && (
+            <div className="mt-4 flex items-start gap-3 rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30 p-3">
+              <CheckCircle2 className="h-4 w-4 text-green-600 mt-0.5 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-green-800 dark:text-green-200">
+                  {req.status === "APPROVED" ? "Amostra aprovada — próximo passo: Kickoff" : "P&D Concluído"}
+                </p>
+                {req.status === "APPROVED" && (
+                  <p className="text-xs text-green-700 dark:text-green-300 mt-0.5">
+                    Avance o <strong>Projeto CRM</strong> para o estágio <strong>"Pedido Aprovado"</strong> para criar o Kickoff automaticamente.
+                  </p>
+                )}
+              </div>
+              {req.crm_project_id && (
+                <Button size="sm" variant="outline" className="shrink-0 border-green-300 text-green-700 hover:bg-green-100 gap-1.5" onClick={() => navigate("/crm/projects")}>
+                  <ExternalLink className="h-3.5 w-3.5" /> Ir para Projetos CRM
+                </Button>
+              )}
+            </div>
+          )}
 
           {/* PD-17: Link to CRM modal */}
           {showLinkCRM && (
@@ -449,7 +471,7 @@ export default function PDDetail() {
           </TabsList>
 
           <TabsContent value="overview">
-            <OverviewTab req={req} dev={dev} formulas={formulas} tests={tests} samples={samples} approval={approval} costs={costs} history={history} onRefresh={fetchData} hasDev={hasDev} clientInfo={client_info} canEdit={canEdit} formulaCostData={formula_cost_data} />
+            <OverviewTab req={req} dev={dev} formulas={formulas} tests={tests} samples={samples} approval={approval} costs={costs} history={history} onRefresh={fetchData} hasDev={hasDev} clientInfo={client_info} canEdit={canEdit} formulaCostData={formula_cost_data} setActiveTab={setActiveTab} documents={documents} updates={updates} pending={pending} canViewCommercial={canViewCommercial} />
           </TabsContent>
 
           <TabsContent value="formula">
@@ -543,7 +565,7 @@ function NeedsDev({ onAction, status, canEdit }) {
 }
 
 /* ============ OVERVIEW TAB ============ */
-function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, history, onRefresh, hasDev, clientInfo, canEdit, formulaCostData }) {
+function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, history, onRefresh, hasDev, clientInfo, canEdit, formulaCostData, setActiveTab, documents, updates, pending, canViewCommercial }) {
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({});
@@ -610,6 +632,46 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
     }
   };
 
+  const STAGE_ORDER = ["OPEN", "IN_PROGRESS", "IN_TESTS", "WAITING_APPROVAL", "APPROVED", "COMPLETED"];
+  const currentStageIndex = STAGE_ORDER.indexOf(req.status);
+  const unlocked = (s) => currentStageIndex >= STAGE_ORDER.indexOf(s);
+
+  // Locked section placeholder — greyed dashed card
+  const LockedSection = ({ accentColor, Icon, title, unlockStage }) => (
+    <div className="border border-dashed rounded-xl overflow-hidden opacity-50">
+      <div className="flex items-center justify-between px-6 py-3.5 bg-muted/10">
+        <div className="flex items-center gap-3">
+          <span className={`w-1 h-4 ${accentColor} rounded-full opacity-40`} />
+          {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/50" />}
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/60">{title}</p>
+        </div>
+        <div className="flex items-center gap-1.5 text-[9px] text-muted-foreground/50">
+          <Lock className="h-3 w-3" />
+          {STATUS_CONFIG[unlockStage]?.label || unlockStage}
+        </div>
+      </div>
+    </div>
+  );
+
+  // Consistent section header
+  const SectionHead = ({ accentColor, Icon, title, action }) => (
+    <div className="flex items-center justify-between px-6 py-4 border-b bg-muted/20">
+      <div className="flex items-center gap-3">
+        <span className={`w-1 h-5 ${accentColor} rounded-full`} />
+        {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground" />}
+        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">{title}</p>
+      </div>
+      {action}
+    </div>
+  );
+
+  // Nav button to full tab
+  const GoBtn = ({ tab, label = "Ver completo" }) => setActiveTab ? (
+    <button onClick={() => setActiveTab(tab)} className="flex items-center gap-1 text-[10px] text-primary hover:underline font-medium shrink-0">
+      {label} <ChevronRight className="h-3 w-3" />
+    </button>
+  ) : null;
+
   const testStats = {
     total: tests.length,
     approved: tests.filter(t => t.status === "APPROVED").length,
@@ -617,74 +679,138 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
     pending: tests.filter(t => t.status === "PENDING" || t.status === "RUNNING").length,
   };
 
+  const latestFormula = formulas.length > 0 ? formulas[formulas.length - 1] : null;
+  const pendingUpdates = (pending || []).filter(p => p.status === "pendente").length;
+  const lastUpdate = (updates || []).slice(-1)[0];
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <div className="lg:col-span-2 space-y-4">
-        {/* Briefing Card from CRM - PROMINENT (Click to expand details) */}
-        {clientInfo && (
-          <Card
-            className="border-blue-200 dark:border-blue-900 cursor-pointer hover:border-blue-400 dark:hover:border-blue-700 hover:shadow-md transition-all group"
-            onClick={() => setShowBriefingDetail(true)}
-            data-testid="briefing-card-clickable"
-          >
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-blue-500" />
+    <div className="space-y-4 max-w-4xl mx-auto">
+
+      {/* — Stage Progress Track — */}
+      <div className="bg-card border rounded-xl px-6 py-5">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground mb-4">Progresso do Projeto</p>
+        <div className="flex items-start">
+          {STAGE_ORDER.map((s, i) => {
+            const cfg = STATUS_CONFIG[s];
+            const isDone = currentStageIndex > i;
+            const isCurrent = req.status === s;
+            const isLast = i === STAGE_ORDER.length - 1;
+            return (
+              <React.Fragment key={s}>
+                <div className="flex flex-col items-center gap-1.5 flex-1 min-w-0">
+                  <div className={`w-7 h-7 rounded-full border-2 flex items-center justify-center transition-all shrink-0 ${
+                    isDone
+                      ? "bg-green-500 border-green-500 text-white"
+                      : isCurrent
+                      ? "bg-primary border-primary text-primary-foreground ring-4 ring-primary/20"
+                      : "bg-muted border-border text-muted-foreground"
+                  }`}>
+                    {isDone
+                      ? <CheckCircle2 className="h-3.5 w-3.5" />
+                      : <span className="text-[10px] font-bold">{i + 1}</span>
+                    }
+                  </div>
+                  <span className={`text-[9px] font-medium text-center leading-tight px-0.5 ${
+                    isCurrent ? "text-primary" : isDone ? "text-muted-foreground" : "text-muted-foreground/50"
+                  }`}>
+                    {cfg.label}
+                  </span>
+                </div>
+                {!isLast && <div className={`h-px flex-[2] mt-3.5 shrink-0 ${isDone ? "bg-green-400" : "bg-border"}`} />}
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* — KPI Strip — */}
+      {hasDev && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[
+            { label: "Fórmulas", value: formulas.length, Icon: Beaker, color: "text-violet-500", accent: "bg-violet-500/10 border-violet-200 dark:border-violet-800" },
+            { label: "Testes", value: `${testStats.approved}/${testStats.total}`, sub: testStats.failed > 0 ? `${testStats.failed} falha(s)` : undefined, Icon: FlaskConical, color: "text-blue-500", accent: "bg-blue-500/10 border-blue-200 dark:border-blue-800" },
+            { label: "Amostras", value: samples.length, Icon: Package, color: "text-amber-500", accent: "bg-amber-500/10 border-amber-200 dark:border-amber-800" },
+            { label: "Custo Unit.", value: formulaCostData ? `R$ ${formulaCostData.custo_unitario.toFixed(2)}` : "—", Icon: DollarSign, color: "text-emerald-600", accent: "bg-emerald-500/10 border-emerald-200 dark:border-emerald-800" },
+          ].map(({ label, value, sub, Icon, color, accent }) => (
+            <div key={label} className={`rounded-xl border px-4 py-3 ${accent} flex items-center gap-3`}>
+              <Icon className={`h-5 w-5 shrink-0 ${color}`} />
+              <div className="min-w-0">
+                <p className="font-mono text-lg font-bold leading-none">{value}</p>
+                <p className="text-[10px] text-muted-foreground mt-0.5">{label}</p>
+                {sub && <p className="text-[9px] text-red-500 mt-0.5">{sub}</p>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* — Briefing CRM — */}
+      {clientInfo && (
+        <>
+          <div className="border rounded-xl overflow-hidden">
+            <button
+              className="w-full flex items-center justify-between px-6 py-4 hover:bg-muted/40 transition-colors group text-left"
+              onClick={() => setShowBriefingDetail(true)}
+              data-testid="briefing-card-clickable"
+            >
+              <div className="flex items-center gap-3">
+                <span className="w-1 h-5 bg-blue-500 rounded-full shrink-0" />
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Briefing do Projeto · CRM</p>
+                  <p className="text-sm font-medium mt-0.5">{clientInfo.nome_projeto || clientInfo.nome_cliente || "Projeto"}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 text-muted-foreground group-hover:text-blue-500 transition-colors shrink-0">
+                <Badge variant="outline" className="text-[9px]">Dados do Pipeline</Badge>
+                <Eye className="h-4 w-4" />
+              </div>
+            </button>
+            <div className="border-t px-6 py-4 grid grid-cols-2 sm:grid-cols-3 gap-x-8 gap-y-3">
+              {[
+                ["Produto", clientInfo.produto],
+                ["Cliente", clientInfo.nome_cliente],
+                ["Orçamento", clientInfo.orcamento_projeto],
+                ["Textura", clientInfo.textura_esperada],
+                ["Aplicação", clientInfo.aplicacao],
+                ["pH Alvo", clientInfo.ph],
+              ].filter(([, v]) => v).map(([label, value]) => (
+                <div key={label}>
+                  <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{label}</p>
+                  <p className="text-sm font-medium">{value}</p>
+                </div>
+              ))}
+            </div>
+            {clientInfo.objetivo_projeto && (
+              <div className="border-t px-6 py-3">
+                <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Objetivo</p>
+                <p className="text-sm text-muted-foreground line-clamp-2">{clientInfo.objetivo_projeto}</p>
+              </div>
+            )}
+            <button
+              className="w-full border-t px-6 py-2.5 bg-muted/20 hover:bg-muted/50 transition-colors flex items-center justify-center gap-1.5 text-[10px] text-muted-foreground hover:text-blue-500"
+              onClick={() => setShowBriefingDetail(true)}
+            >
+              <Eye className="h-3 w-3" /> Clique para ver todas as informações do briefing
+            </button>
+          </div>
+
+          <Dialog open={showBriefingDetail} onOpenChange={setShowBriefingDetail}>
+            <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto" data-testid="briefing-detail-dialog">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
                   Briefing do Projeto (CRM)
-                </CardTitle>
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline" className="text-[10px]">Dados do Pipeline</Badge>
-                  <Eye className="h-3.5 w-3.5 text-muted-foreground group-hover:text-blue-500 transition-colors" />
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3 text-sm">
-              <div className="grid grid-cols-2 gap-x-6 gap-y-2">
-                <InfoRow label="1. Produto" value={clientInfo.produto} />
-                <InfoRow label="2. Cliente" value={clientInfo.nome_cliente} />
-                <InfoRow label="3. Nome do Projeto" value={clientInfo.nome_projeto} />
-                <InfoRow label="9. Orçamento" value={clientInfo.orcamento_projeto} />
-                <InfoRow label="10. Textura Esperada" value={clientInfo.textura_esperada} />
-                <InfoRow label="11. Aplicação" value={clientInfo.aplicacao} />
-                <InfoRow label="12. Sensorial" value={clientInfo.sensorial} />
-                <InfoRow label="13. pH" value={clientInfo.ph} />
-              </div>
-              {clientInfo.objetivo_projeto && (
-                <div className="pt-2 border-t">
-                  <span className="text-muted-foreground text-xs font-medium block mb-1">4. Objetivo do Projeto</span>
-                  <p className="whitespace-pre-wrap line-clamp-2">{clientInfo.objetivo_projeto}</p>
-                </div>
-              )}
-              <div className="pt-2 border-t border-dashed flex items-center justify-center text-xs text-muted-foreground group-hover:text-blue-500 transition-colors">
-                <Eye className="h-3 w-3 mr-1.5" />
-                Clique para ver todas as informações do briefing
-              </div>
-            </CardContent>
-          </Card>
-        )}
+                  <Badge variant="outline" className="text-[10px] ml-2">Dados do Pipeline</Badge>
+                </DialogTitle>
+                <DialogDescription>
+                  Todas as informações do projeto vindas do CRM / Pipeline
+                </DialogDescription>
+              </DialogHeader>
 
-        {/* Briefing Detail Dialog - Full info from CRM */}
-        <Dialog open={showBriefingDetail} onOpenChange={setShowBriefingDetail}>
-          <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto" data-testid="briefing-detail-dialog">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
-                Briefing do Projeto (CRM)
-                <Badge variant="outline" className="text-[10px] ml-2">Dados do Pipeline</Badge>
-              </DialogTitle>
-              <DialogDescription>
-                Todas as informações do projeto vindas do CRM / Pipeline
-              </DialogDescription>
-            </DialogHeader>
-
-            {clientInfo && (
               <div className="space-y-5 text-sm py-2">
-                {/* Identificação */}
                 <section>
                   <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
-                    <span className="w-1 h-4 bg-blue-500 rounded" />
-                    Identificação
+                    <span className="w-1 h-4 bg-blue-500 rounded" /> Identificação
                   </h4>
                   <div className="grid grid-cols-2 gap-x-6 gap-y-3 pl-3">
                     <InfoRow label="1. Produto" value={clientInfo.produto} />
@@ -693,12 +819,9 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                     <InfoRow label="9. Orçamento" value={clientInfo.orcamento_projeto} />
                   </div>
                 </section>
-
-                {/* Especificações Técnicas */}
                 <section>
                   <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
-                    <span className="w-1 h-4 bg-purple-500 rounded" />
-                    Especificações Técnicas
+                    <span className="w-1 h-4 bg-purple-500 rounded" /> Especificações Técnicas
                   </h4>
                   <div className="grid grid-cols-2 gap-x-6 gap-y-3 pl-3">
                     <InfoRow label="10. Textura Esperada" value={clientInfo.textura_esperada} />
@@ -707,13 +830,10 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                     <InfoRow label="13. pH" value={clientInfo.ph} />
                   </div>
                 </section>
-
-                {/* Objetivo & Detalhes */}
                 {(clientInfo.objetivo_projeto || clientInfo.aplicacoes_desenvolver || clientInfo.ativos_claims) && (
                   <section>
                     <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
-                      <span className="w-1 h-4 bg-green-500 rounded" />
-                      Objetivos & Detalhes do Projeto
+                      <span className="w-1 h-4 bg-green-500 rounded" /> Objetivos & Detalhes do Projeto
                     </h4>
                     <div className="space-y-3 pl-3">
                       {clientInfo.objetivo_projeto && (
@@ -737,13 +857,10 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                     </div>
                   </section>
                 )}
-
-                {/* Referências */}
                 {(clientInfo.referencias || clientInfo.referencias_fotos_url) && (
                   <section>
                     <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
-                      <span className="w-1 h-4 bg-amber-500 rounded" />
-                      Referências
+                      <span className="w-1 h-4 bg-amber-500 rounded" /> Referências
                     </h4>
                     <div className="space-y-3 pl-3">
                       {clientInfo.referencias && (
@@ -763,13 +880,10 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                     </div>
                   </section>
                 )}
-
-                {/* Observações Adicionais */}
                 {clientInfo.outras_observacoes && (
                   <section>
                     <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3 flex items-center gap-2">
-                      <span className="w-1 h-4 bg-rose-500 rounded" />
-                      Outras Observações
+                      <span className="w-1 h-4 bg-rose-500 rounded" /> Outras Observações
                     </h4>
                     <div className="pl-3">
                       <span className="text-muted-foreground text-xs font-medium block mb-1">14. Outras Observações</span>
@@ -777,8 +891,6 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                     </div>
                   </section>
                 )}
-
-                {/* Metadata */}
                 <section className="pt-3 border-t">
                   <div className="flex items-center justify-between text-[11px] text-muted-foreground">
                     <span>
@@ -786,257 +898,407 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
                       {req.created_at && <> em {new Date(req.created_at).toLocaleDateString("pt-BR")}</>}
                     </span>
                     {clientInfo.nome_cliente && (
-                      <Badge variant="secondary" className="text-[10px]">
-                        Cliente: {clientInfo.nome_cliente}
-                      </Badge>
+                      <Badge variant="secondary" className="text-[10px]">Cliente: {clientInfo.nome_cliente}</Badge>
                     )}
                   </div>
                 </section>
               </div>
-            )}
 
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setShowBriefingDetail(false)} data-testid="close-briefing-detail-btn">
-                Fechar
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setShowBriefingDetail(false)} data-testid="close-briefing-detail-btn">
+                  Fechar
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </>
+      )}
+
+      {/* — Detalhes da Solicitação — */}
+      <div className="border rounded-xl overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b bg-muted/20">
+          <div className="flex items-center gap-3">
+            <span className="w-1 h-5 bg-primary rounded-full" />
+            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Detalhes da Solicitação</p>
+          </div>
+          {!editing ? (
+            canEdit && (
+              <Button size="sm" variant="ghost" onClick={startEditing} className="gap-1.5 text-xs h-7">
+                <Pencil className="h-3 w-3" /> Editar
               </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        {/* Request Details */}
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-base">Detalhes da Solicitação</CardTitle>
-              {!editing ? (
-                canEdit && (
-                  <Button size="sm" variant="ghost" onClick={startEditing} className="gap-1.5 text-xs">
-                    <Pencil className="h-3.5 w-3.5" />
-                    Editar
-                  </Button>
-                )
-              ) : (
-                <div className="flex gap-1.5">
-                  <Button size="sm" variant="default" onClick={saveChanges} disabled={saving} className="gap-1 text-xs">
-                    <Save className="h-3.5 w-3.5" />
-                    {saving ? "Salvando..." : "Salvar"}
-                  </Button>
-                  <Button size="sm" variant="ghost" onClick={() => setEditing(false)} className="text-xs">
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
+            )
+          ) : (
+            <div className="flex gap-1.5">
+              <Button size="sm" variant="default" onClick={saveChanges} disabled={saving} className="gap-1 text-xs h-7">
+                <Save className="h-3 w-3" />{saving ? "Salvando..." : "Salvar"}
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setEditing(false)} className="h-7">
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          )}
+        </div>
+        <div className="px-6 py-5">
+          {!editing ? (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-8 gap-y-4">
+                {[
+                  ["Tipo", req.request_type],
+                  ["Categoria", req.category],
+                  ["Prioridade", req.priority],
+                  ["Prazo", req.deadline ? new Date(req.deadline).toLocaleDateString("pt-BR") : null],
+                  ["Volume", req.volume],
+                  ["Embalagem", req.packaging],
+                ].map(([label, value]) => (
+                  <div key={label}>
+                    <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{label}</p>
+                    <p className="text-sm font-medium">{value || "—"}</p>
+                  </div>
+                ))}
+              </div>
+              {(req.status === "APPROVED" || req.status === "COMPLETED") && (
+                <div className="border-t pt-3">
+                  <SkuField reqId={req.id} currentSku={req.sku} canEdit={canEdit} onRefresh={onRefresh} />
                 </div>
               )}
+              {req.description && (
+                <div className="border-t pt-3">
+                  <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Descrição / Briefing</p>
+                  <p className="text-sm whitespace-pre-wrap text-muted-foreground">{req.description}</p>
+                </div>
+              )}
+              {req.references && (
+                <div className="border-t pt-3">
+                  <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Referências</p>
+                  <p className="text-sm whitespace-pre-wrap text-muted-foreground">{req.references}</p>
+                </div>
+              )}
+              <div className="border-t pt-3 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                Criado por <span className="font-medium">{req.created_by_name}</span> em {new Date(req.created_at).toLocaleDateString("pt-BR")}
+              </div>
             </div>
-          </CardHeader>
-          <CardContent>
-            {!editing ? (
-              <div className="space-y-3 text-sm">
-                <div className="grid grid-cols-2 gap-x-6 gap-y-2">
-                  <InfoRow label="Tipo" value={req.request_type} />
-                  <InfoRow label="Categoria" value={req.category} />
-                  <InfoRow label="Prioridade" value={req.priority} />
-                  <InfoRow label="Prazo" value={req.deadline ? new Date(req.deadline).toLocaleDateString("pt-BR") : null} />
-                  <InfoRow label="Volume" value={req.volume} />
-                  <InfoRow label="Embalagem" value={req.packaging} />
+          ) : (
+            <div className="space-y-4">
+              <div>
+                <Label>Nome do Projeto</Label>
+                <Input value={form.project_name} onChange={e => setForm(p => ({ ...p, project_name: e.target.value }))} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label>Tipo</Label>
+                  <Select value={form.request_type} onValueChange={v => setForm(p => ({ ...p, request_type: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>{REQUEST_TYPES.map(t => <SelectItem key={t} value={t}>{t}</SelectItem>)}</SelectContent>
+                  </Select>
                 </div>
-                {/* SKU - only for approved/completed */}
-                {(req.status === "APPROVED" || req.status === "COMPLETED") && (
-                  <SkuField reqId={req.id} currentSku={req.sku} canEdit={canEdit} onRefresh={onRefresh} />
-                )}
-                {req.description && (
-                  <div className="pt-2 border-t">
-                    <span className="text-muted-foreground text-xs font-medium block mb-1">Descrição / Briefing</span>
-                    <p className="whitespace-pre-wrap text-sm">{req.description}</p>
-                  </div>
-                )}
-                {req.references && (
-                  <div>
-                    <span className="text-muted-foreground text-xs font-medium block mb-1">Referências</span>
-                    <p className="whitespace-pre-wrap text-sm">{req.references}</p>
-                  </div>
-                )}
-                <div className="text-[11px] text-muted-foreground pt-2 border-t">
-                  Criado por {req.created_by_name} em {new Date(req.created_at).toLocaleDateString("pt-BR")}
+                <div>
+                  <Label>Categoria</Label>
+                  <Select value={form.category || "placeholder"} onValueChange={v => setForm(p => ({ ...p, category: v === "placeholder" ? "" : v }))}>
+                    <SelectTrigger><SelectValue placeholder="Selecionar..." /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="placeholder" disabled>Selecionar...</SelectItem>
+                      {CATEGORIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
                 </div>
+                <div>
+                  <Label>Prioridade</Label>
+                  <Select value={form.priority} onValueChange={v => setForm(p => ({ ...p, priority: v }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>{PRIORITIES.map(pr => <SelectItem key={pr} value={pr}>{pr}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label>Prazo</Label>
+                  <Input type="date" value={form.deadline} onChange={e => setForm(p => ({ ...p, deadline: e.target.value }))} />
+                </div>
+              </div>
+              <div>
+                <Label>Descrição</Label>
+                <Textarea value={form.description} onChange={e => setForm(p => ({ ...p, description: e.target.value }))} rows={3} />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── MANIPULAÇÃO ─────────────────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-violet-500" Icon={Beaker} title="Manipulação · Fórmulas" action={<GoBtn tab="formula" />} />
+          <div className="px-6 py-4">
+            {formulas.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nenhuma fórmula criada ainda.</p>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-8 gap-y-3">
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Fórmulas</p><p className="text-sm font-semibold">{formulas.length}</p></div>
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Versão Ativa</p><p className="text-sm font-semibold">{latestFormula?.version ? `v${latestFormula.version}` : "—"}</p></div>
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Ingredientes</p><p className="text-sm font-semibold">{latestFormula?.items?.length ?? "—"}</p></div>
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Volume</p><p className="text-sm font-semibold">{latestFormula ? `${latestFormula.volume} ${latestFormula.volume_unit}` : "—"}</p></div>
+                </div>
+                {latestFormula && (
+                  <p className="text-xs text-muted-foreground border-t pt-2">Última: <span className="font-medium text-foreground">{latestFormula.name}</span></p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-violet-500" Icon={Beaker} title="Manipulação · Fórmulas" unlockStage="IN_PROGRESS" />
+      )}
+
+      {/* ── TESTES LABORATORIAIS ─────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-blue-500" Icon={FlaskConical} title="Testes Laboratoriais" action={<GoBtn tab="tests" />} />
+          <div className="px-6 py-4">
+            {tests.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nenhum teste registrado ainda.</p>
+            ) : (
+              <div className="flex items-center gap-4 flex-wrap">
+                {[
+                  { label: "Total", value: testStats.total, color: "text-foreground" },
+                  { label: "Aprovados", value: testStats.approved, color: "text-green-600" },
+                  { label: "Falhas", value: testStats.failed, color: "text-red-500" },
+                  { label: "Pendentes", value: testStats.pending, color: "text-amber-500" },
+                ].map(({ label, value, color }) => (
+                  <div key={label} className="flex flex-col items-center gap-0.5 min-w-[48px]">
+                    <span className={`text-xl font-bold font-mono ${color}`}>{value}</span>
+                    <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</span>
+                  </div>
+                ))}
+                <div className="ml-auto">
+                  {testStats.failed > 0 && <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 text-[10px]">{testStats.failed} falha(s)</Badge>}
+                  {testStats.failed === 0 && testStats.total > 0 && testStats.pending === 0 && <Badge className="bg-green-100 text-green-700 text-[10px]">Todos aprovados</Badge>}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-blue-500" Icon={FlaskConical} title="Testes Laboratoriais" unlockStage="IN_PROGRESS" />
+      )}
+
+      {/* ── AMOSTRAS ────────────────────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-amber-500" Icon={Package} title="Amostras Físicas" action={<GoBtn tab="samples" />} />
+          <div className="px-6 py-4">
+            {samples.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nenhuma amostra gerada ainda.</p>
+            ) : (
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-x-8 gap-y-2">
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Total de Amostras</p><p className="text-sm font-semibold">{samples.length}</p></div>
+                  <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Última Amostra</p><p className="text-sm font-semibold truncate">{samples[samples.length - 1]?.name || "—"}</p></div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-amber-500" Icon={Package} title="Amostras Físicas" unlockStage="IN_PROGRESS" />
+      )}
+
+      {/* ── ESTABILIDADES ────────────────────────────────── */}
+      {unlocked("IN_TESTS") ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-cyan-500" Icon={TestTube} title="Estabilidades" action={<GoBtn tab="estabilidades" />} />
+          <div className="px-6 py-4">
+            <p className="text-sm text-muted-foreground">Registre e acompanhe os estudos de estabilidade da fórmula.</p>
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-cyan-500" Icon={TestTube} title="Estabilidades" unlockStage="IN_TESTS" />
+      )}
+
+      {/* ── FICHA TÉCNICA ────────────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-indigo-500" Icon={ClipboardList} title="Ficha Técnica" action={<GoBtn tab="ficha_tecnica" />} />
+          <div className="px-6 py-4 flex items-center gap-3 flex-wrap">
+            <p className="text-sm text-muted-foreground flex-1">Documento técnico completo da fórmula.</p>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs h-7" onClick={() => setActiveTab && setActiveTab("ficha_tecnica")}>
+              <ClipboardList className="h-3 w-3" /> Abrir Ficha
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-indigo-500" Icon={ClipboardList} title="Ficha Técnica" unlockStage="IN_PROGRESS" />
+      )}
+
+      {/* ── CUSTOS P&D ───────────────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-emerald-500" Icon={DollarSign} title="Custos P&D" action={<GoBtn tab="costs" />} />
+          <div className="px-6 py-4">
+            {formulaCostData ? (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-8 gap-y-3">
+                <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Custo Unitário</p><p className="text-sm font-semibold font-mono">R$ {formulaCostData.custo_unitario?.toFixed(2) ?? "—"}</p></div>
+                <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Custo / kg</p><p className="text-sm font-semibold font-mono">R$ {formulaCostData.custo_por_kg?.toFixed(2) ?? "—"}</p></div>
+                <div><p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Versões</p><p className="text-sm font-semibold">{(costs || []).length}</p></div>
               </div>
             ) : (
-              <div className="space-y-4">
-                <div>
-                  <Label>Nome do Projeto</Label>
-                  <Input value={form.project_name} onChange={e => setForm(p => ({ ...p, project_name: e.target.value }))} />
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <Label>Tipo</Label>
-                    <Select value={form.request_type} onValueChange={v => setForm(p => ({ ...p, request_type: v }))}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {REQUEST_TYPES.map(t => <SelectItem key={t} value={t}>{t}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <Label>Categoria</Label>
-                    <Select value={form.category || "placeholder"} onValueChange={v => setForm(p => ({ ...p, category: v === "placeholder" ? "" : v }))}>
-                      <SelectTrigger><SelectValue placeholder="Selecionar..." /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="placeholder" disabled>Selecionar...</SelectItem>
-                        {CATEGORIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <Label>Prioridade</Label>
-                    <Select value={form.priority} onValueChange={v => setForm(p => ({ ...p, priority: v }))}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {PRIORITIES.map(pr => <SelectItem key={pr} value={pr}>{pr}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <Label>Prazo</Label>
-                    <Input type="date" value={form.deadline} onChange={e => setForm(p => ({ ...p, deadline: e.target.value }))} />
-                  </div>
-                </div>
-                <div>
-                  <Label>Descrição</Label>
-                  <Textarea value={form.description} onChange={e => setForm(p => ({ ...p, description: e.target.value }))} rows={3} />
-                </div>
-              </div>
+              <p className="text-sm text-muted-foreground">Nenhuma versão de custo calculada ainda.</p>
             )}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-emerald-500" Icon={DollarSign} title="Custos P&D" unlockStage="IN_PROGRESS" />
+      )}
 
-        {/* Development + Indicators */}
-        {hasDev && (
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base">Desenvolvimento</CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm">
-              <div className="grid grid-cols-2 gap-x-6 gap-y-2 mb-4">
-                <InfoRow label="Responsável" value={dev.assigned_to_name} />
-                <InfoRow label="Versão Atual" value={`v${dev.current_version}`} />
-                <InfoRow label="Início" value={new Date(dev.started_at).toLocaleDateString("pt-BR")} />
-                <InfoRow label="Status" value={dev.status === "active" ? "Ativo" : "Concluído"} />
-              </div>
+      {/* ── COMERCIAL ────────────────────────────────────── */}
+      {canViewCommercial && unlocked("WAITING_APPROVAL") ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-rose-500" Icon={Building2} title="Comercial" action={<GoBtn tab="comercial" />} />
+          <div className="px-6 py-4">
+            <p className="text-sm text-muted-foreground">Versões de custo com margens e preços comerciais.</p>
+          </div>
+        </div>
+      ) : canViewCommercial ? (
+        <LockedSection accentColor="bg-rose-500" Icon={Building2} title="Comercial" unlockStage="WAITING_APPROVAL" />
+      ) : null}
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t">
-                <MiniCard icon={Beaker} label="Fórmulas" value={formulas.length} color="text-purple-500" />
-                <MiniCard icon={FlaskConical} label="Testes" value={`${testStats.approved}/${testStats.total}`} color="text-blue-500" extra={testStats.failed > 0 ? `${testStats.failed} falha(s)` : null} extraColor="text-red-500" />
-                <MiniCard icon={Package} label="Amostras" value={samples.length} color="text-amber-500" />
-                <MiniCard icon={DollarSign} label="Custo Unit." value={formulaCostData ? `R$ ${formulaCostData.custo_unitario.toFixed(2)}` : "—"} color="text-green-500" />
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Approval */}
-        {hasDev && (
-          <Card className={approval ? (approval.approved_by_client && approval.approved_by_internal ? "border-green-300 dark:border-green-800" : "border-orange-300 dark:border-orange-800") : ""}>
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <ShieldCheck className="h-4 w-4" />
-                  Aprovação
-                </CardTitle>
-                <Button size="sm" variant={showApproval ? "secondary" : "outline"} onClick={() => setShowApproval(!showApproval)} className="gap-1.5 text-xs" disabled={!canEdit}>
-                  {showApproval ? <X className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
-                  {showApproval ? "Fechar" : (approval ? "Editar" : "Registrar")}
+      {/* ── APROVAÇÃO ────────────────────────────────────── */}
+      {hasDev && (
+        <div className={`border rounded-xl overflow-hidden ${
+          approval?.approved_by_client && approval?.approved_by_internal
+            ? "border-green-300 dark:border-green-800"
+            : approval ? "border-orange-300 dark:border-orange-800" : ""
+        }`}>
+          <div className="flex items-center justify-between px-6 py-4 border-b bg-muted/20">
+            <div className="flex items-center gap-3">
+              <span className="w-1 h-5 bg-green-500 rounded-full" />
+              <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
+              <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Aprovação</p>
+            </div>
+            <Button size="sm" variant={showApproval ? "secondary" : "outline"} onClick={() => setShowApproval(!showApproval)} className="gap-1.5 text-xs h-7" disabled={!canEdit}>
+              {showApproval ? <X className="h-3 w-3" /> : <Pencil className="h-3 w-3" />}
+              {showApproval ? "Fechar" : (approval ? "Editar" : "Registrar")}
+            </Button>
+          </div>
+          <div className="px-6 py-4">
+            {!showApproval ? (
+              approval ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {approval.approved_by_client ? (
+                      <Badge className="bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 gap-1"><CheckCircle2 className="h-3 w-3" />Cliente Aprovou</Badge>
+                    ) : (
+                      <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 gap-1"><Clock className="h-3 w-3" />Cliente Pendente</Badge>
+                    )}
+                    {approval.approved_by_internal ? (
+                      <Badge className="bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 gap-1"><CheckCircle2 className="h-3 w-3" />Aprovação Interna</Badge>
+                    ) : (
+                      <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 gap-1"><Clock className="h-3 w-3" />Interno Pendente</Badge>
+                    )}
+                  </div>
+                  {approval.notes && <p className="text-xs text-muted-foreground bg-muted/50 p-2 rounded mt-2">{approval.notes}</p>}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">Nenhuma aprovação registrada.</p>
+              )
+            ) : (
+              <div className="space-y-4">
+                <div className="flex items-center gap-6">
+                  <div className="flex items-center gap-2">
+                    <Switch checked={approvalForm.approved_by_client} onCheckedChange={v => setApprovalForm(p => ({ ...p, approved_by_client: v }))} />
+                    <Label>Aprovação do Cliente</Label>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Switch checked={approvalForm.approved_by_internal} onCheckedChange={v => setApprovalForm(p => ({ ...p, approved_by_internal: v }))} />
+                    <Label>Aprovação Interna</Label>
+                  </div>
+                </div>
+                <div>
+                  <Label>Observações</Label>
+                  <Textarea value={approvalForm.notes} onChange={e => setApprovalForm(p => ({ ...p, notes: e.target.value }))} rows={2} />
+                </div>
+                <Button size="sm" onClick={saveApproval} disabled={savingApproval} className="gap-1.5">
+                  <Save className="h-3.5 w-3.5" />
+                  {savingApproval ? "Salvando..." : "Salvar Aprovação"}
                 </Button>
               </div>
-            </CardHeader>
-            <CardContent>
-              {!showApproval ? (
-                approval ? (
-                  <div className="space-y-2 text-sm">
-                    <div className="flex items-center gap-3">
-                      {approval.approved_by_client ? (
-                        <Badge className="bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 gap-1"><CheckCircle2 className="h-3 w-3" />Cliente Aprovou</Badge>
-                      ) : (
-                        <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 gap-1"><Clock className="h-3 w-3" />Cliente Pendente</Badge>
-                      )}
-                      {approval.approved_by_internal ? (
-                        <Badge className="bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 gap-1"><CheckCircle2 className="h-3 w-3" />Aprovação Interna</Badge>
-                      ) : (
-                        <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 gap-1"><Clock className="h-3 w-3" />Interno Pendente</Badge>
-                      )}
-                    </div>
-                    {approval.notes && <p className="text-xs text-muted-foreground bg-muted/50 p-2 rounded mt-2">{approval.notes}</p>}
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">Nenhuma aprovação registrada.</p>
-                )
-              ) : (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-6">
-                    <div className="flex items-center gap-2">
-                      <Switch checked={approvalForm.approved_by_client} onCheckedChange={v => setApprovalForm(p => ({ ...p, approved_by_client: v }))} />
-                      <Label>Aprovação do Cliente</Label>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Switch checked={approvalForm.approved_by_internal} onCheckedChange={v => setApprovalForm(p => ({ ...p, approved_by_internal: v }))} />
-                      <Label>Aprovação Interna</Label>
-                    </div>
-                  </div>
-                  <div>
-                    <Label>Observações</Label>
-                    <Textarea value={approvalForm.notes} onChange={e => setApprovalForm(p => ({ ...p, notes: e.target.value }))} rows={2} />
-                  </div>
-                  <Button size="sm" onClick={saveApproval} disabled={savingApproval} className="gap-1.5">
-                    <Save className="h-3.5 w-3.5" />
-                    {savingApproval ? "Salvando..." : "Salvar Aprovação"}
-                  </Button>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── DOCUMENTOS ───────────────────────────────────── */}
+      {unlocked("IN_PROGRESS") && hasDev ? (
+        <div className="border rounded-xl overflow-hidden">
+          <SectionHead accentColor="bg-orange-500" Icon={FileText} title="Documentos" action={<GoBtn tab="documents" />} />
+          <div className="px-6 py-4">
+            {(documents || []).length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nenhum documento anexado ainda.</p>
+            ) : (
+              <div className="flex items-center gap-3">
+                <span className="text-2xl font-bold font-mono">{documents.length}</span>
+                <span className="text-sm text-muted-foreground">documento(s) anexado(s)</span>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <LockedSection accentColor="bg-orange-500" Icon={FileText} title="Documentos" unlockStage="IN_PROGRESS" />
+      )}
+
+      {/* ── DOCUMENTOS VIVOS ─────────────────────────────── */}
+      <div className="border rounded-xl overflow-hidden">
+        <SectionHead accentColor="bg-teal-500" Icon={ShieldCheck} title="Documentos Vivos" action={<GoBtn tab="live_docs" />} />
+        <div className="px-6 py-4">
+          <p className="text-sm text-muted-foreground">Documentos regulatórios e de conformidade vinculados ao projeto.</p>
+        </div>
       </div>
 
-      {/* Right: Progress Timeline + History */}
-      <div className="space-y-4">
-        <Card className="sticky top-6">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <CheckCircle className="h-4 w-4 text-green-500" />
-              Progresso
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <SampleProgressTimeline req={req} formulas={formulas} tests={tests} samples={samples} approval={approval} />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <History className="h-4 w-4" />
-              Histórico
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-0">
-              {history.map((h, i) => (
-                <div key={h.id} className="flex gap-3 text-sm">
-                  <div className="flex flex-col items-center">
-                    <div className={`w-2.5 h-2.5 rounded-full mt-1.5 shrink-0 ${STATUS_CONFIG[h.to_status]?.dotColor || "bg-gray-400"}`} />
-                    {i < history.length - 1 && <div className="w-px flex-1 bg-border" />}
-                  </div>
-                  <div className="pb-4">
-                    <div className="font-medium text-xs">{STATUS_CONFIG[h.to_status]?.label || h.to_status}</div>
-                    <div className="text-xs text-muted-foreground">{h.comment}</div>
-                    <div className="text-[10px] text-muted-foreground mt-0.5">
-                      {h.changed_by_name} • {new Date(h.created_at).toLocaleString("pt-BR")}
-                    </div>
+      {/* ── ATUALIZAÇÕES ─────────────────────────────────── */}
+      <div className="border rounded-xl overflow-hidden">
+        <SectionHead accentColor="bg-amber-500" Icon={Bell} title="Atualizações" action={<GoBtn tab="updates" />} />
+        <div className="px-6 py-4">
+          {pendingUpdates > 0 && (
+            <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 gap-1 mb-2">
+              <Hourglass className="h-3 w-3" /> {pendingUpdates} pendência(s)
+            </Badge>
+          )}
+          {lastUpdate ? (
+            <p className="text-xs text-muted-foreground line-clamp-2">{lastUpdate.content || lastUpdate.message || "Sem conteúdo"}</p>
+          ) : (
+            <p className="text-sm text-muted-foreground">Nenhuma atualização registrada.</p>
+          )}
+        </div>
+      </div>
+
+      {/* ── HISTÓRICO DE STATUS ──────────────────────────── */}
+      <div className="border rounded-xl overflow-hidden">
+        <div className="flex items-center gap-3 px-6 py-4 border-b bg-muted/20">
+          <span className="w-1 h-5 bg-slate-400 rounded-full" />
+          <History className="h-3.5 w-3.5 text-muted-foreground" />
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Histórico de Status</p>
+        </div>
+        <div className="px-6 py-4">
+          <div className="space-y-0">
+            {history.map((h, i) => (
+              <div key={h.id} className="flex gap-3 text-sm">
+                <div className="flex flex-col items-center">
+                  <div className={`w-2.5 h-2.5 rounded-full mt-1.5 shrink-0 ${STATUS_CONFIG[h.to_status]?.dotColor || "bg-gray-400"}`} />
+                  {i < history.length - 1 && <div className="w-px flex-1 bg-border" style={{ minHeight: 20 }} />}
+                </div>
+                <div className="pb-4">
+                  <div className="font-medium text-xs">{STATUS_CONFIG[h.to_status]?.label || h.to_status}</div>
+                  <div className="text-xs text-muted-foreground">{h.comment}</div>
+                  <div className="text-[10px] text-muted-foreground mt-0.5">
+                    {h.changed_by_name} • {new Date(h.created_at).toLocaleString("pt-BR")}
                   </div>
                 </div>
-              ))}
-              {history.length === 0 && <p className="text-xs text-muted-foreground">Sem histórico</p>}
-            </div>
-          </CardContent>
-        </Card>
+              </div>
+            ))}
+            {history.length === 0 && <p className="text-xs text-muted-foreground">Sem histórico</p>}
+          </div>
+        </div>
       </div>
+
     </div>
   );
 }

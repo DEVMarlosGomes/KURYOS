@@ -39,7 +39,7 @@ export default function ComprasPOLista() {
             const params = { limit: 100 };
             if (statusFiltro && statusFiltro !== "all") params.status = statusFiltro;
             if (urgenteOnly) params.urgente = true;
-            const { data } = await api.get("/api/compras/pos", { params });
+            const { data } = await api.get("/compras/pos", { params });
             setPos(data.pos || []);
             setTotal(data.total || 0);
         } catch { toast.error("Erro ao carregar POs"); }

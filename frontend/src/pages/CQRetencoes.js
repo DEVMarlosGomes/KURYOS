@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import api from "@/lib/api";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, Filter } from "lucide-react";
+import { Loader2, Filter, ChevronRight } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -53,6 +54,7 @@ function DiasBadge({ diasRestantes }) {
 }
 
 export default function CQRetencoes() {
+    const navigate = useNavigate();
     const { user } = useAuth();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -138,19 +140,20 @@ export default function CQRetencoes() {
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground hidden lg:table-cell">Limite Guarda</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">Situação</th>
                                 <th className="text-left px-4 py-3 font-medium text-muted-foreground">Status</th>
+                                <th className="px-4 py-3" />
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-border">
                             {items.length === 0 ? (
                                 <tr>
-                                    <td colSpan={8} className="text-center py-10 text-muted-foreground">
+                                    <td colSpan={9} className="text-center py-10 text-muted-foreground">
                                         Nenhuma amostra de retenção encontrada.
                                     </td>
                                 </tr>
                             ) : items.map((ret) => {
                                 const diasRestantes = getDiasRestantes(ret.data_limite_guarda);
                                 return (
-                                    <tr key={ret.id} className="hover:bg-accent/20 transition-colors" data-testid={`row-ret-${ret.id}`}>
+                                    <tr key={ret.id} className="hover:bg-accent/40 cursor-pointer transition-colors" onClick={() => navigate(`/cq/retencoes/${ret.id}`)} data-testid={`row-ret-${ret.id}`}>
                                         <td className="px-4 py-3 font-mono text-xs font-medium">{ret.numero_ret || ret.numero || "—"}</td>
                                         <td className="px-4 py-3">
                                             <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
@@ -172,6 +175,9 @@ export default function CQRetencoes() {
                                             <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${STATUS_COLORS[ret.status] || "bg-gray-100 text-gray-700"}`}>
                                                 {STATUS_LABELS[ret.status] || ret.status || "—"}
                                             </span>
+                                        </td>
+                                        <td className="px-4 py-3">
+                                            <ChevronRight className="h-4 w-4 text-muted-foreground" />
                                         </td>
                                     </tr>
                                 );

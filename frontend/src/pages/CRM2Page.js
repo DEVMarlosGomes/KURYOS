@@ -299,7 +299,13 @@ export default function CRM2Page() {
         }
         if (data.trigger_batch_samples) {
             setBatchProjectId(projectId);
-            setBatchSamples([createEmptySample()]);
+            const proj = projects.find(p => p.id === projectId);
+            const inherited = createEmptySample();
+            if (proj) {
+                if (proj.categoria) inherited.categoria = proj.categoria;
+                if (proj.responsavel_interno) inherited.responsavel_pd = proj.responsavel_interno;
+            }
+            setBatchSamples([inherited]);
             setShowBatchSamples(true);
         }
         await loadProjects();
@@ -346,8 +352,8 @@ export default function CRM2Page() {
         const validSamples = batchSamples.filter((sample) => (
             sample.nome_produto.trim()
             && sample.tipo_amostra
-            && String(sample.quantidade_por_variacao || "").trim()
             && sample.prazo_entrega_cliente
+            && (!sample.parametro_variacao || String(sample.quantidade_por_variacao || "").trim())
         ));
         if (!validSamples.length) {
             toast.error("Preencha os campos obrigatórios de pelo menos uma amostra.");
@@ -397,7 +403,12 @@ export default function CRM2Page() {
     const handleManualSampleCreation = () => {
         if (!selectedProjectId) return;
         setBatchProjectId(selectedProjectId);
-        setBatchSamples([createEmptySample()]);
+        const inherited = createEmptySample();
+        if (selectedProject) {
+            if (selectedProject.categoria) inherited.categoria = selectedProject.categoria;
+            if (selectedProject.responsavel_interno) inherited.responsavel_pd = selectedProject.responsavel_interno;
+        }
+        setBatchSamples([inherited]);
         setShowBatchSamples(true);
     };
 
@@ -877,6 +888,15 @@ export default function CRM2Page() {
                 updateVariacao={updateVariacao}
                 generateVariacaoLetters={generateVariacaoLetters}
                 constants={sampleConstants}
+                onAddSample={() => {
+                    const proj = projects.find(p => p.id === batchProjectId);
+                    const inherited = createEmptySample();
+                    if (proj) {
+                        if (proj.categoria) inherited.categoria = proj.categoria;
+                        if (proj.responsavel_interno) inherited.responsavel_pd = proj.responsavel_interno;
+                    }
+                    setBatchSamples([...batchSamples, inherited]);
+                }}
             />
 
             <Dialog open={showArchiveDialog} onOpenChange={setShowArchiveDialog}>

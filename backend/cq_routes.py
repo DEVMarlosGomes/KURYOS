@@ -276,6 +276,7 @@ class ChecklistItemInput(BaseModel):
 
 class ChecklistCreate(BaseModel):
     tipo: str                             # CK-1 a CK-8
+    nome: Optional[str] = None           # título descritivo exibido na listagem
     op_id: Optional[str] = None          # OBRIGATÓRIO para CK-3 a CK-8
     op_numero: Optional[str] = None
     lote_id: Optional[str] = None
@@ -283,6 +284,7 @@ class ChecklistCreate(BaseModel):
     turno: Optional[str] = None
     subtipo_insumo: Optional[str] = None    # CK-1 only: frasco|tampa|valvula|rotulo|cartucho|caixa
     horario_previsto_ronda: Optional[str] = None  # CK-6 only
+    ra_id: Optional[str] = None          # vínculo com Registro de Análise de origem
     itens: Optional[List[ChecklistItemInput]] = None
 
 
@@ -1843,8 +1845,10 @@ async def criar_checklist(data: ChecklistCreate, request: Request):
         "lote_id": data.lote_id,
         "linha": data.linha,
         "turno": data.turno,
+        "nome": data.nome,
         "subtipo_insumo": data.subtipo_insumo,
         "horario_previsto_ronda": data.horario_previsto_ronda,
+        "ra_id": data.ra_id,
         "itens": itens,
         "ncs_identificadas": 0,
         "rncs_geradas": [],
@@ -1888,6 +1892,7 @@ async def listar_checklists(
     op_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     lote_id: Optional[str] = Query(None),
+    ra_id: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -1904,6 +1909,8 @@ async def listar_checklists(
         query["status"] = status
     if lote_id:
         query["lote_id"] = lote_id
+    if ra_id:
+        query["ra_id"] = ra_id
 
     cursor = (
         db.cq_checklists.find(query, {"_id": 0})

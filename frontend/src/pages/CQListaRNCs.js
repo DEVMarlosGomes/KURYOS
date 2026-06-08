@@ -3,7 +3,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, ChevronRight, Filter } from "lucide-react";
+import { Loader2, ChevronRight, Filter, Info } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -129,8 +129,16 @@ export default function CQListaRNCs() {
                         <tbody className="divide-y divide-border">
                             {items.length === 0 ? (
                                 <tr>
-                                    <td colSpan={9} className="text-center py-10 text-muted-foreground">
-                                        Nenhuma RNC encontrada.
+                                    <td colSpan={9} className="py-10">
+                                        <div className="flex flex-col items-center gap-2 text-muted-foreground">
+                                            <Info className="h-8 w-8 opacity-40" />
+                                            <p className="font-medium text-sm">Nenhuma RNC encontrada</p>
+                                            {filterStatus === "all" && filterClass === "all" && (
+                                                <p className="text-xs text-center max-w-xs">
+                                                    RNCs são criadas automaticamente ao <strong>reprovar um Registro de Análise</strong> ou ao marcar um item de checklist como "Não Conforme crítico".
+                                                </p>
+                                            )}
+                                        </div>
                                     </td>
                                 </tr>
                             ) : items.map((rnc) => (

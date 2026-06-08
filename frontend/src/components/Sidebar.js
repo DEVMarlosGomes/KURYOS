@@ -29,14 +29,6 @@ const NAV_MODULES = [
         roles: null,
     },
     {
-        key: "pipeline",
-        type: "link",
-        path: "/pipeline",
-        label: "Pipeline",
-        icon: Kanban,
-        roles: ["admin", "vendedor", "sales_ops", "sucesso_cliente", "gestor"],
-    },
-    {
         key: "crm",
         type: "group",
         label: "CRM Comercial",

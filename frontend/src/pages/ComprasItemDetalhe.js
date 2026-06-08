@@ -23,7 +23,7 @@ function NovaCotacaoDialog({ open, itemId, onClose, onCreated }) {
 
     useEffect(() => {
         if (!open) return;
-        api.get("/api/compras/fornecedores", { params: { limit: 200 } }).then(r => setFornecedores(r.data?.fornecedores || []));
+        api.get("/compras/fornecedores", { params: { limit: 200 } }).then(r => setFornecedores(r.data?.fornecedores || []));
     }, [open]);
 
     const set = (k, v) => setForm(f => ({ ...f, [k]: v }));

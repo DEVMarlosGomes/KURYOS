@@ -1602,6 +1602,113 @@ async def dashboard_metrics(request: Request):
         "pipeline_id": pipeline_id
     }
 
+# ============ ERP OVERVIEW (global dashboard) ============
+
+@router.get("/erp-overview")
+async def erp_overview(request: Request):
+    """Aggregated KPIs from all ERP modules for the global dashboard."""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+
+    import asyncio
+    (
+        # CRM
+        total_clientes,
+        clientes_ativos,
+        total_projetos,
+        projetos_ativos,
+        total_amostras,
+        amostras_andamento,
+        # P&D
+        pd_total,
+        pd_open,
+        pd_in_progress,
+        pd_in_tests,
+        pd_waiting,
+        pd_approved,
+        pd_completed,
+        total_formulas,
+        # CQ
+        ras_pendentes,
+        rncs_abertas,
+        retencoes_ativas,
+        # Compras
+        fornecedores_homologados,
+        pos_abertas,
+        # Pedidos
+        pedidos_abertos,
+        # Tarefas
+        tasks_pendentes,
+        tasks_atrasadas,
+    ) = await asyncio.gather(
+        # CRM
+        db.crm_clients.count_documents({"tenant_id": tid}),
+        db.crm_clients.count_documents({"tenant_id": tid, "stage": {"$nin": ["cliente_perdido"]}}),
+        db.crm_projects.count_documents({"tenant_id": tid}),
+        db.crm_projects.count_documents({"tenant_id": tid, "stage": {"$nin": ["projeto_arquivado", "projeto_cancelado"]}}),
+        db.crm_samples.count_documents({"tenant_id": tid}),
+        db.crm_samples.count_documents({"tenant_id": tid, "stage": {"$in": ["solicitada", "em_elaboracao", "retrabalho", "enviada"]}}),
+        # P&D
+        db.pd_requests.count_documents({"tenant_id": tid}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "OPEN"}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "IN_PROGRESS"}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "IN_TESTS"}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "WAITING_APPROVAL"}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "APPROVED"}),
+        db.pd_requests.count_documents({"tenant_id": tid, "status": "COMPLETED"}),
+        db.pd_formulas.count_documents({"tenant_id": tid}),
+        # CQ
+        db.cq_registros_analise.count_documents({"tenant_id": tid, "status": {"$in": ["rascunho", "em_analise"]}}),
+        db.cq_rncs.count_documents({"tenant_id": tid, "status": {"$in": ["aberta", "em_tratamento"]}}),
+        db.cq_retencoes.count_documents({"tenant_id": tid, "status": "em_guarda"}),
+        # Compras
+        db.compras_fornecedores.count_documents({"tenant_id": tid, "homologacao.status": "homologado"}),
+        db.compras_pos.count_documents({"tenant_id": tid, "status": {"$in": ["emitida", "confirmada"]}}),
+        # Pedidos
+        db.orders.count_documents({"tenant_id": tid, "status": {"$in": ["rascunho", "aprovado", "em_producao"]}}),
+        # Tarefas
+        db.tasks.count_documents({"tenant_id": tid, "status": "pendente"}),
+        db.tasks.count_documents({"tenant_id": tid, "status": "pendente", "due_date": {"$lt": now_iso()}}),
+    )
+
+    return {
+        "crm": {
+            "total_clientes": total_clientes,
+            "clientes_ativos": clientes_ativos,
+            "total_projetos": total_projetos,
+            "projetos_ativos": projetos_ativos,
+            "total_amostras": total_amostras,
+            "amostras_andamento": amostras_andamento,
+        },
+        "pd": {
+            "total": pd_total,
+            "open": pd_open,
+            "in_progress": pd_in_progress,
+            "in_tests": pd_in_tests,
+            "waiting_approval": pd_waiting,
+            "approved": pd_approved,
+            "completed": pd_completed,
+            "formulas": total_formulas,
+        },
+        "cq": {
+            "ras_pendentes": ras_pendentes,
+            "rncs_abertas": rncs_abertas,
+            "retencoes_ativas": retencoes_ativas,
+        },
+        "compras": {
+            "fornecedores_homologados": fornecedores_homologados,
+            "pos_abertas": pos_abertas,
+        },
+        "pedidos": {
+            "abertos": pedidos_abertos,
+        },
+        "tasks": {
+            "pendentes": tasks_pendentes,
+            "atrasadas": tasks_atrasadas,
+        },
+    }
+
+
 # ============ USERS (for tenant) ============
 
 @router.get("/users")

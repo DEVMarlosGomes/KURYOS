@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Download, Send, Loader2, ChevronRight, Check, X } from "lucide-react";
+import { Download, Send, Loader2, ChevronRight, Check, X, ClipboardList } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -35,6 +35,7 @@ export default function CQDetalheRA() {
     const [ra, setRa] = useState(null);
     const [parametros, setParametros] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [checklists, setChecklists] = useState([]);
     const [showAprovar, setShowAprovar] = useState(false);
     const [showEnvio, setShowEnvio] = useState(false);
     const [aprovDecisao, setAprovDecisao] = useState("aprovado");
@@ -60,6 +61,9 @@ export default function CQDetalheRA() {
                 initResults[p.id] = { resultado: p.resultado ?? "", observacao: p.observacao ?? "" };
             });
             setLocalResults(initResults);
+            const ckRes = await api.get("/cq/checklists", { params: { ra_id: id, limit: 50 } });
+            const ckData = ckRes.data;
+            setChecklists(Array.isArray(ckData) ? ckData : (ckData?.items ?? []));
         } catch (e) {
             toast.error("Erro ao carregar registro de análise");
         } finally {
@@ -137,7 +141,7 @@ export default function CQDetalheRA() {
     const handleEnvio = async () => {
         setEnvioSaving(true);
         try {
-            await api.post(`/cq/registros-analise/${id}/registrar-envio`, {
+            await api.post(`/cq/registros-analise/${id}/registrar-envio-coa`, {
                 cliente_nome: envioCliente,
                 canal: envioCanal,
                 observacoes: envioObs,
@@ -316,6 +320,58 @@ export default function CQDetalheRA() {
                     </span>
                 </div>
             )}
+
+            {/* Checklists vinculados */}
+            <div className="mt-6">
+                <div className="flex items-center gap-2 mb-3">
+                    <ClipboardList className="h-4 w-4 text-muted-foreground" />
+                    <h2 className="font-heading font-semibold">Checklists Vinculados</h2>
+                </div>
+                {checklists.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">Nenhum checklist vinculado a este Registro de Análise.</p>
+                ) : (
+                    <div className="rounded-lg border border-border overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead className="bg-muted/50">
+                                <tr>
+                                    <th className="text-left px-4 py-2 font-medium text-muted-foreground">Nº CK</th>
+                                    <th className="text-left px-4 py-2 font-medium text-muted-foreground">Tipo</th>
+                                    <th className="text-left px-4 py-2 font-medium text-muted-foreground">Nome</th>
+                                    <th className="text-left px-4 py-2 font-medium text-muted-foreground">Status</th>
+                                    <th className="px-4 py-2" />
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-border">
+                                {checklists.map(ck => (
+                                    <tr
+                                        key={ck.id}
+                                        className="hover:bg-accent/40 cursor-pointer transition-colors"
+                                        onClick={() => navigate(`/cq/checklists/${ck.id}`)}
+                                    >
+                                        <td className="px-4 py-2 font-mono text-xs font-medium">{ck.numero_ck}</td>
+                                        <td className="px-4 py-2">
+                                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                                                {ck.tipo}
+                                            </span>
+                                        </td>
+                                        <td className="px-4 py-2 text-sm">{ck.nome || <span className="text-muted-foreground">—</span>}</td>
+                                        <td className="px-4 py-2">
+                                            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${
+                                                ck.status === "aprovado" ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                                                : ck.status === "reprovado" ? "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
+                                                : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200"
+                                            }`}>
+                                                {ck.status === "aprovado" ? "Aprovado" : ck.status === "reprovado" ? "Reprovado" : "Em Preenchimento"}
+                                            </span>
+                                        </td>
+                                        <td className="px-4 py-2"><ChevronRight className="h-4 w-4 text-muted-foreground" /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
 
             {/* Aprovar Modal */}
             <Dialog open={showAprovar} onOpenChange={setShowAprovar}>

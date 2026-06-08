@@ -492,6 +492,8 @@ class SampleBatchItem(BaseModel):
     nome_amostra: str
     codigo_referencia: str = ""
     observacao_tecnica: str = ""
+    tipo_amostra: str = "nova_formula"
+    referencia_formula: str = ""
     produto: str = ""
     objetivo_projeto: str = ""
     aplicacoes_desenvolver: str = ""

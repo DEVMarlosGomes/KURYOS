@@ -14,7 +14,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter
 } from "@/components/ui/dialog";
-import { Building2, FlaskConical, AlertTriangle, ChevronRight, Trash2, Plus, X, Lock, Printer } from "lucide-react";
+import { Building2, FlaskConical, AlertTriangle, ChevronRight, Trash2, Plus, X, Lock, Printer, ExternalLink } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import ViewSwitcher from "@/components/ViewSwitcher";
@@ -47,13 +47,15 @@ function CRMSubNav({ active }) {
     );
 }
 
+// Estágios espelhados do Pipeline P&D (status_pd_raw)
 const STAGES = [
-    { id: "solicitada", label: "Solicitada", color: "bg-slate-400" },
-    { id: "em_elaboracao", label: "Em Elaboração", color: "bg-blue-500" },
-    { id: "retrabalho", label: "Retrabalho", color: "bg-amber-500" },
-    { id: "enviada", label: "Enviada", color: "bg-cyan-500" },
-    { id: "aprovada", label: "Aprovada", color: "bg-emerald-500" },
-    { id: "reprovada", label: "Reprovada", color: "bg-red-500" },
+    { id: "solicitado",          label: "Aberto",               color: "bg-gray-400" },
+    { id: "em_desenvolvimento",  label: "Em Desenvolvimento",   color: "bg-blue-400" },
+    { id: "em_testes",           label: "Em Testes",            color: "bg-purple-400" },
+    { id: "aguardando_aprovacao",label: "Aguardando Aprovação", color: "bg-yellow-400" },
+    { id: "retrabalho_interno",  label: "Retrabalho",           color: "bg-red-400" },
+    { id: "aprovado",            label: "Aprovado",             color: "bg-green-500" },
+    { id: "concluido",           label: "Concluído",            color: "bg-emerald-600" },
 ];
 
 const STAGE_LABELS = Object.fromEntries(STAGES.map(s => [s.id, s.label]));
@@ -162,7 +164,7 @@ export default function CRM3Page() {
         };
     }, []);
 
-    // Agrupar variações por estágio
+    // Agrupar variações por estágio P&D (status_pd_raw) — espelho do Pipeline P&D
     const variacoesByStage = STAGES.reduce((acc, stage) => {
         acc[stage.id] = [];
         samples.forEach(sample => {
@@ -174,20 +176,21 @@ export default function CRM3Page() {
                 }
 
                 if (sample.variacoes && Array.isArray(sample.variacoes) && sample.variacoes.length > 0) {
-                    // Novo modelo com variações
+                    // Novo modelo com variações — agrupa pelo estágio P&D
                     sample.variacoes.forEach(variacao => {
                         if (!variacao || typeof variacao !== 'object') {
                             console.warn("Invalid variacao:", variacao);
                             return;
                         }
-                        
-                        if (variacao.status === stage.id) {
+                        // Usa status_pd_raw; se ainda não houver (card recém-criado), assume "solicitado"
+                        const pdStage = variacao.status_pd_raw || "solicitado";
+                        if (pdStage === stage.id) {
                             acc[stage.id].push({
                                 id: variacao.id || `${sample.id}-var`,
                                 codigo: variacao.codigo || '',
-                                status: variacao.status || stage.id,
-                                status_pd_label: variacao.status_pd_label || null,
-                                status_pd_raw: variacao.status_pd_raw || null,
+                                status: pdStage,
+                                status_pd_label: variacao.status_pd_label || STAGE_LABELS[pdStage] || pdStage,
+                                status_pd_raw: pdStage,
                                 sample_id: sample.id,
                                 sample_numero: sample.numero_amostra || '',
                                 nome_produto: sample.nome_produto || sample.nome_amostra || '',
@@ -198,15 +201,17 @@ export default function CRM3Page() {
                             });
                         }
                     });
-                } else if (sample.stage === stage.id) {
-                    // Modelo antigo sem variações (compatibilidade)
+                } else if (stage.id === "solicitado") {
+                    // Modelo antigo sem variações: aparece sempre em "Aberto"
                     acc[stage.id].push({
                         id: sample.id,
                         codigo: sample.codigo_referencia || sample.id,
-                        status: sample.stage,
+                        status: "solicitado",
+                        status_pd_raw: "solicitado",
+                        status_pd_label: "Aberto",
                         sample_id: sample.id,
                         sample_numero: sample.numero_amostra || '',
-                        nome_produto: sample.nome_amostra || '',
+                        nome_produto: sample.nome_amostra || sample.nome_produto || '',
                         projeto_nome: sample.projeto_nome || '',
                         cliente_nome: sample.cliente_nome || '',
                         descricao_aplicacao: '',
@@ -337,6 +342,27 @@ export default function CRM3Page() {
         }
     };
 
+    const openPdCard = async (variacao) => {
+        if (variacao.pd_request_id) {
+            navigate(`/pd/${variacao.pd_request_id}`);
+            return;
+        }
+        if (!variacao.pd_card_id) {
+            navigate("/pd");
+            return;
+        }
+        try {
+            const { data } = await api.get(`/crm/pd/cards/${variacao.pd_card_id}`);
+            if (data?.pd_request_id) {
+                navigate(`/pd/${data.pd_request_id}`);
+            } else {
+                navigate("/pd");
+            }
+        } catch {
+            navigate("/pd");
+        }
+    };
+
     if (loading) return (
         <div className="p-8 page-enter">
             <div className="animate-pulse space-y-4">
@@ -406,7 +432,7 @@ export default function CRM3Page() {
                 };
 
                 const filteredByStage = STAGES.reduce((acc, s) => {
-                    acc[s.id] = filteredVariacoes.filter((v) => v.status === s.id);
+                    acc[s.id] = filteredVariacoes.filter((v) => (v.status_pd_raw || "solicitado") === s.id);
                     return acc;
                 }, {});
 
@@ -438,7 +464,7 @@ export default function CRM3Page() {
                             </div>
                             <div className="p-2 space-y-2 min-h-[200px]">
                                 {(filteredByStage[stage.id] || []).map((variacao) => {
-                                    const statusLabel = variacao.status_pd_label || STAGE_LABELS[variacao.status] || variacao.status;
+                                    const statusLabel = STAGE_LABELS[variacao.status_pd_raw || "solicitado"] || variacao.status_pd_label || variacao.status;
                                     return (
                                         <div
                                             key={variacao.id || variacao.sample_id}
@@ -667,6 +693,15 @@ export default function CRM3Page() {
                                                             <Lock className="h-2.5 w-2.5 shrink-0" />
                                                         </span>
                                                         {v.sku_id && <Badge className="text-[10px] bg-emerald-500">SKU</Badge>}
+                                                        {(v.pd_request_id || v.pd_card_id) && (
+                                                            <button
+                                                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-300 transition-colors"
+                                                                title="Abrir desenvolvimento no módulo P&D"
+                                                                onClick={() => openPdCard(v)}
+                                                            >
+                                                                <FlaskConical className="h-2.5 w-2.5 shrink-0" /> Abrir P&D
+                                                            </button>
+                                                        )}
                                                     </div>
                                                     <Button
                                                         variant="ghost" size="icon"

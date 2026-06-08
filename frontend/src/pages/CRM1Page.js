@@ -869,7 +869,7 @@ export default function CRM1Page() {
 
                             <div className="space-y-2">
                                 <Label>Categorias de Interesse *</Label>
-                                <div className="space-y-3 rounded-lg border border-border p-3">
+                                <div className={`space-y-3 rounded-lg border p-3 ${(newClient.categoria_interesse || []).length === 0 ? "border-destructive/50 bg-destructive/5" : "border-border"}`}>
                                     {Object.entries(effectiveCategoryGroups).map(([group, values]) => (
                                         <div key={group} className="space-y-2">
                                             <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
@@ -894,6 +894,9 @@ export default function CRM1Page() {
                                         </div>
                                     ))}
                                 </div>
+                                {(newClient.categoria_interesse || []).length === 0 && (
+                                    <p className="text-xs text-destructive">Selecione ao menos uma categoria de interesse.</p>
+                                )}
                             </div>
 
                             <div className="space-y-2">

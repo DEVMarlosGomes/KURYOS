@@ -71,8 +71,7 @@ export default function PDPage() {
         try {
             const params = search ? { search } : {};
             const { data } = await api.get("/crm/pd/cards", { params });
-            console.log("P&D cards loaded:", data);
-            const validCards = Array.isArray(data) ? data.filter(c => c && c.id) : [];
+const validCards = Array.isArray(data) ? data.filter(c => c && c.id) : (Array.isArray(data?.items) ? data.items.filter(c => c && c.id) : []);
             setCards(validCards);
         } catch (e) {
             console.error("Failed to load P&D cards", e);

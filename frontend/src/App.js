@@ -29,6 +29,7 @@ import CQPreencherChecklist from "@/pages/CQPreencherChecklist";
 import CQListaRNCs from "@/pages/CQListaRNCs";
 import CQDetalheRNC from "@/pages/CQDetalheRNC";
 import CQRetencoes from "@/pages/CQRetencoes";
+import CQDetalheRetencao from "@/pages/CQDetalheRetencao";
 import CQInstrumentos from "@/pages/CQInstrumentos";
 import OrdersPage from "@/pages/OrdersPage";
 import OrderDetail from "@/pages/OrderDetail";
@@ -136,6 +137,7 @@ function AppLayout() {
                     <Route path="/cq/rncs" element={<RoleGuard allowed={CQ_ROLES}><CQListaRNCs /></RoleGuard>} />
                     <Route path="/cq/rncs/:id" element={<RoleGuard allowed={CQ_ROLES}><CQDetalheRNC /></RoleGuard>} />
                     <Route path="/cq/retencoes" element={<RoleGuard allowed={CQ_ROLES}><CQRetencoes /></RoleGuard>} />
+                    <Route path="/cq/retencoes/:id" element={<RoleGuard allowed={CQ_ROLES}><CQDetalheRetencao /></RoleGuard>} />
                     <Route path="/cq/instrumentos" element={<RoleGuard allowed={CQ_ROLES}><CQInstrumentos /></RoleGuard>} />
                     <Route path="/team" element={<RoleGuard allowed={ADMIN_ONLY}><TeamPage /></RoleGuard>} />
                 </Routes>

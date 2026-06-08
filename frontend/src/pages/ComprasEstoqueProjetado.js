@@ -251,7 +251,7 @@ export default function ComprasEstoqueProjetado() {
             const params = { horizonte_dias: horizonte };
             if (categoria && categoria !== "all") params.categoria = categoria;
             if (apenasCriticos) params.apenas_criticos = true;
-            const res = await api.get("/api/compras/estoque-projetado", { params });
+            const res = await api.get("/compras/estoque-projetado", { params });
             setData(res.data);
         } catch (e) {
             toast.error("Erro ao carregar estoque projetado");
