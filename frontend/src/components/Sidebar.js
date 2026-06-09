@@ -4,7 +4,8 @@ import { useTheme } from "@/App";
 import {
     LayoutDashboard, Kanban, Users, LogOut, Moon, Sun, FlaskConical, Building2,
     Package, ChevronDown, ChevronRight, ShieldCheck, BarChart3, Warehouse, ClipboardList,
-    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText, Microscope
+    CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText, Microscope, Factory,
+    Truck, Receipt, Calendar
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -70,16 +71,24 @@ const NAV_MODULES = [
         key: "estoque",
         type: "link",
         path: "/estoque",
-        label: "Estoque",
+        label: "Estoque / WMS",
         icon: Warehouse,
-        roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "gestor"],
+        roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "compras", "gestor"],
+    },
+    {
+        key: "recebimento",
+        type: "link",
+        path: "/recebimento",
+        label: "Recebimento",
+        icon: Package,
+        roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "compras", "gestor"],
     },
     {
         key: "cq",
         type: "group",
         label: "Controle de Qualidade",
         icon: Microscope,
-        basePaths: ["/cq"],
+        basePaths: ["/cq", "/cq/retrabalho"],
         roles: ["admin", "qa", "lider_pd", "formulador", "engenharia_produto", "compras", "sales_ops"],
         children: [
             { path: "/cq",                       label: "Dashboard CQ" },
@@ -88,15 +97,48 @@ const NAV_MODULES = [
             { path: "/cq/rncs",                  label: "Não Conformidades" },
             { path: "/cq/retencoes",             label: "Retenções" },
             { path: "/cq/instrumentos",          label: "Instrumentos" },
+            { path: "/cq/retrabalho",            label: "Retrabalho" },
         ],
     },
     {
         key: "orders",
         type: "link",
         path: "/orders",
-        label: "Pedidos",
+        label: "Pedidos (PI)",
         icon: ShoppingCart,
         roles: null,
+    },
+    {
+        key: "ops",
+        type: "link",
+        path: "/ops",
+        label: "Ordens de Produção",
+        icon: Factory,
+        roles: null,
+    },
+    {
+        key: "pcp",
+        type: "link",
+        path: "/pcp",
+        label: "PCP",
+        icon: Calendar,
+        roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "compras", "gestor", "sales_ops"],
+    },
+    {
+        key: "expedicao",
+        type: "link",
+        path: "/expedicao",
+        label: "Expedição",
+        icon: Truck,
+        roles: ["admin", "compras", "engenharia_produto", "lider_pd", "qa", "sales_ops", "gestor"],
+    },
+    {
+        key: "faturamento",
+        type: "link",
+        path: "/faturamento",
+        label: "Faturamento",
+        icon: Receipt,
+        roles: ["admin", "sales_ops", "compras", "gestor"],
     },
     {
         key: "compras",

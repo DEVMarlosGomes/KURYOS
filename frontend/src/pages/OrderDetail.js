@@ -10,7 +10,59 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { ArrowLeft, Save, Download, Loader2, Plus, Trash2, FileText, Pencil, Check, X } from "lucide-react";
+import { ArrowLeft, Save, Download, Loader2, Plus, Trash2, FileText, Pencil, Check, X, ShieldCheck, AlertTriangle, Factory, Lock, CheckCircle2 } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
+
+const TIPOS_SERVICO = [
+  { value: "producao",    label: "Produção",    desc: "Primeiro pedido — amostra aprovada, gera novo SKU" },
+  { value: "reposicao",  label: "Reposição",   desc: "SKU existente, sem nova amostra, fluxo simplificado" },
+  { value: "retrabalho", label: "Retrabalho",  desc: "Reprocessamento de lote com não conformidade" },
+];
+
+const NIVEIS_FORMALIZACAO = [
+  { value: 1, label: "Nível 1 — Aceite simples",   desc: "Cliente recorrente + valor dentro do threshold" },
+  { value: 2, label: "Nível 2 — Aceite formal",    desc: "Cliente novo OU valor acima do threshold" },
+  { value: 3, label: "Nível 3 — Aditivo ao CGI",   desc: "Alto valor, condições atípicas ou risco elevado" },
+];
+
+const CATEGORIAS_INSUMO = [
+  "Arte / Aprovação de arte",
+  "Cadastro ANVISA / Notificação",
+  "Rótulos / Gravação",
+  "Frascos / Potes",
+  "Tampas / Sobretampa",
+  "Cartucho",
+  "Válvulas",
+  "Celofane / Sleeve",
+  "Display",
+  "Caixa de embarque",
+  "Essência / Fragrância",
+  "Matérias-primas específicas",
+];
+
+const INSUMO_STATUS_CFG = {
+  pendente:     { label: "Pendente",     cls: "bg-slate-100 text-slate-600" },
+  em_andamento: { label: "Em andamento", cls: "bg-amber-100 text-amber-700" },
+  confirmado:   { label: "Confirmado",   cls: "bg-blue-100 text-blue-700" },
+  recebido:     { label: "Recebido",     cls: "bg-green-100 text-green-700" },
+};
+
+function buildDefaultChecklist() {
+  return CATEGORIAS_INSUMO.map(cat => ({
+    categoria: cat, ativo: false, origem: "kuryos",
+    status: "pendente", responsavel: "", data_prevista: null, observacoes: "",
+  }));
+}
+
+// NNN/NNN/NNN auto-mask
+function maskCondicaoPgto(raw) {
+  const digits = raw.replace(/\D/g, "").slice(0, 9);
+  if (digits.length <= 3) return digits;
+  if (digits.length <= 6) return `${digits.slice(0, 3)}/${digits.slice(3)}`;
+  return `${digits.slice(0, 3)}/${digits.slice(3, 6)}/${digits.slice(6)}`;
+}
+
+const STATUSES_IMUTAVEL = new Set(["confirmado", "em_producao", "concluido"]);
 
 const STATUS_OPTIONS = [
   { value: "rascunho", label: "Rascunho" },
@@ -69,6 +121,7 @@ export default function OrderDetail() {
 
   const startEdit = () => {
     setForm(deepClone(order));
+    ensureChecklist();
     setEditing(true);
   };
 
@@ -80,17 +133,27 @@ export default function OrderDetail() {
   const saveOrder = async () => {
     setSaving(true);
     try {
-      const payload = {
-        numero_pedido: form.numero_pedido,
-        data_pedido: form.data_pedido,
-        status: form.status,
-        cliente: form.cliente,
-        frete: form.frete,
-        items: form.items,
-        condicoes: form.condicoes,
-        insumos: form.insumos,
-        observacoes: form.observacoes,
-      };
+      const isLocked = STATUSES_IMUTAVEL.has(order.status);
+      const payload = isLocked
+        ? {
+            status: form.status,
+            observacoes: form.observacoes,
+            checklist_insumos: form.checklist_insumos,
+          }
+        : {
+            numero_pedido: form.numero_pedido,
+            data_pedido: form.data_pedido,
+            status: form.status,
+            tipo_servico: form.tipo_servico,
+            nivel_formalizacao: form.nivel_formalizacao,
+            cliente: form.cliente,
+            frete: form.frete,
+            items: form.items,
+            condicoes: form.condicoes,
+            insumos: form.insumos,
+            checklist_insumos: form.checklist_insumos,
+            observacoes: form.observacoes,
+          };
       const res = await api.put(`/orders/${id}`, payload);
       setOrder(res.data);
       setForm(deepClone(res.data));
@@ -128,6 +191,49 @@ export default function OrderDetail() {
       toast.success("PDF gerado!");
     } catch (err) {
       toast.error("Erro ao gerar PDF");
+    }
+  };
+
+  const signCGI = async () => {
+    try {
+      const res = await api.post(`/orders/${id}/sign-cgi`);
+      setOrder(res.data);
+      setForm(deepClone(res.data));
+      toast.success("CGI assinado com sucesso!");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao assinar CGI");
+    }
+  };
+
+  const approveCliente = async () => {
+    try {
+      const res = await api.post(`/orders/${id}/aprovar-cliente`, { observacoes: "" });
+      setOrder(res.data); setForm(deepClone(res.data));
+      toast.success("Aprovação do cliente registrada");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro");
+    }
+  };
+
+  const ensureChecklist = () => {
+    if (!form.checklist_insumos || form.checklist_insumos.length < CATEGORIAS_INSUMO.length) {
+      const existing = form.checklist_insumos || [];
+      const existingCats = new Set(existing.map(c => c.categoria));
+      const missing = CATEGORIAS_INSUMO.filter(cat => !existingCats.has(cat)).map(cat => ({
+        categoria: cat, ativo: false, origem: "kuryos", status: "pendente", responsavel: "", data_prevista: null, observacoes: "",
+      }));
+      setForm(p => ({ ...p, checklist_insumos: [...existing, ...missing] }));
+    }
+  };
+
+  const generateOP = async () => {
+    try {
+      const res = await api.post(`/orders/${id}/create-op`);
+      toast.success(`OP ${res.data.numero_op} gerada!`);
+      fetchOrder();
+      navigate(`/ops/${res.data.id}`);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao gerar OP");
     }
   };
 
@@ -172,25 +278,6 @@ export default function OrderDetail() {
     setForm(p => ({ ...p, items: (p.items || []).filter((_, i) => i !== idx) }));
   };
 
-  const updateInsumo = (idx, key, value) => {
-    setForm(p => {
-      const insumos = [...(p.insumos || [])];
-      insumos[idx] = { ...insumos[idx], [key]: value };
-      return { ...p, insumos };
-    });
-  };
-
-  const addInsumo = () => {
-    setForm(p => ({
-      ...p,
-      insumos: [...(p.insumos || []), { item: "", especificacoes: "", quantidade: "" }],
-    }));
-  };
-
-  const removeInsumo = (idx) => {
-    setForm(p => ({ ...p, insumos: (p.insumos || []).filter((_, i) => i !== idx) }));
-  };
-
   const totalCalc = (form.items || []).reduce((s, it) => s + (Number(it.valor_total) || 0), 0);
   const statusCfg = STATUS_COLORS[form.status] || STATUS_COLORS.rascunho;
 
@@ -231,6 +318,16 @@ export default function OrderDetail() {
                 </SelectContent>
               </Select>
             )}
+            {form.status === "confirmado" && !form.op_id && (
+              <Button onClick={generateOP} variant="default" className="gap-1.5 bg-emerald-600 hover:bg-emerald-700" data-testid="generate-op-btn">
+                <Factory className="h-4 w-4" /> Gerar OP
+              </Button>
+            )}
+            {form.op_id && (
+              <Button variant="outline" onClick={() => navigate(`/ops/${form.op_id}`)} className="gap-1.5" data-testid="view-op-btn">
+                <Factory className="h-4 w-4" /> Ver OP
+              </Button>
+            )}
             <Button onClick={downloadPDF} className="gap-1.5" data-testid="download-pdf-btn">
               <Download className="h-4 w-4" /> Gerar PDF
             </Button>
@@ -252,6 +349,69 @@ export default function OrderDetail() {
           </div>
         </div>
 
+        {/* CGI Panel (RN-PI-01) */}
+        <div className={`rounded-xl border px-5 py-4 flex items-center justify-between gap-4 ${form.cgi_status === "assinado" ? "bg-green-50 border-green-300 dark:bg-green-950/30 dark:border-green-800" : "bg-amber-50 border-amber-300 dark:bg-amber-950/30 dark:border-amber-800"}`}>
+          <div className="flex items-center gap-3">
+            {form.cgi_status === "assinado"
+              ? <ShieldCheck className="h-5 w-5 text-green-600 shrink-0" />
+              : <AlertTriangle className="h-5 w-5 text-amber-600 shrink-0" />
+            }
+            <div>
+              <p className="text-sm font-semibold">
+                {form.cgi_status === "assinado" ? "CGI Assinado" : "CGI Pendente (RN-PI-01)"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {form.cgi_status === "assinado"
+                  ? `Assinado por ${form.cgi_assinado_por || "—"} em ${form.cgi_assinado_em ? new Date(form.cgi_assinado_em).toLocaleDateString("pt-BR") : "—"}`
+                  : "O Contrato Geral de Industrialização deve ser assinado antes de confirmar o pedido."
+                }
+              </p>
+            </div>
+          </div>
+          {form.cgi_status !== "assinado" && (
+            <Button size="sm" variant="outline" onClick={signCGI} className="shrink-0 gap-1.5 border-amber-400 text-amber-700 hover:bg-amber-100" data-testid="sign-cgi-btn">
+              <ShieldCheck className="h-3.5 w-3.5" /> Assinar CGI
+            </Button>
+          )}
+        </div>
+
+        {/* Imutabilidade banner */}
+        {STATUSES_IMUTAVEL.has(form.status) && (
+          <div className="rounded-xl border border-blue-300 bg-blue-50 dark:bg-blue-950/30 dark:border-blue-800 px-5 py-3 flex items-center gap-3">
+            <Lock className="h-4 w-4 text-blue-600 shrink-0" />
+            <p className="text-sm text-blue-700 dark:text-blue-300">
+              <strong>Pedido imutável (RN-PI-05)</strong> — Status <em>{form.status}</em>. Campos comerciais bloqueados. Apenas checklist de insumos e observações podem ser atualizados. Para alterações, crie um aditivo.
+            </p>
+          </div>
+        )}
+
+        {/* Aprovação do Cliente */}
+        <div className={`rounded-xl border px-5 py-4 flex items-center justify-between gap-4 ${form.aprovacao_cliente === "aprovado" ? "bg-green-50 border-green-300 dark:bg-green-950/30 dark:border-green-800" : "bg-slate-50 border-slate-300 dark:bg-slate-900/30 dark:border-slate-700"}`}>
+          <div className="flex items-center gap-3">
+            {form.aprovacao_cliente === "aprovado"
+              ? <CheckCircle2 className="h-5 w-5 text-green-600 shrink-0" />
+              : <AlertTriangle className="h-5 w-5 text-slate-400 shrink-0" />
+            }
+            <div>
+              <p className="text-sm font-semibold">
+                {form.aprovacao_cliente === "aprovado" ? "Cliente Aprovou o Pedido" : "Aprovação do Cliente Pendente (RN-PI-04)"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {form.aprovacao_cliente === "aprovado"
+                  ? `Registrado por ${form.aprovacao_cliente_por || "—"} em ${form.aprovacao_cliente_em ? new Date(form.aprovacao_cliente_em).toLocaleDateString("pt-BR") : "—"}`
+                  : "Comprovante (print/e-mail) deve ser anexado e aprovação registrada antes de gerar OP."
+                }
+              </p>
+            </div>
+          </div>
+          {form.aprovacao_cliente !== "aprovado" && (
+            <Button size="sm" variant="outline" onClick={approveCliente}
+              className="shrink-0 gap-1.5 border-slate-400 text-slate-700 hover:bg-slate-100">
+              <CheckCircle2 className="h-3.5 w-3.5" /> Registrar Aprovação
+            </Button>
+          )}
+        </div>
+
         {/* 1) Informações Iniciais */}
         <Card>
           <CardHeader className="pb-3">
@@ -259,17 +419,62 @@ export default function OrderDetail() {
               <span className="font-mono text-primary">1)</span> Informações Iniciais
             </CardTitle>
           </CardHeader>
-          <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <Field label="Cliente" value={form.cliente?.nome} onChange={(v) => onCli("nome", v)} editing={editing} testid="field-cliente-nome" />
-            <Field label="# Pedido" value={form.numero_pedido} onChange={(v) => setForm(p => ({ ...p, numero_pedido: v }))} editing={editing} testid="field-numero-pedido" />
-            <Field
-              label="Data"
-              type="date"
-              value={editing ? dateInputValue(form.data_pedido) : (form.data_pedido ? new Date(form.data_pedido).toLocaleDateString("pt-BR") : "")}
-              onChange={(v) => setForm(p => ({ ...p, data_pedido: v ? new Date(v).toISOString() : null }))}
-              editing={editing}
-              testid="field-data-pedido"
-            />
+          <CardContent className="space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <Field label="Cliente" value={form.cliente?.nome} onChange={(v) => onCli("nome", v)} editing={editing} testid="field-cliente-nome" />
+              <Field label="# Pedido" value={form.numero_pedido} onChange={(v) => setForm(p => ({ ...p, numero_pedido: v }))} editing={editing} testid="field-numero-pedido" />
+              <Field
+                label="Data"
+                type="date"
+                value={editing ? dateInputValue(form.data_pedido) : (form.data_pedido ? new Date(form.data_pedido).toLocaleDateString("pt-BR") : "")}
+                onChange={(v) => setForm(p => ({ ...p, data_pedido: v ? new Date(v).toISOString() : null }))}
+                editing={editing}
+                testid="field-data-pedido"
+              />
+            </div>
+            {/* Tipo de Serviço + Nível de Formalização */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <Label className="text-xs text-muted-foreground">Tipo de Serviço</Label>
+                {editing && !STATUSES_IMUTAVEL.has(order.status) ? (
+                  <Select value={form.tipo_servico || "producao"}
+                    onValueChange={v => setForm(p => ({ ...p, tipo_servico: v }))}>
+                    <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {TIPOS_SERVICO.map(t => (
+                        <SelectItem key={t.value} value={t.value}>
+                          <div><div className="font-medium">{t.label}</div><div className="text-xs text-muted-foreground">{t.desc}</div></div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <p className="text-sm font-medium mt-1">
+                    {TIPOS_SERVICO.find(t => t.value === form.tipo_servico)?.label || form.tipo_servico || "Produção"}
+                  </p>
+                )}
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Nível de Formalização</Label>
+                {editing && !STATUSES_IMUTAVEL.has(order.status) ? (
+                  <Select value={String(form.nivel_formalizacao || 1)}
+                    onValueChange={v => setForm(p => ({ ...p, nivel_formalizacao: Number(v) }))}>
+                    <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {NIVEIS_FORMALIZACAO.map(n => (
+                        <SelectItem key={n.value} value={String(n.value)}>
+                          <div><div className="font-medium">{n.label}</div><div className="text-xs text-muted-foreground">{n.desc}</div></div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <p className="text-sm font-medium mt-1">
+                    {NIVEIS_FORMALIZACAO.find(n => n.value === (form.nivel_formalizacao || 1))?.label || `Nível ${form.nivel_formalizacao || 1}`}
+                  </p>
+                )}
+              </div>
+            </div>
           </CardContent>
         </Card>
 
@@ -424,64 +629,125 @@ export default function OrderDetail() {
             </CardTitle>
           </CardHeader>
           <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Field label="Prazo" value={form.condicoes?.prazo} onChange={(v) => onCnd("prazo", v)} editing={editing} testid="field-cond-prazo" />
-            <Field label="Forma de Pgto" value={form.condicoes?.forma_pgto} onChange={(v) => onCnd("forma_pgto", v)} editing={editing} testid="field-cond-pgto" />
+            <Field label="Prazo de Entrega" value={form.condicoes?.prazo} onChange={(v) => onCnd("prazo", v)} editing={editing} testid="field-cond-prazo" />
+            <div>
+              <Label className="text-xs text-muted-foreground">Condição de Pagamento (RN-PI-08)</Label>
+              {editing && !STATUSES_IMUTAVEL.has(order.status) ? (
+                <div>
+                  <Input
+                    value={form.condicoes?.condicao_pagamento || ""}
+                    onChange={(e) => onCnd("condicao_pagamento", maskCondicaoPgto(e.target.value))}
+                    placeholder="000/000/000"
+                    className="mt-1 font-mono"
+                    maxLength={11}
+                    data-testid="field-cond-pgto"
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-0.5">Formato obrigatório: NNN/NNN/NNN (ex: 030/060/090)</p>
+                </div>
+              ) : (
+                <p className="text-sm font-medium mt-1 min-h-[28px] flex items-center font-mono" data-testid="field-cond-pgto">
+                  {form.condicoes?.condicao_pagamento || form.condicoes?.forma_pgto || "—"}
+                </p>
+              )}
+            </div>
+            <Field label="Validade da Proposta" value={form.condicoes?.validade} onChange={(v) => onCnd("validade", v)} editing={editing} testid="field-cond-validade" />
           </CardContent>
         </Card>
 
-        {/* 6) Insumos */}
+        {/* 6) Checklist de Insumos */}
         <Card>
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-base flex items-center gap-2">
-                <span className="font-mono text-primary">6)</span> Insumos a Serem Enviados
-              </CardTitle>
-              {editing && (
-                <Button size="sm" variant="outline" onClick={addInsumo} className="gap-1.5" data-testid="add-insumo-btn">
-                  <Plus className="h-3.5 w-3.5" /> Adicionar Insumo
-                </Button>
-              )}
+              <div>
+                <CardTitle className="text-base flex items-center gap-2">
+                  <span className="font-mono text-primary">6)</span> Checklist de Insumos (RN-PI-06)
+                </CardTitle>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  {(form.checklist_insumos || []).filter(c => c.ativo && c.status === "recebido").length} / {(form.checklist_insumos || []).filter(c => c.ativo).length} insumos ativos recebidos
+                </p>
+              </div>
             </div>
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+              <table className="w-full text-xs">
                 <thead>
-                  <tr className="bg-[#1F2C5C] text-white text-xs">
-                    <th className="text-left p-2 font-medium w-10">#</th>
-                    <th className="text-left p-2 font-medium">Item</th>
-                    <th className="text-left p-2 font-medium">Especificações</th>
-                    <th className="text-left p-2 font-medium w-32">Quantidade</th>
-                    {editing && <th className="w-10"></th>}
+                  <tr className="bg-[#1F2C5C] text-white">
+                    <th className="text-left p-2 font-medium">Categoria</th>
+                    <th className="text-center p-2 font-medium w-14">Aplica?</th>
+                    <th className="text-center p-2 font-medium w-24">Origem</th>
+                    <th className="text-center p-2 font-medium w-28">Status</th>
+                    <th className="text-left p-2 font-medium w-32">Responsável</th>
+                    <th className="text-left p-2 font-medium w-28">Data Prevista</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {(form.insumos || []).map((ins, idx) => (
-                    <tr key={idx} className="border-t hover:bg-muted/30">
-                      <td className="p-2 font-mono text-xs">{idx + 1}</td>
-                      <td className="p-1">
-                        {editing ? <Input value={ins.item || ""} onChange={(e) => updateInsumo(idx, "item", e.target.value)} className="h-8 text-xs" data-testid={`insumo-${idx}-item`} /> : (ins.item || "—")}
-                      </td>
-                      <td className="p-1">
-                        {editing ? <Input value={ins.especificacoes || ""} onChange={(e) => updateInsumo(idx, "especificacoes", e.target.value)} className="h-8 text-xs" data-testid={`insumo-${idx}-spec`} /> : (ins.especificacoes || "—")}
-                      </td>
-                      <td className="p-1">
-                        {editing ? <Input value={ins.quantidade || ""} onChange={(e) => updateInsumo(idx, "quantidade", e.target.value)} className="h-8 text-xs" data-testid={`insumo-${idx}-qtd`} /> : (ins.quantidade || "—")}
-                      </td>
-                      {editing && (
+                  {(form.checklist_insumos || buildDefaultChecklist()).map((ci, idx) => {
+                    const statusCfg = INSUMO_STATUS_CFG[ci.status] || INSUMO_STATUS_CFG.pendente;
+                    const updateCI = (key, val) => setForm(p => {
+                      const cl = [...(p.checklist_insumos || buildDefaultChecklist())];
+                      cl[idx] = { ...cl[idx], [key]: val };
+                      return { ...p, checklist_insumos: cl };
+                    });
+                    return (
+                      <tr key={idx} className={`border-t ${ci.ativo ? "hover:bg-muted/30" : "opacity-50 hover:opacity-70"}`}>
+                        <td className="p-2 font-medium">{ci.categoria}</td>
                         <td className="p-2 text-center">
-                          <button onClick={() => removeInsumo(idx)} className="text-muted-foreground hover:text-red-500" data-testid={`remove-insumo-${idx}`}>
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+                          <Checkbox
+                            checked={!!ci.ativo}
+                            onCheckedChange={editing ? (v) => updateCI("ativo", v) : undefined}
+                            disabled={!editing}
+                            data-testid={`ci-${idx}-ativo`}
+                          />
                         </td>
-                      )}
-                    </tr>
-                  ))}
-                  {(form.insumos || []).length === 0 && (
-                    <tr><td colSpan={editing ? 5 : 4} className="p-4 text-center text-xs text-muted-foreground">
-                      Nenhum insumo. {editing && "Clique em 'Adicionar Insumo'."}
-                    </td></tr>
-                  )}
+                        <td className="p-1 text-center">
+                          {editing && ci.ativo ? (
+                            <Select value={ci.origem || "kuryos"} onValueChange={v => updateCI("origem", v)}>
+                              <SelectTrigger className="h-6 text-[10px] px-1.5"><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="kuryos">Kuryos</SelectItem>
+                                <SelectItem value="cliente">Cliente</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium ${ci.origem === "cliente" ? "bg-purple-100 text-purple-700" : "bg-slate-100 text-slate-600"}`}>
+                              {ci.origem === "cliente" ? "Cliente" : "Kuryos"}
+                            </span>
+                          )}
+                        </td>
+                        <td className="p-1 text-center">
+                          {editing && ci.ativo ? (
+                            <Select value={ci.status || "pendente"} onValueChange={v => updateCI("status", v)}>
+                              <SelectTrigger className="h-6 text-[10px] px-1.5"><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                {Object.entries(INSUMO_STATUS_CFG).map(([k, cfg]) => (
+                                  <SelectItem key={k} value={k}>{cfg.label}</SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium ${statusCfg.cls}`}>{statusCfg.label}</span>
+                          )}
+                        </td>
+                        <td className="p-1">
+                          {editing && ci.ativo ? (
+                            <Input value={ci.responsavel || ""} onChange={e => updateCI("responsavel", e.target.value)} className="h-6 text-[10px]" placeholder="Nome" data-testid={`ci-${idx}-resp`} />
+                          ) : (
+                            <span className="text-muted-foreground">{ci.responsavel || "—"}</span>
+                          )}
+                        </td>
+                        <td className="p-1">
+                          {editing && ci.ativo ? (
+                            <Input type="date" value={ci.data_prevista || ""} onChange={e => updateCI("data_prevista", e.target.value)} className="h-6 text-[10px]" data-testid={`ci-${idx}-data`} />
+                          ) : (
+                            <span className="text-muted-foreground">
+                              {ci.data_prevista ? new Date(ci.data_prevista).toLocaleDateString("pt-BR") : "—"}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

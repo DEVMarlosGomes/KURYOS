@@ -55,6 +55,31 @@ ORDER_STATUS_LABELS = {
 }
 
 
+# ============ CONSTANTS ============
+TIPOS_SERVICO = ["producao", "reposicao", "retrabalho"]
+NIVEIS_FORMALIZACAO = [1, 2, 3]
+CONDICAO_PGTO_RE = r"^\d{3}/\d{3}/\d{3}$"
+
+# Spec Section 1.6 — 12 fixed insumo categories
+CATEGORIAS_INSUMO = [
+    "Arte / Aprovação de arte",
+    "Cadastro ANVISA / Notificação",
+    "Rótulos / Gravação",
+    "Frascos / Potes",
+    "Tampas / Sobretampa",
+    "Cartucho",
+    "Válvulas",
+    "Celofane / Sleeve",
+    "Display",
+    "Caixa de embarque",
+    "Essência / Fragrância",
+    "Matérias-primas específicas",
+]
+
+# Statuses that make the order immutable (RN-PI-05)
+STATUSES_IMUTAVEL = {"confirmado", "em_producao", "concluido"}
+
+
 # ============ MODELS ============
 class OrderItem(BaseModel):
     codigo_kuryos: str = ""
@@ -64,12 +89,29 @@ class OrderItem(BaseModel):
     valor_unitario: float = 0.0
     qtd: float = 0
     valor_total: float = 0.0
+    tipo_servico: str = "producao"   # per-item type: producao | reposicao | retrabalho
 
 
 class OrderInsumo(BaseModel):
     item: str = ""
     especificacoes: str = ""
     quantidade: str = ""
+    arte: bool = False
+    anvisa: bool = False
+    rotulo: bool = False
+    frasco: bool = False
+    tampa: bool = False
+
+
+class InsumoChecklistItem(BaseModel):
+    """Structured insumo checklist — one entry per category (spec Section 1.6)."""
+    categoria: str
+    ativo: bool = False                        # whether this category applies
+    origem: str = "kuryos"                     # kuryos | cliente
+    status: str = "pendente"                   # pendente | em_andamento | confirmado | recebido
+    responsavel: str = ""                      # who follows up when origem=cliente
+    data_prevista: Optional[str] = None
+    observacoes: str = ""
 
 
 class ClienteData(BaseModel):
@@ -92,6 +134,7 @@ class FreteData(BaseModel):
 class CondicoesData(BaseModel):
     prazo: str = ""
     forma_pgto: str = ""
+    condicao_pagamento: str = "000/000/000"    # RN-PI-08: NNN/NNN/NNN
 
 
 class OrderCreate(BaseModel):
@@ -99,11 +142,14 @@ class OrderCreate(BaseModel):
     client_card_id: Optional[str] = None
     numero_pedido: Optional[str] = None
     data_pedido: Optional[str] = None
+    tipo_servico: str = "producao"             # producao | reposicao | retrabalho
+    nivel_formalizacao: int = 1                # 1 | 2 | 3
     cliente: ClienteData = Field(default_factory=ClienteData)
     frete: FreteData = Field(default_factory=FreteData)
     items: List[OrderItem] = []
     condicoes: CondicoesData = Field(default_factory=CondicoesData)
     insumos: List[OrderInsumo] = []
+    checklist_insumos: List[InsumoChecklistItem] = []
     observacoes: str = ""
 
 
@@ -111,12 +157,45 @@ class OrderUpdate(BaseModel):
     numero_pedido: Optional[str] = None
     data_pedido: Optional[str] = None
     status: Optional[str] = None
+    tipo_servico: Optional[str] = None
+    nivel_formalizacao: Optional[int] = None
     cliente: Optional[ClienteData] = None
     frete: Optional[FreteData] = None
     items: Optional[List[OrderItem]] = None
     condicoes: Optional[CondicoesData] = None
     insumos: Optional[List[OrderInsumo]] = None
+    checklist_insumos: Optional[List[InsumoChecklistItem]] = None
     observacoes: Optional[str] = None
+    cgi_status: Optional[str] = None          # "pendente" | "assinado"
+    # Client approval fields (RN-PI-04)
+    aprovacao_cliente: Optional[str] = None   # pendente | aprovado
+    aprovacao_cliente_obs: Optional[str] = None
+    aprovacao_cliente_em: Optional[str] = None
+
+
+# ===== OP MODELS =====
+class OPItem(BaseModel):
+    item: str = ""
+    codigo_kuryos: str = ""
+    qtd_planejada: float = 0
+    qtd_produzida: float = 0
+    lote: str = ""
+    prazo_sla: str = ""
+
+
+class OPCreate(BaseModel):
+    pedido_id: str
+    items: List[OPItem] = []
+    observacoes: str = ""
+
+
+class OPUpdate(BaseModel):
+    status: Optional[str] = None  # "aberta" | "em_processo" | "concluida" | "cancelada"
+    items: Optional[List[OPItem]] = None
+    observacoes: Optional[str] = None
+
+
+OP_STATUSES = ["aberta", "em_processo", "concluida", "cancelada"]
 
 
 # ============ HELPERS ============
@@ -228,6 +307,7 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
     items = await _build_items_from_pd(pd_request_id, tenant_id)
     numero = await _generate_order_number(tenant_id)
 
+    checklist_default = [{"categoria": c, "ativo": False, "origem": "kuryos", "status": "pendente", "responsavel": "", "data_prevista": None, "observacoes": ""} for c in CATEGORIAS_INSUMO]
     order = {
         "id": new_id(),
         "tenant_id": tenant_id,
@@ -236,6 +316,8 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
         "numero_pedido": numero,
         "data_pedido": now_iso(),
         "status": "rascunho",
+        "tipo_servico": "producao",
+        "nivel_formalizacao": 1,
         "project_name": pd_req.get("project_name", ""),
         "cliente": cliente,
         "frete": {
@@ -248,10 +330,19 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
         "condicoes": {
             "prazo": "30 dias",
             "forma_pgto": "Boleto + Depósito",
+            "condicao_pagamento": "030/000/000",
         },
         "insumos": [],
+        "checklist_insumos": checklist_default,
         "total_pedido": _calculate_totals(items),
         "observacoes": "",
+        "cgi_status": "pendente",
+        "cgi_assinado_em": None,
+        "cgi_assinado_por": None,
+        "aprovacao_cliente": "pendente",
+        "aprovacao_cliente_obs": "",
+        "aprovacao_cliente_em": None,
+        "op_id": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "created_by": user["id"],
@@ -324,8 +415,17 @@ async def get_reorder_draft(client_card_id: str, request: Request):
 
 @orders_router.post("")
 async def create_order(data: OrderCreate, request: Request):
+    import re
     user = await get_current_user(request)
-    # Auto-pull CRM data if client_card_id given and cliente not filled
+
+    if data.tipo_servico not in TIPOS_SERVICO:
+        raise HTTPException(status_code=400, detail=f"tipo_servico inválido. Permitidos: {TIPOS_SERVICO}")
+
+    condicoes = data.condicoes.model_dump()
+    cpgto = condicoes.get("condicao_pagamento", "")
+    if cpgto and not re.match(CONDICAO_PGTO_RE, cpgto):
+        raise HTTPException(status_code=400, detail="condicao_pagamento deve ter formato NNN/NNN/NNN (RN-PI-08)")
+
     cliente = data.cliente.model_dump()
     if data.client_card_id and not cliente.get("razao_social"):
         cliente = await _enrich_from_crm(data.client_card_id, user["tenant_id"])
@@ -333,6 +433,10 @@ async def create_order(data: OrderCreate, request: Request):
     items = [it.model_dump() for it in data.items]
     if data.pd_request_id and not items:
         items = await _build_items_from_pd(data.pd_request_id, user["tenant_id"])
+
+    # Build default checklist if not provided
+    checklist = [c.model_dump() for c in data.checklist_insumos] if data.checklist_insumos else \
+        [{"categoria": c, "ativo": False, "origem": "kuryos", "status": "pendente", "responsavel": "", "data_prevista": None, "observacoes": ""} for c in CATEGORIAS_INSUMO]
 
     numero = data.numero_pedido or await _generate_order_number(user["tenant_id"])
 
@@ -344,14 +448,24 @@ async def create_order(data: OrderCreate, request: Request):
         "numero_pedido": numero,
         "data_pedido": data.data_pedido or now_iso(),
         "status": "rascunho",
+        "tipo_servico": data.tipo_servico,
+        "nivel_formalizacao": data.nivel_formalizacao,
         "project_name": "",
         "cliente": cliente,
         "frete": data.frete.model_dump(),
         "items": items,
-        "condicoes": data.condicoes.model_dump(),
+        "condicoes": condicoes,
         "insumos": [it.model_dump() for it in data.insumos],
+        "checklist_insumos": checklist,
         "total_pedido": _calculate_totals(items),
         "observacoes": data.observacoes,
+        "cgi_status": "pendente",
+        "cgi_assinado_em": None,
+        "cgi_assinado_por": None,
+        "aprovacao_cliente": "pendente",
+        "aprovacao_cliente_obs": "",
+        "aprovacao_cliente_em": None,
+        "op_id": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "created_by": user["id"],
@@ -365,6 +479,7 @@ async def create_order(data: OrderCreate, request: Request):
 
 @orders_router.put("/{order_id}")
 async def update_order(order_id: str, data: OrderUpdate, request: Request):
+    import re
     user = await get_current_user(request)
     existing = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not existing:
@@ -376,6 +491,21 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
     if "status" in payload and payload["status"] not in ORDER_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido. Permitidos: {ORDER_STATUSES}")
 
+    # RN-PI-01: CGI must be signed before confirming
+    if payload.get("status") == "confirmado":
+        if existing.get("cgi_status", "pendente") != "assinado":
+            raise HTTPException(status_code=422, detail="CGI não assinado. Assine o Contrato Geral de Industrialização antes de confirmar o pedido. (RN-PI-01)")
+
+    # RN-PI-05: confirmed/em_producao/concluido orders are immutable — only allowed fields
+    IMMUTABLE_BLOCK = {"items", "cliente", "frete", "condicoes", "insumos", "numero_pedido", "data_pedido", "tipo_servico", "nivel_formalizacao"}
+    if existing.get("status") in STATUSES_IMUTAVEL:
+        blocked = IMMUTABLE_BLOCK & set(payload.keys())
+        if blocked:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Pedido {existing['status']} é imutável (RN-PI-05). Campos bloqueados: {sorted(blocked)}. Crie um aditivo para alterações comerciais."
+            )
+
     # CQ hard stops — verify CK prerequisites before starting production
     if payload.get("status") == "em_producao":
         op_tipo = existing.get("tipo", "")
@@ -385,7 +515,15 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
             await cq_verificar_assepsia_envase(db, user["tenant_id"], order_id)
             await cq_verificar_setup_linha(db, user["tenant_id"], order_id)
 
-    for key in ("numero_pedido", "data_pedido", "status", "observacoes"):
+    # Validate NNN/NNN/NNN if condicoes.condicao_pagamento is provided
+    if "condicoes" in payload and payload["condicoes"]:
+        cpgto = payload["condicoes"].get("condicao_pagamento", "")
+        if cpgto and not re.match(CONDICAO_PGTO_RE, cpgto):
+            raise HTTPException(status_code=400, detail="condicao_pagamento deve ter formato NNN/NNN/NNN (RN-PI-08)")
+
+    for key in ("numero_pedido", "data_pedido", "status", "observacoes", "cgi_status",
+                "tipo_servico", "nivel_formalizacao",
+                "aprovacao_cliente", "aprovacao_cliente_obs", "aprovacao_cliente_em"):
         if key in payload:
             update_fields[key] = payload[key]
 
@@ -401,6 +539,9 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
     if "insumos" in payload and payload["insumos"] is not None:
         update_fields["insumos"] = payload["insumos"]
 
+    if "checklist_insumos" in payload and payload["checklist_insumos"] is not None:
+        update_fields["checklist_insumos"] = payload["checklist_insumos"]
+
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
@@ -410,6 +551,33 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
     return updated
 
 
+@orders_router.post("/{order_id}/aprovar-cliente")
+async def aprovar_cliente(order_id: str, request: Request):
+    """Register client approval (RN-PI-04) — sets aprovacao_cliente=aprovado."""
+    from pydantic import BaseModel as PM
+    class AprovBody(PM):
+        observacoes: str = ""
+
+    user = await get_current_user(request)
+    body_raw = await request.json()
+    obs = body_raw.get("observacoes", "")
+    existing = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+    now = now_iso()
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "aprovacao_cliente": "aprovado",
+            "aprovacao_cliente_obs": obs,
+            "aprovacao_cliente_em": now,
+            "aprovacao_cliente_por": user["name"],
+            "updated_at": now,
+        }}
+    )
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
 @orders_router.delete("/{order_id}")
 async def delete_order(order_id: str, request: Request):
     user = await get_current_user(request)
@@ -417,6 +585,84 @@ async def delete_order(order_id: str, request: Request):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
     return {"message": "Pedido removido"}
+
+
+# ============ CGI SIGN (RN-PI-01) ============
+@orders_router.post("/{order_id}/sign-cgi")
+async def sign_cgi(order_id: str, request: Request):
+    """Mark the CGI (Contrato Geral de Industrialização) as signed for this order."""
+    user = await get_current_user(request)
+    order = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "cgi_status": "assinado",
+            "cgi_assinado_em": now_iso(),
+            "cgi_assinado_por": user.get("name", ""),
+            "updated_at": now_iso(),
+        }},
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return updated
+
+
+# ============ OP — CREATE FROM ORDER ============
+async def _generate_op_number(tenant_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    year = now.year
+    count = await db.ops.count_documents({"tenant_id": tenant_id, "created_at": {"$gte": f"{year}-01-01"}})
+    return f"OP-{year}-{count + 1:03d}"
+
+
+@orders_router.post("/{order_id}/create-op")
+async def create_op_from_order(order_id: str, request: Request):
+    """Convert a confirmed PI into an Ordem de Produção."""
+    user = await get_current_user(request)
+    order = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+    if order.get("status") not in ("confirmado", "em_producao"):
+        raise HTTPException(status_code=422, detail="OP só pode ser gerada a partir de um pedido Confirmado.")
+    if order.get("op_id"):
+        existing_op = await db.ops.find_one({"id": order["op_id"]}, {"_id": 0})
+        if existing_op:
+            return existing_op
+
+    numero_op = await _generate_op_number(user["tenant_id"])
+    op_items = [
+        {
+            "item": it.get("item", ""),
+            "codigo_kuryos": it.get("codigo_kuryos", ""),
+            "qtd_planejada": it.get("qtd", 0),
+            "qtd_produzida": 0,
+            "lote": "",
+            "prazo_sla": it.get("prazo_entrega", ""),
+        }
+        for it in (order.get("items") or [])
+    ]
+    op = {
+        "id": new_id(),
+        "tenant_id": user["tenant_id"],
+        "numero_op": numero_op,
+        "pedido_id": order_id,
+        "numero_pedido": order.get("numero_pedido", ""),
+        "cliente_nome": order.get("cliente", {}).get("nome") or order.get("cliente", {}).get("razao_social", ""),
+        "project_name": order.get("project_name", ""),
+        "status": "aberta",
+        "items": op_items,
+        "observacoes": "",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+    }
+    await db.ops.insert_one(op)
+    op.pop("_id", None)
+    # Link back to the order
+    await db.orders.update_one({"id": order_id}, {"$set": {"op_id": op["id"], "status": "em_producao", "updated_at": now_iso()}})
+    return op
 
 
 # ============ PDF GENERATION ============
@@ -670,3 +916,266 @@ async def export_order_pdf(order_id: str, request: Request):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ============ OPS ROUTER ============
+ops_router = APIRouter(prefix="/api/ops")
+
+
+@ops_router.get("")
+async def list_ops(request: Request, status: Optional[str] = None, q: Optional[str] = None):
+    user = await get_current_user(request)
+    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    if status:
+        query["status"] = status
+    if q:
+        query["$or"] = [
+            {"numero_op": {"$regex": q, "$options": "i"}},
+            {"cliente_nome": {"$regex": q, "$options": "i"}},
+            {"project_name": {"$regex": q, "$options": "i"}},
+        ]
+    ops = await db.ops.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return ops
+
+
+@ops_router.get("/{op_id}")
+async def get_op(op_id: str, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    return op
+
+
+@ops_router.put("/{op_id}")
+async def update_op(op_id: str, data: OPUpdate, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    payload = data.model_dump(exclude_unset=True)
+    if "status" in payload and payload["status"] not in OP_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Status inválido. Permitidos: {OP_STATUSES}")
+    update_fields: Dict[str, Any] = {k: v for k, v in payload.items() if v is not None or k == "observacoes"}
+    update_fields["updated_at"] = now_iso()
+    await db.ops.update_one({"id": op_id}, {"$set": update_fields})
+    updated = await db.ops.find_one({"id": op_id}, {"_id": 0})
+
+    # On conclusion: compute un/h and push to SKU production history (RN-SK-05)
+    if payload.get("status") == "concluida":
+        await _record_op_producao_to_sku(updated)
+
+    return updated
+
+
+async def _record_op_producao_to_sku(op: dict):
+    """Calculate un/h from apontamentos and push result into SKU medias_producao."""
+    try:
+        from workflow_engine import recalc_sku_averages
+        apontamentos = op.get("apontamentos") or []
+        if not apontamentos:
+            return
+        total_produzido = sum(a.get("qtd_produzida", 0) for a in apontamentos)
+        if total_produzido <= 0:
+            return
+
+        horarios = sorted([a["horario"] for a in apontamentos if a.get("horario")])
+        duracao_h = 0.0
+        if len(horarios) >= 2:
+            from datetime import datetime, timezone
+            t0 = datetime.fromisoformat(horarios[0].replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(horarios[-1].replace("Z", "+00:00"))
+            raw_h = (t1 - t0).total_seconds() / 3600
+            pause_h = sum(p.get("duracao_min", 0) for p in (op.get("pausas") or [])) / 60
+            duracao_h = max(raw_h - pause_h, 0.0)
+
+        if duracao_h <= 0:
+            return
+        unh = round(total_produzido / duracao_h, 1)
+
+        # Resolve sku_id via codigo_kuryos on first OP item
+        items = op.get("items") or []
+        codigo_kuryos = items[0].get("codigo_kuryos", "") if items else ""
+        if not codigo_kuryos:
+            return
+        sku = await db.skus.find_one(
+            {"codigo_interno": codigo_kuryos, "tenant_id": op["tenant_id"]}, {"_id": 0}
+        )
+        if not sku:
+            return
+
+        await db.skus.update_one(
+            {"id": sku["id"]},
+            {"$push": {"medias_producao.historico_producao": {
+                "op_id": op["id"],
+                "op_numero": op.get("numero_op"),
+                "data": now_iso(),
+                "qtd_produzida": total_produzido,
+                "duracao_h": round(duracao_h, 2),
+                "unh": unh,
+            }}}
+        )
+        await recalc_sku_averages(op["tenant_id"], sku["id"])
+    except Exception:
+        pass  # Non-critical — don't fail the OP update
+
+
+# ─── Apontamento de produção ─────────────────────────────────────────────────
+class ApontamentoCreate(BaseModel):
+    item_idx: int = 0
+    qtd_produzida: float
+    turno: str = "integral"     # manha | tarde | noite | integral
+    horario: Optional[str] = None
+    observacoes: str = ""
+
+
+@ops_router.post("/{op_id}/apontar")
+async def apontar_producao(op_id: str, data: ApontamentoCreate, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    if op["status"] not in ("em_processo", "aberta"):
+        raise HTTPException(status_code=422, detail="Apontamento só é permitido em OPs abertas ou em processo")
+    if data.qtd_produzida <= 0:
+        raise HTTPException(status_code=400, detail="Quantidade produzida deve ser positiva")
+
+    items = list(op.get("items", []))
+    if data.item_idx >= len(items):
+        raise HTTPException(status_code=400, detail=f"item_idx {data.item_idx} inválido")
+
+    now = now_iso()
+    apontamento = {
+        "id": new_id(),
+        "item_idx": data.item_idx,
+        "item_nome": items[data.item_idx].get("item", ""),
+        "qtd_produzida": data.qtd_produzida,
+        "turno": data.turno,
+        "horario": data.horario or now,
+        "observacoes": data.observacoes,
+        "por": user["name"],
+        "em": now,
+    }
+
+    # Accumulate qtd_produzida on the item
+    items[data.item_idx]["qtd_produzida"] = (
+        float(items[data.item_idx].get("qtd_produzida") or 0) + data.qtd_produzida
+    )
+
+    await db.ops.update_one(
+        {"id": op_id},
+        {
+            "$push": {"apontamentos": apontamento},
+            "$set": {"items": items, "updated_at": now},
+        }
+    )
+    return await db.ops.find_one({"id": op_id}, {"_id": 0})
+
+
+# ─── Pausa / Retomada ─────────────────────────────────────────────────────────
+class PausaCreate(BaseModel):
+    motivo: str
+    tipo: str = "outro"   # manutencao | falta_material | almoco | outro
+    horario_inicio: Optional[str] = None
+
+
+@ops_router.post("/{op_id}/pausar")
+async def pausar_op(op_id: str, data: PausaCreate, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    if op["status"] != "em_processo":
+        raise HTTPException(status_code=422, detail="Só é possível pausar OPs em processo")
+    # Check no open pause
+    pausas = op.get("pausas", [])
+    if any(p.get("horario_fim") is None for p in pausas):
+        raise HTTPException(status_code=409, detail="Há uma pausa em aberto — retome antes de pausar novamente")
+
+    now = now_iso()
+    pausa = {
+        "id": new_id(),
+        "tipo": data.tipo,
+        "motivo": data.motivo,
+        "horario_inicio": data.horario_inicio or now,
+        "horario_fim": None,
+        "duracao_min": None,
+        "por": user["name"],
+        "em": now,
+    }
+    await db.ops.update_one(
+        {"id": op_id},
+        {"$push": {"pausas": pausa}, "$set": {"status": "pausada", "updated_at": now}}
+    )
+    return await db.ops.find_one({"id": op_id}, {"_id": 0})
+
+
+@ops_router.post("/{op_id}/retomar")
+async def retomar_op(op_id: str, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    if op["status"] != "pausada":
+        raise HTTPException(status_code=422, detail="OP não está pausada")
+
+    now = now_iso()
+    pausas = list(op.get("pausas", []))
+    # Close the open pause
+    for p in reversed(pausas):
+        if p.get("horario_fim") is None:
+            from datetime import datetime, timezone
+            try:
+                inicio = datetime.fromisoformat(p["horario_inicio"].replace("Z", "+00:00"))
+                fim = datetime.now(timezone.utc)
+                p["duracao_min"] = int((fim - inicio).total_seconds() / 60)
+            except Exception:
+                p["duracao_min"] = None
+            p["horario_fim"] = now
+            break
+
+    await db.ops.update_one(
+        {"id": op_id},
+        {"$set": {"pausas": pausas, "status": "em_processo", "updated_at": now}}
+    )
+    return await db.ops.find_one({"id": op_id}, {"_id": 0})
+
+
+# ─── Registro de perdas ───────────────────────────────────────────────────────
+class PerdaCreate(BaseModel):
+    item_idx: int = 0
+    tipo: str = "processo"    # processo | material | embalagem | outro
+    quantidade: float
+    unidade: str = "un"
+    motivo: str = ""
+
+
+@ops_router.post("/{op_id}/perda")
+async def registrar_perda(op_id: str, data: PerdaCreate, request: Request):
+    user = await get_current_user(request)
+    op = await db.ops.find_one({"id": op_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not op:
+        raise HTTPException(status_code=404, detail="OP não encontrada")
+    if data.quantidade <= 0:
+        raise HTTPException(status_code=400, detail="Quantidade de perda deve ser positiva")
+
+    items = list(op.get("items", []))
+    item_nome = items[data.item_idx].get("item", "") if data.item_idx < len(items) else ""
+
+    now = now_iso()
+    perda = {
+        "id": new_id(),
+        "item_idx": data.item_idx,
+        "item_nome": item_nome,
+        "tipo": data.tipo,
+        "quantidade": data.quantidade,
+        "unidade": data.unidade,
+        "motivo": data.motivo,
+        "por": user["name"],
+        "em": now,
+    }
+    await db.ops.update_one(
+        {"id": op_id},
+        {"$push": {"perdas": perda}, "$set": {"updated_at": now}}
+    )
+    return await db.ops.find_one({"id": op_id}, {"_id": 0})

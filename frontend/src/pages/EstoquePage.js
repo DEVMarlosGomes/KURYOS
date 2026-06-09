@@ -20,8 +20,24 @@ import {
 } from "@/components/ui/select";
 import {
     Warehouse, Plus, Search, ArrowDown, ArrowUp, ArrowLeftRight,
-    AlertTriangle, Trash2, History, Package, FlaskConical, Tag, Box,
+    AlertTriangle, Trash2, History, Package, FlaskConical, Tag, Box, ShieldCheck,
 } from "lucide-react";
+
+const POSICAO_CQ_CONFIG = {
+    livre:       { label: "Livre",       cls: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300" },
+    quarentena:  { label: "Quarentena",  cls: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" },
+    aprovado:    { label: "Aprovado",    cls: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300" },
+    reprovado:   { label: "Reprovado",   cls: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300" },
+};
+
+function PosicaoBadge({ posicao }) {
+    const cfg = POSICAO_CQ_CONFIG[posicao] || POSICAO_CQ_CONFIG.livre;
+    return (
+        <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${cfg.cls}`}>
+            {cfg.label}
+        </span>
+    );
+}
 
 const SETORES = [
     { key: "MANIPULACAO", label: "Matérias-Primas", sublabel: "Manipulação", icon: FlaskConical, tipo: "mp", tipoMP: "FORMULACAO", color: "bg-blue-500" },
@@ -58,6 +74,7 @@ export default function EstoquePage() {
 
     const [selectedItem, setSelectedItem] = useState(null);
     const [kardex, setKardex] = useState([]);
+    const [updatingPosicao, setUpdatingPosicao] = useState(false);
 
     const [showNewItem, setShowNewItem] = useState(false);
     const [showMov, setShowMov] = useState(false);
@@ -116,6 +133,21 @@ export default function EstoquePage() {
             loadDashboard();
         } catch (e) {
             toast.error(formatApiError(e));
+        }
+    };
+
+    const updatePosicaoCQ = async (posicao) => {
+        if (!selectedItem) return;
+        setUpdatingPosicao(true);
+        try {
+            const { data } = await api.patch(`/estoque/items/${selectedItem.id}/posicao`, { posicao_cq: posicao });
+            setSelectedItem(prev => ({ ...prev, posicao_cq: data.posicao_cq }));
+            setItems(prev => prev.map(i => i.id === selectedItem.id ? { ...i, posicao_cq: data.posicao_cq } : i));
+            toast.success(`Posição CQ: ${POSICAO_CQ_CONFIG[posicao]?.label}`);
+        } catch (e) {
+            toast.error(formatApiError(e));
+        } finally {
+            setUpdatingPosicao(false);
         }
     };
 
@@ -225,15 +257,16 @@ export default function EstoquePage() {
                                 <th className="text-right px-4 py-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Saldo</th>
                                 <th className="text-right px-4 py-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Mín.</th>
                                 <th className="text-left px-4 py-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Local</th>
+                                <th className="text-center px-4 py-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">CQ</th>
                                 <th className="text-center px-4 py-2.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Ações</th>
                             </tr>
                         </thead>
                         <tbody>
                             {loading && (
-                                <tr><td colSpan={7} className="px-4 py-6 text-center text-muted-foreground">Carregando…</td></tr>
+                                <tr><td colSpan={8} className="px-4 py-6 text-center text-muted-foreground">Carregando…</td></tr>
                             )}
                             {!loading && items.length === 0 && (
-                                <tr><td colSpan={7} className="px-4 py-10 text-center text-muted-foreground italic">
+                                <tr><td colSpan={8} className="px-4 py-10 text-center text-muted-foreground italic">
                                     Nenhum item neste setor. Clique em "Novo Item" para começar.
                                 </td></tr>
                             )}
@@ -261,6 +294,9 @@ export default function EstoquePage() {
                                         {it.estoque_minimo || "—"}
                                     </td>
                                     <td className="px-4 py-2.5 text-muted-foreground">{it.localizacao || "—"}</td>
+                                    <td className="px-4 py-2.5 text-center">
+                                        <PosicaoBadge posicao={it.posicao_cq || "livre"} />
+                                    </td>
                                     <td className="px-4 py-2.5 text-center" onClick={(e) => e.stopPropagation()}>
                                         <div className="flex items-center justify-center gap-1">
                                             <Button
@@ -319,6 +355,29 @@ export default function EstoquePage() {
                                     <Stat label="Lote" value={selectedItem.lote || "—"} />
                                     <Stat label="Localização" value={selectedItem.localizacao || "—"} />
                                     <Stat label="Validade" value={selectedItem.validade ? new Date(selectedItem.validade).toLocaleDateString("pt-BR") : "—"} />
+                                </div>
+
+                                {/* Posição CQ */}
+                                <div className="rounded-lg border border-border p-3 space-y-2">
+                                    <div className="flex items-center gap-2">
+                                        <ShieldCheck className="h-4 w-4 text-primary" />
+                                        <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Posição CQ</span>
+                                        <PosicaoBadge posicao={selectedItem.posicao_cq || "livre"} />
+                                    </div>
+                                    <div className="flex gap-1.5 flex-wrap">
+                                        {Object.entries(POSICAO_CQ_CONFIG).map(([key, cfg]) => (
+                                            <Button
+                                                key={key}
+                                                size="sm"
+                                                variant={(selectedItem.posicao_cq || "livre") === key ? "default" : "outline"}
+                                                className="h-7 text-xs"
+                                                disabled={updatingPosicao || (selectedItem.posicao_cq || "livre") === key}
+                                                onClick={() => updatePosicaoCQ(key)}
+                                            >
+                                                {cfg.label}
+                                            </Button>
+                                        ))}
+                                    </div>
                                 </div>
 
                                 {isLowStock(selectedItem) && (

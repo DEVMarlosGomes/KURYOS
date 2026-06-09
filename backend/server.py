@@ -40,7 +40,12 @@ from openpyxl.styles import Font as XlFont, Alignment, PatternFill
 from pd_routes import pd_router, init_pd, run_stability_scheduler, check_stability_alerts_for_tenant
 from crm_routes import crm_router, init_crm, run_alert_scheduler
 from estoque_routes import estoque_router, init_estoque
-from orders_routes import orders_router, init_orders
+from recebimento_routes import recebimento_router, init_recebimento
+from retrabalho_routes import retrabalho_router, init_retrabalho
+from expedicao_routes import expedicao_router, init_expedicao
+from faturamento_routes import faturamento_router, init_faturamento
+from pcp_routes import pcp_router, init_pcp
+from orders_routes import orders_router, ops_router, init_orders
 from kickoff_routes import kickoff_router, init_kickoff
 from compras_routes import compras_router, init_compras, create_compras_indexes
 from contratos_routes import contratos_router, init_contratos
@@ -1931,6 +1936,17 @@ async def startup():
     # Initialize Estoque module
     init_estoque(db, get_current_user, new_id, now_iso)
 
+    # Initialize Recebimento module
+    init_recebimento(db, get_current_user, new_id, now_iso)
+
+    # Initialize Retrabalho module
+    init_retrabalho(db, get_current_user, new_id, now_iso)
+
+    # Initialize Expedição + Faturamento modules
+    init_expedicao(db, get_current_user, new_id, now_iso)
+    init_faturamento(db, get_current_user, new_id, now_iso)
+    init_pcp(db, get_current_user, new_id, now_iso)
+
     # Initialize Orders module
     init_orders(db, get_current_user, new_id, now_iso)
     init_kickoff(db, get_current_user, new_id, now_iso)
@@ -2028,7 +2044,13 @@ app.include_router(router)
 app.include_router(pd_router)
 app.include_router(crm_router)
 app.include_router(estoque_router)
+app.include_router(recebimento_router)
+app.include_router(retrabalho_router)
+app.include_router(expedicao_router)
+app.include_router(faturamento_router)
+app.include_router(pcp_router)
 app.include_router(orders_router)
+app.include_router(ops_router)
 app.include_router(workflow_router)
 app.include_router(kickoff_router)
 app.include_router(compras_router)

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
     ClipboardList, CheckSquare, AlertTriangle, FlaskConical,
-    ChevronRight, Loader2, RefreshCw
+    ChevronRight, Loader2, RefreshCw, RotateCcw,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -14,18 +14,19 @@ export default function CQDashboard() {
     const navigate = useNavigate();
     const { user } = useAuth();
     const [loading, setLoading] = useState(true);
-    const [cards, setCards] = useState({ rasPendentes: 0, checklistsAtivos: 0, rncsAbertas: 0, instrumentosVencidos: 0 });
+    const [cards, setCards] = useState({ rasPendentes: 0, checklistsAtivos: 0, rncsAbertas: 0, instrumentosVencidos: 0, retrabalhoAtivos: 0 });
     const [tasks, setTasks] = useState([]);
     const [tasksLoading, setTasksLoading] = useState(true);
 
     const loadCards = async () => {
         setLoading(true);
         try {
-            const [rasRes, ckRes, rncRes, instrRes] = await Promise.all([
+            const [rasRes, ckRes, rncRes, instrRes, rtRes] = await Promise.all([
                 api.get("/cq/registros-analise", { params: { status: "em_analise" } }),
                 api.get("/cq/checklists", { params: { status: "em_preenchimento" } }),
                 api.get("/cq/rncs", { params: { status: "aberta" } }),
                 api.get("/cq/instrumentos"),
+                api.get("/retrabalho/dashboard").catch(() => ({ data: { total_ativos: 0 } })),
             ]);
             const rasPendentes = Array.isArray(rasRes.data)
                 ? rasRes.data.length
@@ -40,7 +41,8 @@ export default function CQDashboard() {
                 ? instrRes.data
                 : (instrRes.data?.items ?? instrRes.data?.data ?? []);
             const instrumentosVencidos = instrList.filter(i => i.status === "vencido").length;
-            setCards({ rasPendentes, checklistsAtivos, rncsAbertas, instrumentosVencidos });
+            const retrabalhoAtivos = rtRes.data?.total_ativos ?? 0;
+            setCards({ rasPendentes, checklistsAtivos, rncsAbertas, instrumentosVencidos, retrabalhoAtivos });
         } catch (e) {
             toast.error("Erro ao carregar dados do dashboard CQ");
         } finally {
@@ -103,6 +105,15 @@ export default function CQDashboard() {
             bg: "bg-red-50 dark:bg-red-950/30",
             border: "border-red-200 dark:border-red-800",
         },
+        {
+            testId: "card-retrabalho-ativos",
+            label: "Retrabalhos Ativos",
+            value: cards.retrabalhoAtivos,
+            icon: RotateCcw,
+            color: "text-orange-600",
+            bg: "bg-orange-50 dark:bg-orange-950/30",
+            border: "border-orange-200 dark:border-orange-800",
+        },
     ];
 
     const navButtons = [
@@ -111,6 +122,7 @@ export default function CQDashboard() {
         { label: "RNCs", path: "/cq/rncs", icon: AlertTriangle },
         { label: "Retenções", path: "/cq/retencoes", icon: FlaskConical },
         { label: "Instrumentos", path: "/cq/instrumentos", icon: FlaskConical },
+        { label: "Retrabalho", path: "/cq/retrabalho", icon: RotateCcw },
     ];
 
     return (
@@ -131,7 +143,7 @@ export default function CQDashboard() {
                     <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
                 </div>
             ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
                     {cardDefs.map((card) => {
                         const Icon = card.icon;
                         return (

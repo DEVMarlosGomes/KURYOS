@@ -33,6 +33,8 @@ import CQDetalheRetencao from "@/pages/CQDetalheRetencao";
 import CQInstrumentos from "@/pages/CQInstrumentos";
 import OrdersPage from "@/pages/OrdersPage";
 import OrderDetail from "@/pages/OrderDetail";
+import OPPage from "@/pages/OPPage";
+import OPDetail from "@/pages/OPDetail";
 import ComprasPage from "@/pages/ComprasPage";
 import ComprasDashboard from "@/pages/ComprasDashboard";
 import ComprasFornecedores from "@/pages/ComprasFornecedores";
@@ -45,6 +47,12 @@ import ComprasCotacao from "@/pages/ComprasCotacao";
 import ComprasPOLista from "@/pages/ComprasPOLista";
 import ComprasPODetalhe from "@/pages/ComprasPODetalhe";
 import ComprasEstoqueProjetado from "@/pages/ComprasEstoqueProjetado";
+import EstoquePage from "@/pages/EstoquePage";
+import RecebimentoPage from "@/pages/RecebimentoPage";
+import CQRetrabalho from "@/pages/CQRetrabalho";
+import ExpedicaoPage from "@/pages/ExpedicaoPage";
+import FaturamentoPage from "@/pages/FaturamentoPage";
+import PCPPage from "@/pages/PCPPage";
 import ContratosPage from "@/pages/ContratosPage";
 import Sidebar from "@/components/Sidebar";
 import RoleGuard, { ROLE_GROUPS } from "@/components/RoleGuard";
@@ -116,6 +124,11 @@ function AppLayout() {
                     <Route path="/tasks" element={<TasksPage />} />
                     <Route path="/orders" element={<OrdersPage />} />
                     <Route path="/orders/:id" element={<OrderDetail />} />
+                    <Route path="/ops" element={<OPPage />} />
+                    <Route path="/ops/:id" element={<OPDetail />} />
+                    <Route path="/pcp" element={<PCPPage />} />
+                    <Route path="/expedicao" element={<ExpedicaoPage />} />
+                    <Route path="/faturamento" element={<FaturamentoPage />} />
                     <Route path="/compras" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasDashboard /></RoleGuard>} />
                     <Route path="/compras/fornecedores" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasFornecedores /></RoleGuard>} />
                     <Route path="/compras/fornecedores/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasFornecedorDetalhe /></RoleGuard>} />
@@ -127,6 +140,8 @@ function AppLayout() {
                     <Route path="/compras/pos" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPOLista /></RoleGuard>} />
                     <Route path="/compras/pos/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPODetalhe /></RoleGuard>} />
                     <Route path="/compras/estoque-projetado" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasEstoqueProjetado /></RoleGuard>} />
+                    <Route path="/estoque" element={<EstoquePage />} />
+                    <Route path="/recebimento" element={<RecebimentoPage />} />
                     <Route path="/contratos" element={<RoleGuard allowed={CONTRATOS_ROLES}><ContratosPage /></RoleGuard>} />
                     <Route path="/audit" element={<RoleGuard allowed={AUDIT_ROLES}><AuditLogPage /></RoleGuard>} />
                     <Route path="/cq" element={<RoleGuard allowed={CQ_ROLES}><CQDashboard /></RoleGuard>} />
@@ -139,6 +154,7 @@ function AppLayout() {
                     <Route path="/cq/retencoes" element={<RoleGuard allowed={CQ_ROLES}><CQRetencoes /></RoleGuard>} />
                     <Route path="/cq/retencoes/:id" element={<RoleGuard allowed={CQ_ROLES}><CQDetalheRetencao /></RoleGuard>} />
                     <Route path="/cq/instrumentos" element={<RoleGuard allowed={CQ_ROLES}><CQInstrumentos /></RoleGuard>} />
+                    <Route path="/cq/retrabalho" element={<RoleGuard allowed={CQ_ROLES}><CQRetrabalho /></RoleGuard>} />
                     <Route path="/team" element={<RoleGuard allowed={ADMIN_ONLY}><TeamPage /></RoleGuard>} />
                 </Routes>
             </main>

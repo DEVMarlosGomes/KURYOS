@@ -70,6 +70,8 @@ TIPO_ITEM_VALORES = ["mp", "produto_acabado"]
 
 # ============ PYDANTIC MODELS ============
 
+POSICOES_CQ = ["livre", "quarentena", "aprovado", "reprovado"]
+
 class EstoqueItemCreate(BaseModel):
     tipo_item: str  # "mp" | "produto_acabado"
     setor: str      # MANIPULACAO | ROTULAGEM | LOGISTICA | FABRICA
@@ -83,6 +85,7 @@ class EstoqueItemCreate(BaseModel):
     lote: str = ""
     validade: Optional[str] = None     # ISO date
     observacoes: str = ""
+    posicao_cq: str = "livre"          # livre | quarentena | aprovado | reprovado
 
 
 class EstoqueItemUpdate(BaseModel):
@@ -94,6 +97,7 @@ class EstoqueItemUpdate(BaseModel):
     lote: Optional[str] = None
     validade: Optional[str] = None
     observacoes: Optional[str] = None
+    posicao_cq: Optional[str] = None
 
 
 class MovimentoCreate(BaseModel):
@@ -217,6 +221,7 @@ async def create_item(data: EstoqueItemCreate, request: Request):
         "lote": data.lote,
         "validade": data.validade,
         "observacoes": data.observacoes,
+        "posicao_cq": data.posicao_cq if data.posicao_cq in POSICOES_CQ else "livre",
         "created_by": user["id"],
         "created_by_name": user["name"],
         "created_at": now,
@@ -234,6 +239,7 @@ async def list_items(
     tipo_item: Optional[str] = None,
     search: Optional[str] = None,
     only_low_stock: bool = False,
+    posicao_cq: Optional[str] = None,
 ):
     user = await _get_current_user(request)
     query = {"tenant_id": user["tenant_id"]}
@@ -248,6 +254,8 @@ async def list_items(
             {"lote": {"$regex": search, "$options": "i"}},
         ]
 
+    if posicao_cq:
+        query["posicao_cq"] = posicao_cq
     items = await db.estoque_items.find(query, {"_id": 0}).sort("nome", 1).to_list(5000)
     if only_low_stock:
         items = [i for i in items if i.get("quantidade_atual", 0) <= i.get("estoque_minimo", 0) and i.get("estoque_minimo", 0) > 0]
@@ -291,6 +299,24 @@ async def delete_item(item_id: str, request: Request):
     # Movimentos são preservados (kardex imutável)
     logger.info(f"Deleted estoque_item {item_id}")
     return {"deleted": item_id}
+
+
+@estoque_router.patch("/items/{item_id}/posicao")
+async def update_posicao_cq(item_id: str, request: Request):
+    """Atualiza posição CQ do item: quarentena → aprovado | reprovado."""
+    user = await _get_current_user(request)
+    body = await request.json()
+    nova_posicao = body.get("posicao_cq")
+    if nova_posicao not in POSICOES_CQ:
+        raise HTTPException(status_code=400, detail=f"Posição inválida. Permitidas: {POSICOES_CQ}")
+    item = await _get_item_or_404(item_id, user["tenant_id"])
+    await db.estoque_items.update_one(
+        {"id": item_id},
+        {"$set": {"posicao_cq": nova_posicao, "updated_at": _now_iso()}}
+    )
+    updated = await db.estoque_items.find_one({"id": item_id}, {"_id": 0})
+    return updated
+
 
 
 # ============ MOVIMENTOS (KARDEX - APPEND ONLY) ============

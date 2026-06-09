@@ -68,10 +68,10 @@ export default function OrdersPage() {
           <div>
             <h1 className="text-2xl font-heading font-semibold tracking-tight flex items-center gap-2">
               <ClipboardList className="h-6 w-6" />
-              Pedidos
+              Pedidos de Industrialização (PI)
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Ordens de produção criadas a partir de projetos P&D aprovados
+              Pedidos comerciais gerados a partir de projetos P&D aprovados
             </p>
           </div>
         </div>

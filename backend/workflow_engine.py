@@ -166,6 +166,77 @@ async def next_sku_number(tenant_id: str) -> int:
 
 
 # ======================================================================
+#   SKU CODE GENERATION  [CAT2]-[CLI3]-[SEQ4]
+# ======================================================================
+
+CAT2_MAP: Dict[str, str] = {
+    "capilares": "CA", "capilar": "CA",
+    "skin_care": "SC", "skincare": "SC", "skin care": "SC",
+    "dermocosmeticos": "SC", "dermocosmetico": "SC", "dermo": "SC",
+    "higiene_pessoal": "HP", "higiene pessoal": "HP", "higiene": "HP",
+    "perfumaria": "PF",
+    "maquiagem": "MQ", "makeup": "MQ",
+    "corporal": "CO", "spa": "CO", "corporal_spa": "CO", "corporal / spa": "CO",
+    "infantil": "IN",
+    "masculino": "MA",
+    "profissional": "PS", "salao": "PS", "profissional_salao": "PS",
+    "profissional / salão": "PS",
+}
+
+
+def cat2_from_categoria(categoria: str) -> str:
+    """Return the 2-letter CAT2 code for a product category string."""
+    if not categoria:
+        return "GE"
+    key = categoria.lower().strip()
+    if key in CAT2_MAP:
+        return CAT2_MAP[key]
+    key_norm = key.replace(" ", "_").replace("/", "_").replace("ã", "a").replace("é", "e").replace("ó", "o")
+    if key_norm in CAT2_MAP:
+        return CAT2_MAP[key_norm]
+    for k, v in CAT2_MAP.items():
+        if k in key or key in k:
+            return v
+    return "GE"
+
+
+async def next_sku_per_pair(tenant_id: str, cat2: str, cli3: str) -> int:
+    """Atomic counter per (tenant, cat2, cli3) pair — returns 1-based integer."""
+    key = f"sku_{cat2}_{cli3}"
+    return await next_sequence(tenant_id, key, start=0)
+
+
+async def recalc_sku_averages(tenant_id: str, sku_id: str) -> None:
+    """Recalculate all automatic production averages for a SKU from its historico_producao."""
+    sku = await db.skus.find_one({"id": sku_id, "tenant_id": tenant_id})
+    if not sku:
+        return
+    historico = (sku.get("medias_producao") or {}).get("historico_producao", [])
+    if not historico:
+        return
+
+    now = datetime.now(timezone.utc)
+
+    def avg_unh(records):
+        vals = [r["unh"] for r in records if r.get("unh") and r["unh"] > 0]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    def within_days(days):
+        cutoff = (now - timedelta(days=days)).isoformat()
+        return [r for r in historico if (r.get("data") or "") >= cutoff]
+
+    await db.skus.update_one(
+        {"id": sku_id, "tenant_id": tenant_id},
+        {"$set": {
+            "medias_producao.media_geral_unh": avg_unh(historico),
+            "medias_producao.media_12m_unh": avg_unh(within_days(365)),
+            "medias_producao.media_3m_unh": avg_unh(within_days(90)),
+            "medias_producao.media_1m_unh": avg_unh(within_days(30)),
+        }}
+    )
+
+
+# ======================================================================
 #   HIERARCHY VALIDATION
 # ======================================================================
 

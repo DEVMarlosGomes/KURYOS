@@ -27,6 +27,9 @@ from workflow_engine import (
     create_workflow_task,
     next_sample_number,
     next_sku_number,
+    next_sku_per_pair,
+    cat2_from_categoria,
+    recalc_sku_averages,
     assert_client_exists,
     assert_project_exists,
     assert_sample_exists,
@@ -396,6 +399,8 @@ class ClientCreate(BaseModel):
     site: str = ""
     instagram: str = ""
     observacoes: str = ""
+    # SKU identifier (RN-SK-01: obrigatório antes da aprovação do pedido)
+    cli3: str = ""
 
 
 class ClientUpdate(BaseModel):
@@ -433,6 +438,7 @@ class ClientUpdate(BaseModel):
     instagram: Optional[str] = None
     observacoes: Optional[str] = None
     ultima_atualizacao_temperatura: Optional[str] = None
+    cli3: Optional[str] = None
 
 class ClientMove(BaseModel):
     stage: str
@@ -610,6 +616,14 @@ class SKUUpdate(BaseModel):
     anvisa_numero: Optional[str] = None
     anvisa_validade: Optional[str] = None
     status: Optional[str] = None
+    nome_produto: Optional[str] = None
+
+class SKUMetaUpdate(BaseModel):
+    meta_unh: Optional[float] = None
+    ajuste_percentual: Optional[float] = None  # -100 to +100
+
+class SKUDescontinuar(BaseModel):
+    motivo: str
 
 class OrderAdd(BaseModel):
     data_pedido: str
@@ -1173,6 +1187,7 @@ async def create_client(data: ClientCreate, request: Request):
         "site": create_payload["site"],
         "instagram": create_payload["instagram"],
         "observacoes": create_payload["observacoes"],
+        "cli3": (data.cli3 or "").upper()[:3],
         "has_grau2_anvisa": create_payload.get("has_grau2_anvisa", False),
         "ultima_atualizacao_temperatura": now,
         # Qualificado fields (empty initially)
@@ -1295,6 +1310,10 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
     # RN-CL-04: Registrar data de atualização de temperatura
     if "temperatura_lead" in update_fields:
         update_fields["ultima_atualizacao_temperatura"] = _now_iso()
+
+    # RN-SK-01: cli3 — normalise to uppercase 3-char max
+    if "cli3" in update_fields and update_fields["cli3"]:
+        update_fields["cli3"] = str(update_fields["cli3"]).upper().strip()[:3]
 
     payload = dict(existing)
     payload.update(update_fields)
@@ -3605,9 +3624,16 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
     """Auto-create SKU entity when a variação is approved"""
     tenant_id = sample["tenant_id"]
 
-    # Generate auto-incremented code
-    count = await db.skus.count_documents({"tenant_id": tenant_id})
-    codigo = f"KRY-{str(count + 1).zfill(3)}"
+    # Resolve CAT2 and CLI3 for new code format [CAT2]-[CLI3]-[SEQ4]
+    categoria = sample.get("categoria", "")
+    cat2 = cat2_from_categoria(categoria)
+    client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
+    cli3 = (client.get("cli3") or "").upper().strip()[:3] if client else ""
+    if not cli3:
+        # Fallback: first 3 letters of client name
+        cli3 = "".join(c for c in (client.get("nome_empresa", "") if client else "").upper() if c.isalpha())[:3] or "GEN"
+    seq = await next_sku_per_pair(tenant_id, cat2, cli3)
+    codigo = f"{cat2}-{cli3}-{str(seq).zfill(4)}"
 
     now = _now_iso()
     sku_id = _new_id()
@@ -3616,8 +3642,10 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
         "id": sku_id,
         "tenant_id": tenant_id,
         "codigo_interno": codigo,
+        "cat2": cat2,
+        "cli3": cli3,
         "nome_produto": f"{sample['nome_produto']} - {variacao['codigo']}",
-        "categoria": sample.get("categoria", ""),
+        "categoria": categoria,
         "formula_vinculada": "",
         "cliente_id": sample["cliente_id"],
         "cliente_nome": sample.get("cliente_nome", ""),
@@ -3630,22 +3658,36 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
         "moq": 0,
         "anvisa": {"numero": "", "validade": None},
         "status": "ativo",
+        "descontinuado_motivo": None,
+        "descontinuado_em": None,
+        "descontinuado_por": None,
         "historico_pedidos": [],
         "data_ultimo_pedido": None,
         "frequencia_media_recompra_dias": 0,
+        "medias_producao": {
+            "media_geral_unh": None,
+            "media_12m_unh": None,
+            "media_3m_unh": None,
+            "media_1m_unh": None,
+            "meta_unh": None,
+            "ajuste_percentual": 0,
+            "meta_set_by": None,
+            "meta_set_at": None,
+            "historico_producao": [],
+        },
         "created_at": now,
         "updated_at": now,
     }
 
     await db.skus.insert_one(sku)
     sku.pop("_id", None)
-    
+
     # Atualizar variação com SKU ID
     await db.crm_samples.update_one(
         {"id": sample["id"], "variacoes.id": variacao["id"]},
         {"$set": {"variacoes.$.sku_id": sku_id, "variacoes.$.gera_sku": True}}
     )
-    
+
     logger.info(f"Auto-created SKU {codigo} from variação {variacao['codigo']}")
     return sku
 
@@ -3658,9 +3700,18 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
     """Auto-create SKU entity when a sample is approved"""
     tenant_id = sample["tenant_id"]
 
-    # Generate auto-incremented code
-    count = await db.skus.count_documents({"tenant_id": tenant_id})
-    codigo = f"KRY-{str(count + 1).zfill(3)}"
+    # Resolve category from project if not on sample
+    project = await db.crm_projects.find_one({"id": sample["projeto_id"]}, {"_id": 0})
+    categoria = sample.get("categoria") or (project.get("categoria") if project else "") or ""
+
+    # Resolve CAT2 and CLI3 for code format [CAT2]-[CLI3]-[SEQ4]
+    cat2 = cat2_from_categoria(categoria)
+    client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
+    cli3 = (client.get("cli3") or "").upper().strip()[:3] if client else ""
+    if not cli3:
+        cli3 = "".join(c for c in (client.get("nome_empresa", "") if client else "").upper() if c.isalpha())[:3] or "GEN"
+    seq = await next_sku_per_pair(tenant_id, cat2, cli3)
+    codigo = f"{cat2}-{cli3}-{str(seq).zfill(4)}"
 
     now = _now_iso()
     sku_id = _new_id()
@@ -3669,8 +3720,10 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         "id": sku_id,
         "tenant_id": tenant_id,
         "codigo_interno": codigo,
-        "nome_produto": sample["nome_amostra"],
-        "categoria": "",
+        "cat2": cat2,
+        "cli3": cli3,
+        "nome_produto": sample.get("nome_amostra", ""),
+        "categoria": categoria,
         "formula_vinculada": "",
         "cliente_id": sample["cliente_id"],
         "cliente_nome": sample.get("cliente_nome", ""),
@@ -3681,21 +3734,29 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         "moq": 0,
         "anvisa": {"numero": "", "validade": None},
         "status": "ativo",
+        "descontinuado_motivo": None,
+        "descontinuado_em": None,
+        "descontinuado_por": None,
         "historico_pedidos": [],
         "data_ultimo_pedido": None,
         "frequencia_media_recompra_dias": 0,
+        "medias_producao": {
+            "media_geral_unh": None,
+            "media_12m_unh": None,
+            "media_3m_unh": None,
+            "media_1m_unh": None,
+            "meta_unh": None,
+            "ajuste_percentual": 0,
+            "meta_set_by": None,
+            "meta_set_at": None,
+            "historico_producao": [],
+        },
         "created_at": now,
         "updated_at": now,
     }
 
     await db.skus.insert_one(sku)
     sku.pop("_id", None)
-
-    # Also try to get project category
-    project = await db.crm_projects.find_one({"id": sample["projeto_id"]}, {"_id": 0})
-    if project and project.get("categoria"):
-        await db.skus.update_one({"id": sku_id}, {"$set": {"categoria": project["categoria"]}})
-        sku["categoria"] = project["categoria"]
 
     logger.info(f"Auto-created SKU {codigo} from sample {sample['id']}")
     return sku
@@ -3737,10 +3798,12 @@ async def get_sku(sku_id: str, request: Request):
 
 @crm_router.put("/skus/{sku_id}")
 async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
-    """Limited update — SKU is mostly immutable after creation"""
+    """Limited update — SKU code is immutable (RN-SK-04), other fields are editable."""
     user = await _get_current_user(request)
     update_fields = {}
 
+    if data.nome_produto is not None:
+        update_fields["nome_produto"] = data.nome_produto
     if data.preco_unitario is not None:
         update_fields["preco_unitario"] = data.preco_unitario
     if data.moq is not None:
@@ -3768,6 +3831,129 @@ async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
 
     sku = await db.skus.find_one({"id": sku_id}, {"_id": 0})
     return sku
+
+
+@crm_router.post("/skus/{sku_id}/meta")
+async def update_sku_meta(sku_id: str, data: SKUMetaUpdate, request: Request):
+    """Update manual Meta un/h and ajuste percentual (RN-SK-05)."""
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+
+    now = _now_iso()
+    updates = {}
+    if data.meta_unh is not None:
+        if data.meta_unh < 0:
+            raise HTTPException(status_code=422, detail="meta_unh não pode ser negativa")
+        updates["medias_producao.meta_unh"] = data.meta_unh
+        updates["medias_producao.meta_set_by"] = user["name"]
+        updates["medias_producao.meta_set_at"] = now
+    if data.ajuste_percentual is not None:
+        if not (-100 <= data.ajuste_percentual <= 100):
+            raise HTTPException(status_code=422, detail="ajuste_percentual deve estar entre -100 e +100")
+        updates["medias_producao.ajuste_percentual"] = data.ajuste_percentual
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    updates["updated_at"] = now
+    await db.skus.update_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"$set": updates})
+    return await db.skus.find_one({"id": sku_id}, {"_id": 0})
+
+
+@crm_router.post("/skus/{sku_id}/descontinuar")
+async def descontinuar_sku(sku_id: str, data: SKUDescontinuar, request: Request):
+    """Mark SKU as discontinued with mandatory reason (RN-SK-03)."""
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+    if sku.get("status") == "descontinuado":
+        raise HTTPException(status_code=400, detail="SKU já está descontinuado")
+    if not data.motivo.strip():
+        raise HTTPException(status_code=422, detail="Motivo obrigatório para descontinuar (RN-SK-03)")
+
+    now = _now_iso()
+    await db.skus.update_one(
+        {"id": sku_id, "tenant_id": user["tenant_id"]},
+        {"$set": {
+            "status": "descontinuado",
+            "descontinuado_motivo": data.motivo.strip(),
+            "descontinuado_em": now,
+            "descontinuado_por": user["name"],
+            "updated_at": now,
+        }}
+    )
+    return await db.skus.find_one({"id": sku_id}, {"_id": 0})
+
+
+@crm_router.get("/skus/{sku_id}/saldo")
+async def get_sku_saldo(sku_id: str, request: Request):
+    """Return consolidated open balance (saldo aberto) view per order for a SKU."""
+    user = await _get_current_user(request)
+    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not sku:
+        raise HTTPException(status_code=404, detail="SKU não encontrado")
+
+    # Find all orders that contain this SKU's code
+    codigo = sku.get("codigo_interno", "")
+    orders_cursor = db.orders.find(
+        {"tenant_id": user["tenant_id"], "items.codigo_kuryos": codigo},
+        {"_id": 0}
+    )
+    orders = await orders_cursor.to_list(500)
+
+    result = []
+    for order in orders:
+        items_for_sku = [it for it in (order.get("items") or []) if it.get("codigo_kuryos") == codigo]
+        for item in items_for_sku:
+            qtd_pedido = item.get("qtd", 0)
+            # Find OPs for this order
+            ops_cursor = db.ops.find(
+                {"tenant_id": user["tenant_id"], "pedido_id": order["id"]},
+                {"_id": 0}
+            )
+            ops = await ops_cursor.to_list(100)
+            ops_info = []
+            qtd_realizada_total = 0
+            qtd_perda_total = 0
+            for op in ops:
+                qtd_apontada = sum(a.get("qtd_produzida", 0) for a in (op.get("apontamentos") or []))
+                qtd_perda = sum(p.get("quantidade", 0) for p in (op.get("perdas") or []))
+                qtd_realizada_total += qtd_apontada
+                qtd_perda_total += qtd_perda
+                # PCP slot for this OP
+                pcp_slot = await db.pcp_programacao.find_one({"op_id": op["id"]}, {"_id": 0})
+                ops_info.append({
+                    "op_id": op["id"],
+                    "numero_op": op.get("numero_op"),
+                    "status": op.get("status"),
+                    "qtd_planejada": op.get("items", [{}])[0].get("qtd", 0) if op.get("items") else 0,
+                    "qtd_realizada": qtd_apontada,
+                    "qtd_perda": qtd_perda,
+                    "pcp_data_inicio": pcp_slot.get("data_inicio") if pcp_slot else None,
+                    "pcp_linha": pcp_slot.get("linha_nome") if pcp_slot else None,
+                    "pcp_status": pcp_slot.get("status") if pcp_slot else None,
+                })
+            saldo_aberto = max(qtd_pedido - qtd_realizada_total, 0)
+            checklist_ok = all(
+                (ci.get("status") == "recebido" or not ci.get("ativo"))
+                for ci in (order.get("checklist_insumos") or [])
+            )
+            result.append({
+                "pedido_id": order["id"],
+                "numero_pedido": order.get("numero_pedido"),
+                "cliente_nome": order.get("cliente", {}).get("nome"),
+                "order_status": order.get("status"),
+                "item_nome": item.get("item"),
+                "qtd_pedido": qtd_pedido,
+                "qtd_realizada": qtd_realizada_total,
+                "qtd_perda": qtd_perda_total,
+                "saldo_aberto": saldo_aberto,
+                "checklist_insumos_ok": checklist_ok,
+                "ops": ops_info,
+            })
+    return result
 
 
 @crm_router.post("/skus/{sku_id}/orders")
