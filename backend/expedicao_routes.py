@@ -37,11 +37,12 @@ def _now():
     return now_iso_func()
 
 
-EXP_STATUSES = ["pendente", "preparando", "expedido", "entregue", "cancelado"]
+EXP_STATUSES = ["pendente", "preparando", "conferido", "expedido", "entregue", "cancelado"]
 
 STATUS_TRANSITIONS = {
     "pendente":    ["preparando", "cancelado"],
-    "preparando":  ["expedido", "cancelado"],
+    "preparando":  ["conferido", "cancelado"],
+    "conferido":   ["expedido", "cancelado"],
     "expedido":    ["entregue"],
     "entregue":    [],
     "cancelado":   [],
@@ -57,16 +58,19 @@ class ExpItem(BaseModel):
     lote: str = ""
     numero_serie: str = ""
     estoque_item_id: Optional[str] = None
+    volumes: int = 1          # número de caixas/volumes deste item
+    peso_unitario: float = 0  # kg por volume
 
 
 class ExpCreate(BaseModel):
-    order_id: Optional[str] = None          # PI id
+    order_id: Optional[str] = None
     order_numero: Optional[str] = None
     cliente_nome: str
     cliente_id: Optional[str] = None
     endereco_entrega: str = ""
     transportadora: str = ""
-    previsao_entrega: Optional[str] = None  # YYYY-MM-DD
+    previsao_entrega: Optional[str] = None
+    numero_nf_saida: str = ""   # NF fiscal de saída
     items: List[ExpItem]
     observacoes: str = ""
 
@@ -79,7 +83,22 @@ class ExpUpdate(BaseModel):
     data_expedicao: Optional[str] = None
     data_entrega: Optional[str] = None
     codigo_rastreio: Optional[str] = None
+    numero_nf_saida: Optional[str] = None
     observacoes: Optional[str] = None
+
+
+class ConferenciaItem(BaseModel):
+    produto_nome: str
+    quantidade_conferida: float
+    lote_conferido: str = ""
+    ok: bool = True
+    divergencia: str = ""
+
+
+class ConferenciaCreate(BaseModel):
+    items: List[ConferenciaItem]
+    conferente_nome: str = ""
+    observacoes: str = ""
 
 
 # ===== SEQUENCE =====
@@ -157,7 +176,9 @@ async def create_ordem(data: ExpCreate, request: Request):
         "data_expedicao": None,
         "data_entrega": None,
         "codigo_rastreio": None,
+        "numero_nf_saida": data.numero_nf_saida,
         "status": "pendente",
+        "conferencia": None,
         "items": [i.model_dump() for i in data.items],
         "observacoes": data.observacoes,
         "historico": [{"de": None, "para": "pendente", "por": user["name"], "em": now}],
@@ -252,12 +273,99 @@ async def update_ordem(exp_id: str, data: ExpUpdate, request: Request):
             updates["data_entrega"] = payload.get("data_entrega") or now[:10]
 
     for field in ("transportadora", "endereco_entrega", "previsao_entrega",
-                  "codigo_rastreio", "observacoes", "data_expedicao", "data_entrega"):
+                  "codigo_rastreio", "numero_nf_saida", "observacoes", "data_expedicao", "data_entrega"):
         if field in payload and payload[field] is not None:
             updates[field] = payload[field]
 
     await db.expedicao_ordens.update_one({"id": exp_id}, {"$set": updates})
     return await db.expedicao_ordens.find_one({"id": exp_id}, {"_id": 0})
+
+
+@expedicao_router.post("/ordens/{exp_id}/conferir")
+async def conferir_ordem(exp_id: str, data: ConferenciaCreate, request: Request):
+    """Realiza a conferência física dos itens — prepara → conferido."""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+    exp = await db.expedicao_ordens.find_one({"id": exp_id, "tenant_id": tid}, {"_id": 0})
+    if not exp:
+        raise HTTPException(status_code=404, detail="EXP não encontrada")
+    if exp["status"] != "preparando":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Conferência só é possível quando status = 'preparando' (atual: {exp['status']})"
+        )
+
+    tem_divergencia = any(not item.ok for item in data.items)
+    now = _now()
+    historico = list(exp.get("historico", []))
+    historico.append({"de": "preparando", "para": "conferido", "por": user["name"], "em": now,
+                      "nota": "com divergências" if tem_divergencia else "OK"})
+
+    conferencia_record = {
+        "conferente_nome": data.conferente_nome or user["name"],
+        "conferente_id": user["id"],
+        "data_conferencia": now,
+        "tem_divergencia": tem_divergencia,
+        "observacoes": data.observacoes,
+        "items": [i.model_dump() for i in data.items],
+    }
+
+    await db.expedicao_ordens.update_one({"id": exp_id}, {"$set": {
+        "status": "conferido",
+        "conferencia": conferencia_record,
+        "historico": historico,
+        "updated_at": now,
+    }})
+    return await db.expedicao_ordens.find_one({"id": exp_id}, {"_id": 0})
+
+
+@expedicao_router.get("/ordens/{exp_id}/romaneio")
+async def romaneio(exp_id: str, request: Request):
+    """Retorna dados estruturados para impressão do romaneio / packing list."""
+    user = await get_current_user(request)
+    exp = await db.expedicao_ordens.find_one({"id": exp_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not exp:
+        raise HTTPException(status_code=404, detail="EXP não encontrada")
+
+    items = exp.get("items", [])
+    total_volumes = sum(int(i.get("volumes", 1)) for i in items)
+    peso_total = sum(
+        float(i.get("volumes", 1)) * float(i.get("peso_unitario", 0))
+        for i in items
+    )
+
+    return {
+        "numero_exp": exp["numero_exp"],
+        "numero_nf_saida": exp.get("numero_nf_saida", ""),
+        "cliente_nome": exp["cliente_nome"],
+        "endereco_entrega": exp.get("endereco_entrega", ""),
+        "transportadora": exp.get("transportadora", ""),
+        "previsao_entrega": exp.get("previsao_entrega"),
+        "data_expedicao": exp.get("data_expedicao"),
+        "codigo_rastreio": exp.get("codigo_rastreio", ""),
+        "status": exp["status"],
+        "items": [
+            {
+                "produto_nome": i.get("produto_nome", ""),
+                "sku": i.get("sku", ""),
+                "lote": i.get("lote", ""),
+                "quantidade": i.get("quantidade", 0),
+                "unidade": i.get("unidade", "un"),
+                "volumes": i.get("volumes", 1),
+                "peso_unitario": i.get("peso_unitario", 0),
+                "peso_total_item": float(i.get("volumes", 1)) * float(i.get("peso_unitario", 0)),
+            }
+            for i in items
+        ],
+        "totais": {
+            "total_itens": len(items),
+            "total_volumes": total_volumes,
+            "peso_total_kg": round(peso_total, 3),
+        },
+        "conferencia": exp.get("conferencia"),
+        "order_numero": exp.get("order_numero", ""),
+        "observacoes": exp.get("observacoes", ""),
+    }
 
 
 @expedicao_router.delete("/ordens/{exp_id}")
@@ -271,10 +379,12 @@ async def expedicao_dashboard(request: Request):
     tid = user["tenant_id"]
     pendente = await db.expedicao_ordens.count_documents({"tenant_id": tid, "status": "pendente"})
     preparando = await db.expedicao_ordens.count_documents({"tenant_id": tid, "status": "preparando"})
+    conferido = await db.expedicao_ordens.count_documents({"tenant_id": tid, "status": "conferido"})
     expedido = await db.expedicao_ordens.count_documents({"tenant_id": tid, "status": "expedido"})
     return {
         "pendente": pendente,
         "preparando": preparando,
+        "conferido": conferido,
         "expedido": expedido,
-        "total_ativos": pendente + preparando + expedido,
+        "total_ativos": pendente + preparando + conferido + expedido,
     }

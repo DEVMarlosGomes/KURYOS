@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
 import { toast } from "sonner";
@@ -7,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
@@ -16,7 +15,7 @@ import {
     Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-    Package, Plus, Search, Trash2, Loader2, ClipboardList, AlertTriangle,
+    Package, Plus, Search, Trash2, Loader2, AlertTriangle, Zap, Link,
 } from "lucide-react";
 
 const TIPO_MP_OPTIONS = [
@@ -32,7 +31,7 @@ const STATUS_CONFIG = {
 };
 
 function emptyItem() {
-    return { nome: "", codigo: "", tipo_mp: "FORMULACAO", quantidade: "", unidade: "kg", lote: "", validade: "" };
+    return { nome: "", codigo: "", tipo_mp: "FORMULACAO", quantidade: "", unidade: "kg", lote: "", validade: "", urgente: false };
 }
 
 function emptyForm() {
@@ -63,6 +62,9 @@ export default function RecebimentoPage() {
     const [fornecedores, setFornecedores] = useState([]);
     const [pos, setPOs] = useState([]);
     const [selectedEntrada, setSelectedEntrada] = useState(null);
+    const [poSugestoes, setPoSugestoes] = useState([]);
+    const [loadingSugestao, setLoadingSugestao] = useState(false);
+    const [checkingUrgente, setCheckingUrgente] = useState({});
 
     const loadEntradas = useCallback(async () => {
         setLoading(true);
@@ -97,6 +99,7 @@ export default function RecebimentoPage() {
 
     const openForm = () => {
         setForm(emptyForm());
+        setPoSugestoes([]);
         setShowForm(true);
     };
 
@@ -117,8 +120,44 @@ export default function RecebimentoPage() {
         items: f.items.length > 1 ? f.items.filter((_, i) => i !== idx) : f.items,
     }));
 
-    const onSelectPO = (poId) => {
-        const po = pos.find(p => p.id === poId);
+    // RN-REC-03: Auto-link PO suggestion
+    const buscarSugestoesPO = async (fornecedorId, itemNome) => {
+        if (!fornecedorId) return;
+        setLoadingSugestao(true);
+        try {
+            const params = { fornecedor_id: fornecedorId };
+            if (itemNome) params.item_nome = itemNome;
+            const { data } = await api.get("/recebimento/sugerir-po", { params });
+            setPoSugestoes(data || []);
+            if (data && data.length === 1) {
+                onSelectPO(data[0].id, data);
+                toast.info(`PO ${data[0].numero_po || data[0].id.slice(-6)} vinculada automaticamente`);
+            }
+        } catch { /* silent */ } finally {
+            setLoadingSugestao(false);
+        }
+    };
+
+    // RN-REC-00B: Check URGENT for an item
+    const checkUrgente = async (idx, nome) => {
+        if (!nome.trim()) return;
+        setCheckingUrgente(prev => ({ ...prev, [idx]: true }));
+        try {
+            const { data } = await api.get("/recebimento/check-urgente", { params: { item_nome: nome } });
+            if (data.urgente) {
+                setItem(idx, "urgente", true);
+                toast.warning(`URGENTE: ${nome} está bloqueando uma OP nos próximos 14 dias!`);
+            } else {
+                setItem(idx, "urgente", false);
+            }
+        } catch { /* silent */ } finally {
+            setCheckingUrgente(prev => ({ ...prev, [idx]: false }));
+        }
+    };
+
+    const onSelectPO = (poId, sugestoes) => {
+        const pool = sugestoes || poSugestoes;
+        const po = pos.find(p => p.id === poId) || pool.find(p => p.id === poId);
         if (!po) { setField("po_id", ""); setField("po_numero", ""); return; }
         const forn = fornecedores.find(f => f.id === po.fornecedor_id);
         setForm(f => ({
@@ -128,6 +167,17 @@ export default function RecebimentoPage() {
             fornecedor_id: po.fornecedor_id || "",
             fornecedor_nome: forn?.razao_social || forn?.nome_fantasia || po.fornecedor_nome || "",
         }));
+    };
+
+    const onFornecedorChange = (id) => {
+        const f = fornecedores.find(x => x.id === id);
+        setForm(prev => ({
+            ...prev,
+            fornecedor_id: id,
+            fornecedor_nome: f?.razao_social || f?.nome_fantasia || "",
+        }));
+        const primeiroItem = form.items[0]?.nome;
+        buscarSugestoesPO(id, primeiroItem || "");
     };
 
     const handleSave = async () => {
@@ -156,8 +206,13 @@ export default function RecebimentoPage() {
                     validade: i.validade || null,
                 })),
             };
-            await api.post("/recebimento/entradas", payload);
-            toast.success(`NF ${form.numero_nf} registrada — itens em quarentena CQ`);
+            const { data: result } = await api.post("/recebimento/entradas", payload);
+            const temUrgente = result.tem_urgente;
+            toast.success(
+                temUrgente
+                    ? `NF ${form.numero_nf} registrada — ⚡ item URGENTE detectado, verifique a RA CQ!`
+                    : `NF ${form.numero_nf} registrada — itens em quarentena CQ`
+            );
             setShowForm(false);
             loadEntradas();
         } catch (e) {
@@ -234,6 +289,11 @@ export default function RecebimentoPage() {
                                                     {ent.po_numero && (
                                                         <Badge variant="outline" className="text-[10px]">PO {ent.po_numero}</Badge>
                                                     )}
+                                                    {ent.tem_urgente && (
+                                                        <Badge className="text-[10px] bg-red-600 text-white gap-1">
+                                                            <Zap className="h-2.5 w-2.5" />URGENTE
+                                                        </Badge>
+                                                    )}
                                                 </div>
                                                 <div className="text-sm font-medium">{ent.fornecedor_nome || "Fornecedor não informado"}</div>
                                                 <div className="text-xs text-muted-foreground">
@@ -242,9 +302,12 @@ export default function RecebimentoPage() {
                                                 </div>
                                             </div>
                                             <div className="text-right text-xs text-muted-foreground shrink-0">
-                                                {(ent.items || []).map(i => (
-                                                    <div key={i.nome}>{i.nome} · {i.quantidade} {i.unidade}</div>
-                                                )).slice(0, 3)}
+                                                {(ent.items || []).slice(0, 3).map((i, idx) => (
+                                                    <div key={idx} className="flex items-center gap-1 justify-end">
+                                                        {i.urgente && <Zap className="h-3 w-3 text-red-500" />}
+                                                        {i.nome} · {i.quantidade} {i.unidade}
+                                                    </div>
+                                                ))}
                                                 {ent.items?.length > 3 && <div>+{ent.items.length - 3} mais</div>}
                                             </div>
                                         </div>
@@ -277,18 +340,31 @@ export default function RecebimentoPage() {
                                 <h4 className="font-semibold mb-2">Itens recebidos</h4>
                                 <div className="space-y-2">
                                     {(selectedEntrada.items || []).map((item, idx) => (
-                                        <div key={idx} className="rounded-lg border border-border p-3 text-xs space-y-1">
-                                            <div className="font-medium">{item.nome} {item.codigo ? `(${item.codigo})` : ""}</div>
+                                        <div
+                                            key={idx}
+                                            className={`rounded-lg border p-3 text-xs space-y-1 ${item.urgente ? "border-red-300 bg-red-50/50 dark:bg-red-950/20" : "border-border"}`}
+                                        >
+                                            <div className="font-medium flex items-center gap-2">
+                                                {item.urgente && (
+                                                    <Badge className="text-[10px] bg-red-600 text-white gap-1 py-0">
+                                                        <Zap className="h-2.5 w-2.5" />URGENTE
+                                                    </Badge>
+                                                )}
+                                                {item.nome} {item.codigo ? `(${item.codigo})` : ""}
+                                            </div>
                                             <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-0.5">
                                                 <span>Tipo: {TIPO_MP_OPTIONS.find(t => t.value === item.tipo_mp)?.label || item.tipo_mp}</span>
                                                 <span>Qtd: {item.quantidade} {item.unidade}</span>
                                                 {item.lote && <span>Lote: {item.lote}</span>}
                                                 {item.validade && <span>Validade: {formatDate(item.validade)}</span>}
+                                                {item.data_limite_cq && (
+                                                    <span className="text-amber-600">Prazo CQ: {formatDate(item.data_limite_cq)}</span>
+                                                )}
                                             </div>
                                             {item.ra_id && (
                                                 <div className="mt-1 text-[10px] text-amber-600 flex items-center gap-1">
                                                     <AlertTriangle className="h-3 w-3" />
-                                                    RA CQ criado · Status: {item.ra_status || "rascunho"}
+                                                    RA CQ criada · Status: {item.ra_status || "rascunho"}
                                                 </div>
                                             )}
                                         </div>
@@ -317,24 +393,89 @@ export default function RecebimentoPage() {
                     </DialogHeader>
 
                     <div className="space-y-5">
-                        {/* PO selection */}
-                        {pos.length > 0 && (
+                        {/* Fornecedor + PO auto-link */}
+                        <div className="grid grid-cols-2 gap-3">
                             <div>
-                                <Label>Vincular a Pedido de Compra (opcional)</Label>
-                                <Select onValueChange={onSelectPO}>
-                                    <SelectTrigger className="mt-1">
-                                        <SelectValue placeholder="Selecionar PO…" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        {pos.map(po => (
-                                            <SelectItem key={po.id} value={po.id}>
-                                                PO {po.numero_po || po.id.slice(-6)} · {po.fornecedor_nome || "—"}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
+                                <Label>Fornecedor</Label>
+                                {fornecedores.length > 0 ? (
+                                    <Select value={form.fornecedor_id} onValueChange={onFornecedorChange}>
+                                        <SelectTrigger className="mt-1">
+                                            <SelectValue placeholder="Selecionar…" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {fornecedores.map(f => (
+                                                <SelectItem key={f.id} value={f.id}>
+                                                    {f.razao_social || f.nome_fantasia}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                ) : (
+                                    <Input
+                                        value={form.fornecedor_nome}
+                                        onChange={e => setField("fornecedor_nome", e.target.value)}
+                                        placeholder="Nome do fornecedor"
+                                        className="mt-1"
+                                    />
+                                )}
                             </div>
-                        )}
+                            <div>
+                                <Label className="flex items-center justify-between">
+                                    <span className="flex items-center gap-1">
+                                        PO Vinculada
+                                        {loadingSugestao && <Loader2 className="h-3 w-3 animate-spin ml-1" />}
+                                    </span>
+                                    {form.fornecedor_id && !form.po_id && (
+                                        <button
+                                            type="button"
+                                            className="text-[10px] text-primary hover:underline flex items-center gap-1"
+                                            onClick={() => buscarSugestoesPO(form.fornecedor_id, form.items[0]?.nome)}
+                                        >
+                                            <Link className="h-3 w-3" />Sugerir PO
+                                        </button>
+                                    )}
+                                </Label>
+                                {poSugestoes.length > 1 ? (
+                                    <Select onValueChange={v => onSelectPO(v, poSugestoes)}>
+                                        <SelectTrigger className="mt-1">
+                                            <SelectValue placeholder={`${poSugestoes.length} POs encontradas — selecione`} />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {poSugestoes.map(po => (
+                                                <SelectItem key={po.id} value={po.id}>
+                                                    PO {po.numero_po || po.id.slice(-6)} · {po.fornecedor_nome || "—"}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                ) : pos.length > 0 ? (
+                                    <Select value={form.po_id} onValueChange={v => onSelectPO(v, [])}>
+                                        <SelectTrigger className="mt-1">
+                                            <SelectValue placeholder="Selecionar PO…" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {pos.map(po => (
+                                                <SelectItem key={po.id} value={po.id}>
+                                                    PO {po.numero_po || po.id.slice(-6)} · {po.fornecedor_nome || "—"}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                ) : (
+                                    <Input
+                                        value={form.po_numero}
+                                        onChange={e => setField("po_numero", e.target.value)}
+                                        placeholder="Nº da PO (opcional)"
+                                        className="mt-1"
+                                    />
+                                )}
+                                {form.po_id && (
+                                    <p className="text-[10px] text-green-600 mt-1 flex items-center gap-1">
+                                        <Link className="h-3 w-3" />PO {form.po_numero} vinculada
+                                    </p>
+                                )}
+                            </div>
+                        </div>
 
                         {/* NF data */}
                         <div className="grid grid-cols-2 gap-3">
@@ -361,56 +502,15 @@ export default function RecebimentoPage() {
                             </div>
                         </div>
 
-                        {/* Fornecedor */}
-                        <div className="grid grid-cols-2 gap-3">
-                            {fornecedores.length > 0 ? (
-                                <div>
-                                    <Label>Fornecedor</Label>
-                                    <Select
-                                        value={form.fornecedor_id}
-                                        onValueChange={id => {
-                                            const f = fornecedores.find(x => x.id === id);
-                                            setForm(prev => ({
-                                                ...prev,
-                                                fornecedor_id: id,
-                                                fornecedor_nome: f?.razao_social || f?.nome_fantasia || "",
-                                            }));
-                                        }}
-                                    >
-                                        <SelectTrigger className="mt-1">
-                                            <SelectValue placeholder="Selecionar…" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            {fornecedores.map(f => (
-                                                <SelectItem key={f.id} value={f.id}>
-                                                    {f.razao_social || f.nome_fantasia}
-                                                </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                            ) : (
-                                <div>
-                                    <Label htmlFor="fornecedor_nome">Fornecedor</Label>
-                                    <Input
-                                        id="fornecedor_nome"
-                                        value={form.fornecedor_nome}
-                                        onChange={e => setField("fornecedor_nome", e.target.value)}
-                                        placeholder="Nome do fornecedor"
-                                        className="mt-1"
-                                    />
-                                </div>
-                            )}
-                            <div>
-                                <Label htmlFor="observacoes">Observações</Label>
-                                <Input
-                                    id="observacoes"
-                                    value={form.observacoes}
-                                    onChange={e => setField("observacoes", e.target.value)}
-                                    placeholder="Opcional"
-                                    className="mt-1"
-                                />
-                            </div>
+                        <div>
+                            <Label htmlFor="observacoes">Observações</Label>
+                            <Input
+                                id="observacoes"
+                                value={form.observacoes}
+                                onChange={e => setField("observacoes", e.target.value)}
+                                placeholder="Opcional"
+                                className="mt-1"
+                            />
                         </div>
 
                         <Separator />
@@ -425,9 +525,22 @@ export default function RecebimentoPage() {
                             </div>
                             <div className="space-y-3">
                                 {form.items.map((item, idx) => (
-                                    <div key={idx} className="rounded-lg border border-border p-3 space-y-3">
+                                    <div
+                                        key={idx}
+                                        className={`rounded-lg border p-3 space-y-3 ${item.urgente ? "border-red-300 bg-red-50/40 dark:bg-red-950/20" : "border-border"}`}
+                                    >
                                         <div className="flex items-center justify-between">
-                                            <span className="text-xs font-semibold text-muted-foreground uppercase">Item {idx + 1}</span>
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-semibold text-muted-foreground uppercase">Item {idx + 1}</span>
+                                                {item.urgente && (
+                                                    <Badge className="text-[10px] bg-red-600 text-white gap-1 py-0">
+                                                        <Zap className="h-2.5 w-2.5" />URGENTE — bloqueando OP!
+                                                    </Badge>
+                                                )}
+                                                {checkingUrgente[idx] && (
+                                                    <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                                                )}
+                                            </div>
                                             {form.items.length > 1 && (
                                                 <Button
                                                     size="icon" variant="ghost"
@@ -444,6 +557,11 @@ export default function RecebimentoPage() {
                                                 <Input
                                                     value={item.nome}
                                                     onChange={e => setItem(idx, "nome", e.target.value)}
+                                                    onBlur={e => {
+                                                        const val = e.target.value.trim();
+                                                        if (val) checkUrgente(idx, val);
+                                                        if (val && form.fornecedor_id) buscarSugestoesPO(form.fornecedor_id, val);
+                                                    }}
                                                     placeholder="Nome da matéria-prima"
                                                     className="mt-0.5 h-8 text-sm"
                                                 />
@@ -523,7 +641,7 @@ export default function RecebimentoPage() {
 
                         <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 flex items-start gap-2 text-xs">
                             <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
-                            <span>Após registrar, os itens entrarão no estoque em <strong>quarentena CQ</strong> e um <strong>Registro de Análise</strong> será criado automaticamente no módulo CQ para cada item.</span>
+                            <span>Após registrar, os itens entrarão no estoque em <strong>quarentena CQ</strong> e um <strong>Registro de Análise</strong> será criado automaticamente para cada item.</span>
                         </div>
                     </div>
 

@@ -18,8 +18,29 @@ import {
 } from "@/components/ui/select";
 import {
     RotateCcw, Plus, Search, Loader2, ChevronRight, AlertTriangle,
-    ClipboardList, Calendar, User,
+    Calendar, User, DollarSign, Truck,
 } from "lucide-react";
+
+const CATEGORIA_CONFIG = {
+    "RT-1": {
+        label: "RT-1 — Retrabalho Interno",
+        short: "RT-1",
+        description: "Reprocessamento no próprio lote (lote original + sufixo R)",
+        cls: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200",
+    },
+    "RT-2": {
+        label: "RT-2 — Substituição de Lote",
+        short: "RT-2",
+        description: "Novo lote criado para substituir o lote reprovado",
+        cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200",
+    },
+    "RT-3": {
+        label: "RT-3 — Devolução ao Fornecedor",
+        short: "RT-3",
+        description: "Material devolvido ao fornecedor (exige comprovante físico)",
+        cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200",
+    },
+};
 
 const STATUS_CONFIG = {
     pendente:      { label: "Pendente",       cls: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300" },
@@ -41,14 +62,17 @@ const NEXT_STATUS_LABEL = {
 
 function emptyForm() {
     return {
-        origem_tipo: "rnc",
-        origem_id: "",
+        categoria: "RT-1",
+        rnc_id: "",
+        op_id: "",
         lote_numero: "",
         produto_nome: "",
         problema_descrito: "",
         instrucoes_retrabalho: "",
         responsavel_nome: "",
         data_limite: "",
+        custo_estimado: "",
+        devolucao_id: "",
         observacoes: "",
     };
 }
@@ -58,9 +82,20 @@ function formatDate(iso) {
     try { return new Date(iso).toLocaleDateString("pt-BR"); } catch { return iso; }
 }
 
+function formatBRL(val) {
+    if (!val && val !== 0) return "—";
+    return Number(val).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
 function StatusBadge({ status }) {
     const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.pendente;
     return <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${cfg.cls}`}>{cfg.label}</span>;
+}
+
+function CategoriaBadge({ categoria }) {
+    const cfg = CATEGORIA_CONFIG[categoria];
+    if (!cfg) return null;
+    return <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold ${cfg.cls}`}>{cfg.short}</span>;
 }
 
 export default function CQRetrabalho() {
@@ -69,6 +104,7 @@ export default function CQRetrabalho() {
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
     const [statusFilter, setStatusFilter] = useState("all");
+    const [categoriaFilter, setCategoriaFilter] = useState("all");
     const [showForm, setShowForm] = useState(false);
     const [form, setForm] = useState(emptyForm());
     const [saving, setSaving] = useState(false);
@@ -77,13 +113,13 @@ export default function CQRetrabalho() {
     const [showConcluir, setShowConcluir] = useState(false);
     const [obsConc, setObsConc] = useState("");
     const [rncs, setRncs] = useState([]);
-    const [ras, setRas] = useState([]);
 
     const loadOrdens = useCallback(async () => {
         setLoading(true);
         try {
             const params = {};
             if (statusFilter !== "all") params.status = statusFilter;
+            if (categoriaFilter !== "all") params.categoria = categoriaFilter;
             if (search.trim()) params.q = search.trim();
             const { data } = await api.get("/retrabalho/ordens", { params });
             setOrdens(data || []);
@@ -92,59 +128,52 @@ export default function CQRetrabalho() {
         } finally {
             setLoading(false);
         }
-    }, [search, statusFilter]);
+    }, [search, statusFilter, categoriaFilter]);
 
-    const loadRefs = useCallback(async () => {
+    const loadRNCs = useCallback(async () => {
         try {
-            const [rncRes, raRes] = await Promise.all([
-                api.get("/cq/rncs", { params: { status: "aberta" } }),
-                api.get("/cq/registros-analise", { params: { status: "reprovado" } }),
-            ]);
-            setRncs(Array.isArray(rncRes.data) ? rncRes.data : []);
-            setRas(Array.isArray(raRes.data) ? raRes.data : []);
+            const { data } = await api.get("/cq/rncs", { params: { limit: 200 } });
+            setRncs(Array.isArray(data) ? data : []);
         } catch { /* optional */ }
     }, []);
 
     useEffect(() => { loadOrdens(); }, [loadOrdens]);
-    useEffect(() => { loadRefs(); }, [loadRefs]);
+    useEffect(() => { loadRNCs(); }, [loadRNCs]);
 
     const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-    const onOrigemChange = (tipo) => {
-        setForm(f => ({ ...f, origem_tipo: tipo, origem_id: "" }));
-    };
-
-    const onOrigemIdChange = (id) => {
-        setField("origem_id", id);
-        if (form.origem_tipo === "rnc") {
-            const rnc = rncs.find(r => r.id === id);
-            if (rnc && !form.produto_nome) {
-                setField("produto_nome", rnc.produto_nome || rnc.lote_numero || "");
-                if (!form.problema_descrito) setField("problema_descrito", rnc.descricao || "");
-            }
-        } else {
-            const ra = ras.find(r => r.id === id);
-            if (ra && !form.produto_nome) {
-                setField("produto_nome", ra.item_nome || ra.produto_nome || "");
-                setField("lote_numero", ra.lote_numero || "");
-            }
+    const onRNCChange = (id) => {
+        setField("rnc_id", id);
+        const rnc = rncs.find(r => r.id === id);
+        if (rnc) {
+            if (!form.produto_nome) setField("produto_nome", rnc.produto_nome || rnc.lote_numero || "");
+            if (!form.problema_descrito) setField("problema_descrito", rnc.descricao || "");
+            if (!form.lote_numero) setField("lote_numero", rnc.lote_numero || "");
         }
     };
 
     const handleCreate = async () => {
+        if (!form.rnc_id) { toast.error("Selecione a RNC vinculada (obrigatório — RN-RT-01)"); return; }
         if (!form.produto_nome.trim()) { toast.error("Informe o nome do produto"); return; }
         if (!form.problema_descrito.trim()) { toast.error("Descreva o problema identificado"); return; }
+        if (form.categoria === "RT-3" && !form.devolucao_id.trim()) {
+            toast.error("RT-3 exige comprovante de devolução física (RN-RT-04)");
+            return;
+        }
         setSaving(true);
         try {
             await api.post("/retrabalho/ordens", {
-                origem_tipo: form.origem_tipo,
-                origem_id: form.origem_id || null,
-                lote_numero: form.lote_numero || null,
+                categoria: form.categoria,
+                rnc_id: form.rnc_id,
+                op_id: form.op_id || undefined,
+                lote_numero: form.lote_numero || undefined,
                 produto_nome: form.produto_nome.trim(),
                 problema_descrito: form.problema_descrito.trim(),
                 instrucoes_retrabalho: form.instrucoes_retrabalho,
-                responsavel_nome: form.responsavel_nome || null,
-                data_limite: form.data_limite || null,
+                responsavel_nome: form.responsavel_nome || undefined,
+                data_limite: form.data_limite || undefined,
+                custo_estimado: form.custo_estimado ? Number(form.custo_estimado) : 0,
+                devolucao_id: form.devolucao_id || undefined,
                 observacoes: form.observacoes,
             });
             toast.success("Ordem de Retrabalho criada");
@@ -170,7 +199,7 @@ export default function CQRetrabalho() {
         setActionLoading(true);
         try {
             await api.put(`/retrabalho/ordens/${rt.id}`, { status: next });
-            toast.success(`Status atualizado: ${STATUS_CONFIG[next]?.label}`);
+            toast.success(`Status: ${STATUS_CONFIG[next]?.label}`);
             loadOrdens();
             if (selectedRT?.id === rt.id) {
                 const { data } = await api.get(`/retrabalho/ordens/${rt.id}`);
@@ -217,23 +246,14 @@ export default function CQRetrabalho() {
         }
     };
 
-    const openDetail = async (rt) => {
-        setSelectedRT(rt);
-    };
-
-    const reloadDetail = async (id) => {
-        try {
-            const { data } = await api.get(`/retrabalho/ordens/${id}`);
-            setSelectedRT(data);
-        } catch { /* ignore */ }
-    };
-
     const counts = {
         total: ordens.length,
         pendente: ordens.filter(o => o.status === "pendente").length,
         em_retrabalho: ordens.filter(o => o.status === "em_retrabalho").length,
         concluido: ordens.filter(o => o.status === "concluido").length,
     };
+
+    const categoriaCfg = form.categoria ? CATEGORIA_CONFIG[form.categoria] : null;
 
     return (
         <div className="h-full overflow-auto">
@@ -273,23 +293,34 @@ export default function CQRetrabalho() {
 
                 {/* Filters */}
                 <div className="flex gap-2 items-center flex-wrap">
-                    <div className="relative flex-1 min-w-[240px]">
+                    <div className="relative flex-1 min-w-[200px]">
                         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                         <Input
-                            placeholder="Buscar RT, produto, lote…"
+                            placeholder="Buscar RT, produto, lote, RNC…"
                             value={search}
                             onChange={e => setSearch(e.target.value)}
                             className="pl-9"
                         />
                     </div>
                     <Select value={statusFilter} onValueChange={setStatusFilter}>
-                        <SelectTrigger className="w-48">
+                        <SelectTrigger className="w-44">
                             <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
                             <SelectItem value="all">Todos os Status</SelectItem>
                             {Object.entries(STATUS_CONFIG).map(([k, v]) => (
                                 <SelectItem key={k} value={k}>{v.label}</SelectItem>
+                            ))}
+                        </SelectContent>
+                    </Select>
+                    <Select value={categoriaFilter} onValueChange={setCategoriaFilter}>
+                        <SelectTrigger className="w-36">
+                            <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem value="all">Todas Categorias</SelectItem>
+                            {Object.entries(CATEGORIA_CONFIG).map(([k, v]) => (
+                                <SelectItem key={k} value={k}>{v.short}</SelectItem>
                             ))}
                         </SelectContent>
                     </Select>
@@ -316,7 +347,7 @@ export default function CQRetrabalho() {
                             <Card
                                 key={rt.id}
                                 className="hover:border-primary/40 hover:shadow-sm transition-all cursor-pointer group"
-                                onClick={() => openDetail(rt)}
+                                onClick={() => setSelectedRT(rt)}
                                 data-testid={`rt-card-${rt.id}`}
                             >
                                 <CardContent className="p-4">
@@ -325,17 +356,25 @@ export default function CQRetrabalho() {
                                             <div className="flex items-center gap-2 flex-wrap">
                                                 <span className="font-mono text-sm font-bold text-primary">{rt.numero_rt}</span>
                                                 <StatusBadge status={rt.status} />
-                                                {rt.origem_tipo === "rnc" && rt.rnc_numero && (
+                                                {rt.categoria && <CategoriaBadge categoria={rt.categoria} />}
+                                                {rt.rnc_numero && (
                                                     <Badge variant="outline" className="text-[10px]">RNC {rt.rnc_numero}</Badge>
                                                 )}
-                                                {rt.origem_tipo === "ra" && rt.ra_numero && (
-                                                    <Badge variant="outline" className="text-[10px]">RA {rt.ra_numero}</Badge>
+                                                {rt.categoria === "RT-3" && (
+                                                    <Badge variant="outline" className="text-[10px] border-red-300 text-red-600">
+                                                        <Truck className="h-2.5 w-2.5 mr-1" />Devolução
+                                                    </Badge>
                                                 )}
                                             </div>
                                             <h3 className="font-semibold text-sm">{rt.produto_nome}</h3>
                                             <p className="text-xs text-muted-foreground line-clamp-1">{rt.problema_descrito}</p>
                                             <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
                                                 {rt.lote_numero && <span>Lote: {rt.lote_numero}</span>}
+                                                {rt.custo_estimado > 0 && (
+                                                    <span className="flex items-center gap-1 text-orange-600">
+                                                        <DollarSign className="h-3 w-3" />{formatBRL(rt.custo_estimado)}
+                                                    </span>
+                                                )}
                                                 <span className="flex items-center gap-1">
                                                     <User className="h-3 w-3" />{rt.responsavel_nome}
                                                 </span>
@@ -381,6 +420,7 @@ export default function CQRetrabalho() {
                         <div className="space-y-4 text-sm">
                             <div className="flex items-center gap-3 flex-wrap">
                                 <StatusBadge status={selectedRT.status} />
+                                {selectedRT.categoria && <CategoriaBadge categoria={selectedRT.categoria} />}
                                 {selectedRT.data_limite && (
                                     <span className="text-xs text-muted-foreground flex items-center gap-1">
                                         <Calendar className="h-3.5 w-3.5" />Prazo: {formatDate(selectedRT.data_limite)}
@@ -391,8 +431,20 @@ export default function CQRetrabalho() {
                             <div className="grid grid-cols-2 gap-3 text-sm">
                                 <div><span className="text-muted-foreground">Responsável:</span> {selectedRT.responsavel_nome || "—"}</div>
                                 <div><span className="text-muted-foreground">Lote:</span> {selectedRT.lote_numero || "—"}</div>
-                                {selectedRT.rnc_numero && <div><span className="text-muted-foreground">RNC:</span> {selectedRT.rnc_numero}</div>}
-                                {selectedRT.ra_numero && <div><span className="text-muted-foreground">RA:</span> {selectedRT.ra_numero}</div>}
+                                {selectedRT.rnc_numero && (
+                                    <div><span className="text-muted-foreground">RNC vinculada:</span> {selectedRT.rnc_numero}</div>
+                                )}
+                                {selectedRT.op_numero && (
+                                    <div><span className="text-muted-foreground">OP:</span> {selectedRT.op_numero}</div>
+                                )}
+                                {(selectedRT.custo_estimado ?? 0) > 0 && (
+                                    <div className="text-orange-600">
+                                        <span className="text-muted-foreground">Custo estimado:</span> {formatBRL(selectedRT.custo_estimado)}
+                                    </div>
+                                )}
+                                {selectedRT.categoria === "RT-3" && selectedRT.devolucao_id && (
+                                    <div><span className="text-muted-foreground">Comprovante devolução:</span> {selectedRT.devolucao_id}</div>
+                                )}
                             </div>
 
                             <div>
@@ -429,7 +481,7 @@ export default function CQRetrabalho() {
                                         <div className="space-y-1.5">
                                             {selectedRT.historico.map((h, i) => (
                                                 <div key={i} className="text-xs flex items-center gap-2 text-muted-foreground">
-                                                    <span className="mono-num">{new Date(h.em).toLocaleString("pt-BR")}</span>
+                                                    <span>{new Date(h.em).toLocaleString("pt-BR")}</span>
                                                     <span>·</span>
                                                     <span>{h.para === "pendente" ? "Criada" : `${STATUS_CONFIG[h.de]?.label || h.de} → ${STATUS_CONFIG[h.para]?.label || h.para}`}</span>
                                                     <span>· por {h.por}</span>
@@ -443,19 +495,14 @@ export default function CQRetrabalho() {
                         <DialogFooter className="flex flex-wrap gap-2 justify-between">
                             <div className="flex gap-2 flex-wrap">
                                 {NEXT_STATUS[selectedRT.status] && (
-                                    <Button
-                                        size="sm"
-                                        disabled={actionLoading}
-                                        onClick={() => handleAdvanceStatus(selectedRT)}
-                                    >
+                                    <Button size="sm" disabled={actionLoading} onClick={() => handleAdvanceStatus(selectedRT)}>
                                         {actionLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                                         {NEXT_STATUS_LABEL[selectedRT.status]}
                                     </Button>
                                 )}
                                 {["pendente", "em_retrabalho"].includes(selectedRT.status) && (
                                     <Button
-                                        size="sm"
-                                        variant="outline"
+                                        size="sm" variant="outline"
                                         className="text-destructive border-destructive/30 hover:text-destructive"
                                         disabled={actionLoading}
                                         onClick={() => handleCancel(selectedRT)}
@@ -511,56 +558,88 @@ export default function CQRetrabalho() {
                         <DialogTitle>Nova Ordem de Retrabalho</DialogTitle>
                     </DialogHeader>
                     <div className="space-y-4">
-                        {/* Source */}
-                        <div className="grid grid-cols-2 gap-3">
-                            <div>
-                                <Label>Origem</Label>
-                                <Select value={form.origem_tipo} onValueChange={onOrigemChange}>
-                                    <SelectTrigger className="mt-1">
-                                        <SelectValue />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                        <SelectItem value="rnc">RNC (Não-Conformidade)</SelectItem>
-                                        <SelectItem value="ra">RA (Registro de Análise)</SelectItem>
-                                        <SelectItem value="manual">Manual (sem origem)</SelectItem>
-                                    </SelectContent>
-                                </Select>
+
+                        {/* Categoria selector */}
+                        <div>
+                            <Label>Categoria *</Label>
+                            <div className="grid grid-cols-3 gap-2 mt-1">
+                                {Object.entries(CATEGORIA_CONFIG).map(([key, cfg]) => (
+                                    <button
+                                        key={key}
+                                        type="button"
+                                        onClick={() => setField("categoria", key)}
+                                        className={`rounded-lg border p-3 text-left transition-all text-xs ${
+                                            form.categoria === key
+                                                ? "border-primary bg-primary/5 ring-1 ring-primary"
+                                                : "border-border hover:border-muted-foreground/40"
+                                        }`}
+                                    >
+                                        <div className="font-bold mb-0.5">{key}</div>
+                                        <div className="text-muted-foreground leading-tight">{cfg.description}</div>
+                                    </button>
+                                ))}
                             </div>
-                            {form.origem_tipo === "rnc" && rncs.length > 0 && (
-                                <div>
-                                    <Label>RNC</Label>
-                                    <Select value={form.origem_id} onValueChange={onOrigemIdChange}>
-                                        <SelectTrigger className="mt-1">
-                                            <SelectValue placeholder="Selecionar RNC…" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            {rncs.map(r => (
-                                                <SelectItem key={r.id} value={r.id}>
-                                                    {r.numero_rnc || r.id.slice(-6)} — {(r.descricao || "").slice(0, 40)}
-                                                </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                    </Select>
-                                </div>
-                            )}
-                            {form.origem_tipo === "ra" && ras.length > 0 && (
-                                <div>
-                                    <Label>RA Reprovada</Label>
-                                    <Select value={form.origem_id} onValueChange={onOrigemIdChange}>
-                                        <SelectTrigger className="mt-1">
-                                            <SelectValue placeholder="Selecionar RA…" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                            {ras.map(r => (
-                                                <SelectItem key={r.id} value={r.id}>
-                                                    {r.numero_ra || r.id.slice(-6)} — {r.item_nome || r.produto_nome || ""}
-                                                </SelectItem>
-                                            ))}
-                                        </SelectContent>
-                                    </Select>
-                                </div>
+                            {categoriaCfg && (
+                                <p className="text-xs text-muted-foreground mt-1.5 flex items-center gap-1.5">
+                                    <span className={`px-1.5 py-0.5 rounded text-[11px] font-medium ${categoriaCfg.cls}`}>{form.categoria}</span>
+                                    {categoriaCfg.description}
+                                </p>
                             )}
                         </div>
+
+                        {/* RNC obrigatória — RN-RT-01 */}
+                        <div>
+                            <Label className="flex items-center gap-1">
+                                RNC Vinculada *
+                                <span className="text-[10px] text-muted-foreground font-normal">(obrigatório — RN-RT-01)</span>
+                            </Label>
+                            {rncs.length > 0 ? (
+                                <Select value={form.rnc_id} onValueChange={onRNCChange}>
+                                    <SelectTrigger className={`mt-1 ${!form.rnc_id ? "border-destructive/50" : ""}`}>
+                                        <SelectValue placeholder="Selecionar RNC obrigatoriamente…" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {rncs.map(r => (
+                                            <SelectItem key={r.id} value={r.id}>
+                                                {r.numero_rnc || r.id.slice(-6)} — {(r.descricao || r.produto_nome || "").slice(0, 50)}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            ) : (
+                                <Input
+                                    value={form.rnc_id}
+                                    onChange={e => setField("rnc_id", e.target.value)}
+                                    placeholder="ID da RNC"
+                                    className={`mt-1 ${!form.rnc_id ? "border-destructive/50" : ""}`}
+                                />
+                            )}
+                            {!form.rnc_id && (
+                                <p className="text-xs text-destructive mt-1 flex items-center gap-1">
+                                    <AlertTriangle className="h-3 w-3" />
+                                    Toda Ordem de Retrabalho exige uma RNC vinculada
+                                </p>
+                            )}
+                        </div>
+
+                        {/* RT-3: comprovante de devolução física — RN-RT-04 */}
+                        {form.categoria === "RT-3" && (
+                            <div className="rounded-lg border border-red-200 bg-red-50/50 dark:bg-red-950/20 dark:border-red-900 p-3 space-y-3">
+                                <div className="flex items-center gap-2 text-xs text-red-700 dark:text-red-300 font-medium">
+                                    <Truck className="h-4 w-4" />
+                                    RT-3: Devolução ao Fornecedor — exige comprovante de devolução física (RN-RT-04)
+                                </div>
+                                <div>
+                                    <Label className="text-xs">Nº do Comprovante / Protocolo de Devolução *</Label>
+                                    <Input
+                                        value={form.devolucao_id}
+                                        onChange={e => setField("devolucao_id", e.target.value)}
+                                        placeholder="Ex: DEV-2024-001 ou nº do romaneio"
+                                        className={`mt-1 h-8 text-sm ${!form.devolucao_id ? "border-destructive/50" : ""}`}
+                                    />
+                                </div>
+                            </div>
+                        )}
 
                         <div className="grid grid-cols-2 gap-3">
                             <div>
@@ -568,16 +647,16 @@ export default function CQRetrabalho() {
                                 <Input
                                     value={form.produto_nome}
                                     onChange={e => setField("produto_nome", e.target.value)}
-                                    placeholder="Nome do produto ou matéria-prima"
+                                    placeholder="Nome do produto"
                                     className="mt-1"
                                 />
                             </div>
                             <div>
-                                <Label>Nº do Lote</Label>
+                                <Label>Nº do Lote {form.categoria === "RT-1" ? "(receberá sufixo R)" : ""}</Label>
                                 <Input
                                     value={form.lote_numero}
                                     onChange={e => setField("lote_numero", e.target.value)}
-                                    placeholder="Opcional"
+                                    placeholder={form.categoria === "RT-1" ? "Ex: 25/042 → 25/042R" : "Opcional"}
                                     className="mt-1"
                                 />
                             </div>
@@ -626,19 +705,41 @@ export default function CQRetrabalho() {
                             </div>
                         </div>
 
-                        <div>
-                            <Label>Observações</Label>
-                            <Input
-                                value={form.observacoes}
-                                onChange={e => setField("observacoes", e.target.value)}
-                                placeholder="Opcional"
-                                className="mt-1"
-                            />
+                        <div className="grid grid-cols-2 gap-3">
+                            <div>
+                                <Label className="flex items-center gap-1">
+                                    <DollarSign className="h-3.5 w-3.5" />
+                                    Custo Estimado (R$)
+                                </Label>
+                                <Input
+                                    type="number"
+                                    min="0"
+                                    step="0.01"
+                                    value={form.custo_estimado}
+                                    onChange={e => setField("custo_estimado", e.target.value)}
+                                    placeholder="0,00"
+                                    className="mt-1"
+                                />
+                            </div>
+                            <div>
+                                <Label>Observações</Label>
+                                <Input
+                                    value={form.observacoes}
+                                    onChange={e => setField("observacoes", e.target.value)}
+                                    placeholder="Opcional"
+                                    className="mt-1"
+                                />
+                            </div>
                         </div>
                     </div>
+
                     <DialogFooter className="mt-4">
                         <Button variant="outline" onClick={() => setShowForm(false)} disabled={saving}>Cancelar</Button>
-                        <Button onClick={handleCreate} disabled={saving} data-testid="btn-salvar-rt">
+                        <Button
+                            onClick={handleCreate}
+                            disabled={saving || !form.rnc_id}
+                            data-testid="btn-salvar-rt"
+                        >
                             {saving ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <RotateCcw className="h-4 w-4 mr-1" />}
                             Criar Ordem de Retrabalho
                         </Button>

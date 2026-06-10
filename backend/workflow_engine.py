@@ -206,6 +206,20 @@ async def next_sku_per_pair(tenant_id: str, cat2: str, cli3: str) -> int:
     return await next_sequence(tenant_id, key, start=0)
 
 
+async def next_lote_per_day(tenant_id: str, data_iso: str) -> int:
+    """Returns sequential lote number for a given calendar day (global across all OPs for that day)."""
+    day_key = data_iso[:10].replace("-", "")  # YYYYMMDD
+    return await next_sequence(tenant_id, f"lote_{day_key}", start=0)
+
+
+def format_lote_numero(data_iso: str, seq: int) -> str:
+    """Format lote number as YYYYY/NN per spec 3.2 — e.g. 26014/03 for 14-Jan-2026 lote #3."""
+    d = datetime.fromisoformat(data_iso[:10])
+    year2 = str(d.year)[-2:]
+    doy = d.timetuple().tm_yday
+    return f"{year2}{str(doy).zfill(3)}/{str(seq).zfill(2)}"
+
+
 async def recalc_sku_averages(tenant_id: str, sku_id: str) -> None:
     """Recalculate all automatic production averages for a SKU from its historico_producao."""
     sku = await db.skus.find_one({"id": sku_id, "tenant_id": tenant_id})

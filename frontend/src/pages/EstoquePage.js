@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/select";
 import {
     Warehouse, Plus, Search, ArrowDown, ArrowUp, ArrowLeftRight,
-    AlertTriangle, Trash2, History, Package, FlaskConical, Tag, Box, ShieldCheck,
+    AlertTriangle, Trash2, History, Package, FlaskConical, Tag, Box, ShieldCheck, RotateCcw,
 } from "lucide-react";
 
 const POSICAO_CQ_CONFIG = {
@@ -44,6 +44,7 @@ const SETORES = [
     { key: "ROTULAGEM",   label: "Rótulos",         sublabel: "Rotulagem",   icon: Tag,          tipo: "mp", tipoMP: "ROTULO",     color: "bg-amber-500" },
     { key: "LOGISTICA",   label: "Insumos / Embalagens", sublabel: "Logística", icon: Box,      tipo: "mp", tipoMP: "EMBALAGEM",  color: "bg-emerald-500" },
     { key: "FABRICA",     label: "Produto Acabado", sublabel: "Fábrica",     icon: Package,      tipo: "produto_acabado", color: "bg-violet-500" },
+    { key: "DEVOLUCAO",   label: "Devoluções",      sublabel: "Quarentena Especial", icon: RotateCcw, tipo: "mp", tipoMP: null, color: "bg-rose-500" },
 ];
 
 const TIPO_MOV_LABELS = {
@@ -163,14 +164,14 @@ export default function EstoquePage() {
                         Controle de Estoque
                     </h1>
                     <p className="text-sm text-muted-foreground">
-                        4 setores · Kardex imutável · Alertas em tempo real
+                        5 setores · Kardex imutável · FIFO · Alertas em tempo real
                     </p>
                 </div>
             </div>
 
             {/* Dashboard cards */}
             {dashboard && (
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                     {dashboard.setores.map((s) => {
                         const cfg = SETORES.find(x => x.key === s.setor);
                         const Icon = cfg?.icon || Package;
@@ -215,6 +216,30 @@ export default function EstoquePage() {
                                     onClick={() => { setSetorAtivo(it.setor); openItemDetail(it); }}
                                 >
                                     {it.nome} · {it.quantidade_atual}/{it.estoque_minimo}{it.unidade}
+                                </Badge>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Obsolescence alert */}
+            {dashboard?.alertas?.obsoletos?.length > 0 && (
+                <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 flex items-start gap-3">
+                    <RotateCcw className="h-5 w-5 text-rose-500 shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                        <p className="text-sm font-medium">
+                            {dashboard.alertas.obsoletos.length} item(s) sem movimentação há 90+ dias
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                            {dashboard.alertas.obsoletos.slice(0, 8).map((it) => (
+                                <Badge
+                                    key={it.id}
+                                    variant="outline"
+                                    className="cursor-pointer bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-500/30"
+                                    onClick={() => { setSetorAtivo(it.setor); openItemDetail(it); }}
+                                >
+                                    {it.nome} · {it.quantidade_atual} {it.unidade}
                                 </Badge>
                             ))}
                         </div>
@@ -293,7 +318,9 @@ export default function EstoquePage() {
                                     <td className="px-4 py-2.5 text-right text-muted-foreground mono-num">
                                         {it.estoque_minimo || "—"}
                                     </td>
-                                    <td className="px-4 py-2.5 text-muted-foreground">{it.localizacao || "—"}</td>
+                                    <td className="px-4 py-2.5 text-muted-foreground font-mono text-xs">
+                                        {it.localizacao_estruturada || it.localizacao || "—"}
+                                    </td>
                                     <td className="px-4 py-2.5 text-center">
                                         <PosicaoBadge posicao={it.posicao_cq || "livre"} />
                                     </td>
@@ -353,7 +380,7 @@ export default function EstoquePage() {
                                     <Stat label="Estoque mínimo" value={`${selectedItem.estoque_minimo || 0} ${selectedItem.unidade}`} />
                                     <Stat label="Código" value={selectedItem.codigo || "—"} />
                                     <Stat label="Lote" value={selectedItem.lote || "—"} />
-                                    <Stat label="Localização" value={selectedItem.localizacao || "—"} />
+                                    <Stat label="Localização" value={selectedItem.localizacao_estruturada || selectedItem.localizacao || "—"} />
                                     <Stat label="Validade" value={selectedItem.validade ? new Date(selectedItem.validade).toLocaleDateString("pt-BR") : "—"} />
                                 </div>
 
@@ -497,7 +524,7 @@ function Stat({ label, value, highlight }) {
 
 function NewItemDialog({ open, onOpenChange, setor, onCreated }) {
     const [form, setForm] = useState({
-        nome: "", codigo: "", unidade: "kg", estoque_minimo: "", localizacao: "", lote: "", validade: "", observacoes: "",
+        nome: "", codigo: "", unidade: "kg", estoque_minimo: "", localizacao: "", localizacao_estruturada: "", lote: "", validade: "", observacoes: "",
     });
     const [mps, setMps] = useState([]);
     const [mpId, setMpId] = useState("__none__");
@@ -505,10 +532,10 @@ function NewItemDialog({ open, onOpenChange, setor, onCreated }) {
 
     useEffect(() => {
         if (!open) return;
-        setForm({ nome: "", codigo: "", unidade: "kg", estoque_minimo: "", localizacao: "", lote: "", validade: "", observacoes: "" });
+        setForm({ nome: "", codigo: "", unidade: "kg", estoque_minimo: "", localizacao: "", localizacao_estruturada: "", lote: "", validade: "", observacoes: "" });
         setMpId("__none__");
         // Pre-carrega MPs homologadas do tipo correspondente
-        if (setor !== "FABRICA" && setorCfg?.tipoMP) {
+        if (setor !== "FABRICA" && setor !== "DEVOLUCAO" && setorCfg?.tipoMP) {
             api.get("/pd/homologacao/mps", { params: { tipo_mp: setorCfg.tipoMP, status: "homologada" } })
                 .then(({ data }) => setMps(data))
                 .catch(() => {});
@@ -538,6 +565,7 @@ function NewItemDialog({ open, onOpenChange, setor, onCreated }) {
                 unidade: form.unidade || "un",
                 estoque_minimo: parseFloat(form.estoque_minimo) || 0,
                 localizacao: form.localizacao,
+                localizacao_estruturada: form.localizacao_estruturada,
                 lote: form.lote,
                 validade: form.validade || null,
                 observacoes: form.observacoes,
@@ -598,8 +626,18 @@ function NewItemDialog({ open, onOpenChange, setor, onCreated }) {
                             <Input type="number" step="0.01" value={form.estoque_minimo} onChange={(e) => setForm({ ...form, estoque_minimo: e.target.value })} />
                         </div>
                         <div className="space-y-1">
-                            <Label className="text-xs">Localização</Label>
+                            <Label className="text-xs">Localização (livre)</Label>
                             <Input value={form.localizacao} onChange={(e) => setForm({ ...form, localizacao: e.target.value })} placeholder="Prateleira A-03" />
+                        </div>
+                        <div className="space-y-1 col-span-2">
+                            <Label className="text-xs">Endereço Estruturado <span className="text-muted-foreground">(GAL-B-04-1)</span></Label>
+                            <Input
+                                value={form.localizacao_estruturada}
+                                onChange={(e) => setForm({ ...form, localizacao_estruturada: e.target.value.toUpperCase() })}
+                                placeholder="ex: GAL-B-04-1"
+                                className="font-mono"
+                            />
+                            <p className="text-[10px] text-muted-foreground">Formato: GALERIA-CORREDOR-PRATELEIRA-POSIÇÃO</p>
                         </div>
                         <div className="space-y-1">
                             <Label className="text-xs">Lote</Label>
@@ -639,8 +677,7 @@ function MovDialog({ open, onOpenChange, item, direction, onSuccess }) {
             setMotivo("");
             setReferencia("");
             setDocumento("");
-            // Default setor destino diferente do atual
-            const outros = SETORES.filter(s => s.key !== item.setor && (item.tipo_item === "produto_acabado" ? s.key === "FABRICA" : s.key !== "FABRICA"));
+            const outros = SETORES.filter(s => s.key !== item.setor);
             setSetorDestino(outros[0]?.key || "");
         }
     }, [open, direction, item.setor, item.tipo_item]);
@@ -720,7 +757,7 @@ function MovDialog({ open, onOpenChange, item, direction, onSuccess }) {
                             <Select value={setorDestino} onValueChange={setSetorDestino}>
                                 <SelectTrigger><SelectValue /></SelectTrigger>
                                 <SelectContent>
-                                    {SETORES.filter(s => s.key !== item.setor && (item.tipo_item === "produto_acabado" ? s.key === "FABRICA" : s.key !== "FABRICA"))
+                                    {SETORES.filter(s => s.key !== item.setor)
                                         .map(s => <SelectItem key={s.key} value={s.key}>{s.label} ({s.sublabel})</SelectItem>)}
                                 </SelectContent>
                             </Select>

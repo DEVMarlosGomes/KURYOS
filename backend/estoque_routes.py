@@ -33,13 +33,14 @@ def init_estoque(database, get_user_fn, new_id_fn, now_iso_fn):
 
 # ============ CONSTANTS ============
 
-SETORES = ["MANIPULACAO", "ROTULAGEM", "LOGISTICA", "FABRICA"]
+SETORES = ["MANIPULACAO", "ROTULAGEM", "LOGISTICA", "FABRICA", "DEVOLUCAO"]
 
 SETOR_LABELS = {
     "MANIPULACAO": "Matérias-Primas (Manipulação)",
     "ROTULAGEM": "Rótulos (Rotulagem)",
     "LOGISTICA": "Insumos / Embalagens (Logística)",
     "FABRICA": "Produto Acabado (Fábrica)",
+    "DEVOLUCAO": "Devoluções / Quarentena Especial",
 }
 
 # Tipos de MP vinculados a cada setor (para validação semântica)
@@ -47,8 +48,12 @@ SETOR_TIPO_MP = {
     "MANIPULACAO": "FORMULACAO",
     "ROTULAGEM": "ROTULO",
     "LOGISTICA": "EMBALAGEM",
-    # FABRICA não tem MP, recebe produto acabado
+    # FABRICA e DEVOLUCAO aceitam ambos os tipos
 }
+
+# Regex pattern for structured address GAL-B-04-1
+import re
+_LOC_PATTERN = re.compile(r"^[A-Z]{2,5}-[A-Z]-\d{2}-\d+$", re.IGNORECASE)
 
 TIPOS_MOVIMENTO = [
     "ENTRADA_RECEBIMENTO",    # ↑  Entrada por aprovação de lote (CQ)
@@ -74,18 +79,19 @@ POSICOES_CQ = ["livre", "quarentena", "aprovado", "reprovado"]
 
 class EstoqueItemCreate(BaseModel):
     tipo_item: str  # "mp" | "produto_acabado"
-    setor: str      # MANIPULACAO | ROTULAGEM | LOGISTICA | FABRICA
+    setor: str      # MANIPULACAO | ROTULAGEM | LOGISTICA | FABRICA | DEVOLUCAO
     nome: str
     codigo: str = ""
-    mp_id: Optional[str] = None        # Ref. para homologação_mp se tipo_item=mp
-    produto_id: Optional[str] = None   # Ref. para SKU se tipo_item=produto_acabado
-    unidade: str = "un"                # kg, L, un, cx, etc
+    mp_id: Optional[str] = None
+    produto_id: Optional[str] = None
+    unidade: str = "un"
     estoque_minimo: float = 0
-    localizacao: str = ""              # Prateleira/Posição física
+    localizacao: str = ""              # Free text fallback
+    localizacao_estruturada: str = ""  # Format: GAL-B-04-1 (galeria-corredor-prateleira-posição)
     lote: str = ""
-    validade: Optional[str] = None     # ISO date
+    validade: Optional[str] = None
     observacoes: str = ""
-    posicao_cq: str = "livre"          # livre | quarentena | aprovado | reprovado
+    posicao_cq: str = "livre"
 
 
 class EstoqueItemUpdate(BaseModel):
@@ -94,6 +100,7 @@ class EstoqueItemUpdate(BaseModel):
     unidade: Optional[str] = None
     estoque_minimo: Optional[float] = None
     localizacao: Optional[str] = None
+    localizacao_estruturada: Optional[str] = None
     lote: Optional[str] = None
     validade: Optional[str] = None
     observacoes: Optional[str] = None
@@ -181,8 +188,15 @@ async def create_item(data: EstoqueItemCreate, request: Request):
     # Validação semântica: tipo_item por setor
     if data.setor == "FABRICA" and data.tipo_item != "produto_acabado":
         raise HTTPException(status_code=400, detail="Setor FABRICA só aceita produto_acabado")
-    if data.setor != "FABRICA" and data.tipo_item != "mp":
+    if data.setor not in ("FABRICA", "DEVOLUCAO") and data.tipo_item != "mp":
         raise HTTPException(status_code=400, detail=f"Setor {data.setor} só aceita MPs (tipo_item=mp)")
+
+    # Validate structured location format if provided
+    if data.localizacao_estruturada and not _LOC_PATTERN.match(data.localizacao_estruturada):
+        raise HTTPException(
+            status_code=400,
+            detail="Formato de localização inválido. Use: GAL-B-04-1 (sigla-corredor-prateleira-posição)"
+        )
 
     # Unicidade: um item por (mp_id|produto_id) + setor
     dup_query = {"tenant_id": user["tenant_id"], "setor": data.setor}
@@ -222,6 +236,7 @@ async def create_item(data: EstoqueItemCreate, request: Request):
         "validade": data.validade,
         "observacoes": data.observacoes,
         "posicao_cq": data.posicao_cq if data.posicao_cq in POSICOES_CQ else "livre",
+        "localizacao_estruturada": data.localizacao_estruturada,
         "created_by": user["id"],
         "created_by_name": user["name"],
         "created_at": now,
@@ -577,6 +592,18 @@ async def estoque_dashboard(request: Request):
         "created_at": {"$gte": (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)).isoformat()}
     })
 
+    # Obsolescência: itens sem movimento nos últimos 90 dias
+    cutoff_90 = (datetime.now(timezone.utc).replace(tzinfo=None) - __import__("datetime").timedelta(days=90)).isoformat()
+    itens_ids_com_mov = await db.estoque_movimentos.distinct(
+        "item_id",
+        {"tenant_id": t_id, "created_at": {"$gte": cutoff_90}}
+    )
+    obsoletos = [
+        i for i in items_all
+        if i.get("quantidade_atual", 0) > 0
+        and i["id"] not in itens_ids_com_mov
+    ]
+
     return {
         "setores": [
             {
@@ -589,6 +616,7 @@ async def estoque_dashboard(request: Request):
         "alertas": {
             "baixo_estoque": low_stock,
             "validade_proxima": expiring_soon,
+            "obsoletos": obsoletos[:20],
         },
         "movimentos_hoje": last_24h,
         "total_items": len(items_all),
@@ -605,3 +633,43 @@ async def get_options():
         "movimentos_saida": list(MOVIMENTOS_SAIDA),
         "tipos_item": TIPO_ITEM_VALORES,
     }
+
+
+@estoque_router.get("/alertas/obsolescencia")
+async def alertas_obsolescencia(request: Request, dias: int = 90):
+    """Items with saldo > 0 but no movement in the last N days."""
+    user = await _get_current_user(request)
+    t_id = user["tenant_id"]
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    itens_ativos_ids = await db.estoque_movimentos.distinct(
+        "item_id",
+        {"tenant_id": t_id, "created_at": {"$gte": cutoff}}
+    )
+    items = await db.estoque_items.find(
+        {"tenant_id": t_id, "quantidade_atual": {"$gt": 0}},
+        {"_id": 0}
+    ).to_list(10000)
+    obsoletos = [i for i in items if i["id"] not in itens_ativos_ids]
+    return {"dias_sem_movimento": dias, "total": len(obsoletos), "items": obsoletos}
+
+
+@estoque_router.get("/fifo-sugestao")
+async def fifo_sugestao(request: Request, nome: str, setor: Optional[str] = None):
+    """
+    Returns all lots of an item sorted by validade ASC (FIFO).
+    Operator should consume from top of list first.
+    """
+    user = await _get_current_user(request)
+    query: Dict[str, Any] = {
+        "tenant_id": user["tenant_id"],
+        "nome": {"$regex": nome, "$options": "i"},
+        "quantidade_atual": {"$gt": 0},
+        "posicao_cq": "aprovado",
+    }
+    if setor:
+        query["setor"] = setor
+    items = await db.estoque_items.find(query, {"_id": 0}).to_list(100)
+    # Sort by validade (None = infinite = last)
+    items.sort(key=lambda x: x.get("validade") or "9999-99-99")
+    return {"fifo_order": items, "total_lotes": len(items)}
