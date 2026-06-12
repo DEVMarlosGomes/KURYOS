@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 import { getCurrentBackendUrl, toWebSocketUrl } from "@/lib/backend";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
@@ -74,6 +75,11 @@ export default function CRM3Page() {
 
     // Estado para registrar resultado do cliente (somente quando variação está em "enviada")
     const [resultadoForm, setResultadoForm] = useState({});  // variacaoId → { resultado, feedback, loading }
+
+    // Local edit values for custo_fragrancia (controlled CurrencyInput in existing-variation rows)
+    const [custoCurrencyEdits, setCustoCurrencyEdits] = useState({});  // variacaoId → { value, currency }
+    const getCustoEdit = (v) => custoCurrencyEdits[v.id] ?? { value: v.custo_fragrancia ?? "", currency: v.custo_fragrancia_currency || "BRL" };
+    const setCustoEdit = (id, patch) => setCustoCurrencyEdits(prev => ({ ...prev, [id]: { ...(prev[id] ?? {}), ...patch } }));
 
     useEffect(() => {
         localStorage.setItem("crm3:view", view);
@@ -304,6 +310,7 @@ export default function CRM3Page() {
         percentual_fragrancia: "",
         referencia_fragrancia: "",
         custo_fragrancia: "",
+        custo_fragrancia_currency: "BRL",
         observacoes_especificas: ""
     }]);
 
@@ -321,6 +328,7 @@ export default function CRM3Page() {
                     percentual_fragrancia: v.percentual_fragrancia ? parseFloat(v.percentual_fragrancia) : null,
                     referencia_fragrancia: v.referencia_fragrancia,
                     custo_fragrancia: v.custo_fragrancia ? parseFloat(v.custo_fragrancia) : null,
+                    custo_fragrancia_currency: v.custo_fragrancia_currency || "BRL",
                     observacoes_especificas: v.observacoes_especificas,
                 }))
             };
@@ -751,16 +759,23 @@ export default function CRM3Page() {
                                                         />
                                                     </div>
                                                     <div className="space-y-1">
-                                                        <Label className="text-[10px] text-muted-foreground">Custo Frag. (R$/kg)</Label>
-                                                        <Input
-                                                            type="number" step="0.01"
-                                                            defaultValue={v.custo_fragrancia ?? ""}
-                                                            className="h-8 text-xs"
-                                                            onBlur={(e) => {
-                                                                const val = e.target.value === "" ? null : parseFloat(e.target.value);
-                                                                if (val !== v.custo_fragrancia)
-                                                                    handleUpdateVariacao(selectedSample.id, v.id, { custo_fragrancia: val });
+                                                        <Label className="text-[10px] text-muted-foreground">Custo Frag.</Label>
+                                                        <CurrencyInput
+                                                            value={getCustoEdit(v).value}
+                                                            currency={getCustoEdit(v).currency}
+                                                            onValueChange={(val) => setCustoEdit(v.id, { value: val })}
+                                                            onCurrencyChange={(c) => {
+                                                                setCustoEdit(v.id, { currency: c });
+                                                                handleUpdateVariacao(selectedSample.id, v.id, { custo_fragrancia_currency: c });
                                                             }}
+                                                            onBlur={() => {
+                                                                const edit = getCustoEdit(v);
+                                                                const num = edit.value === "" ? null : parseFloat(edit.value);
+                                                                if (num !== v.custo_fragrancia)
+                                                                    handleUpdateVariacao(selectedSample.id, v.id, { custo_fragrancia: num });
+                                                            }}
+                                                            size="sm"
+                                                            showHint={false}
                                                         />
                                                     </div>
                                                     <div className="space-y-1 col-span-2">
@@ -989,15 +1004,21 @@ export default function CRM3Page() {
                                             />
                                         </div>
                                         <div className="space-y-1">
-                                            <Label className="text-xs">Custo Fragrância (R$/kg)</Label>
-                                            <Input
-                                                type="number" step="0.01"
+                                            <Label className="text-xs">Custo Fragrância</Label>
+                                            <CurrencyInput
                                                 value={v.custo_fragrancia}
-                                                onChange={(e) => {
+                                                currency={v.custo_fragrancia_currency || "BRL"}
+                                                onValueChange={(val) => {
                                                     const list = [...newVariacoes];
-                                                    list[idx].custo_fragrancia = e.target.value;
+                                                    list[idx].custo_fragrancia = val;
                                                     setNewVariacoes(list);
                                                 }}
+                                                onCurrencyChange={(c) => {
+                                                    const list = [...newVariacoes];
+                                                    list[idx].custo_fragrancia_currency = c;
+                                                    setNewVariacoes(list);
+                                                }}
+                                                size="sm"
                                             />
                                         </div>
                                         <div className="col-span-2 space-y-1">

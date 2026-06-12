@@ -1068,7 +1068,8 @@ class ItemCompraUpdate(BaseModel):
 
 class CotacaoCreate(BaseModel):
     fornecedor_id: str
-    preco_unitario: float               # BRL
+    preco_unitario: float
+    preco_unitario_currency: str = "BRL"
     prazo_pagamento_texto: str          # "30 DDL"
     prazo_pagamento_dias: int
     prazo_entrega_dias_uteis: int
@@ -1290,6 +1291,7 @@ async def registrar_cotacao(item_id: str, data: CotacaoCreate, request: Request)
         "item_id": item_id,
         "item_descricao": item.get("descricao", ""),
         "preco_unitario": float(data.preco_unitario),
+        "preco_unitario_currency": data.preco_unitario_currency,
         "prazo_pagamento_texto": data.prazo_pagamento_texto,
         "prazo_pagamento_dias": data.prazo_pagamento_dias,
         "prazo_entrega_dias_uteis": data.prazo_entrega_dias_uteis,

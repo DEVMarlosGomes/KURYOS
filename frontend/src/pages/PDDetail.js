@@ -22,10 +22,10 @@ import {
   Loader2, ArrowRight, FileText, DollarSign, Beaker, Package, History,
   Eye, Download, Pencil, Save, X, ShieldCheck, Send, MessageSquare, Settings2,
   Bell, Hourglass, AlertTriangle, Sparkles, ClipboardList, ThumbsUp, ThumbsDown,
-  PrinterIcon, CheckSquare, XSquare, Lock, Unlock, RefreshCw, TestTube, TrendingUp,
+  CheckSquare, XSquare, Lock, Unlock, RefreshCw, TestTube, TrendingUp,
   Thermometer, Wind, Snowflake, Sun, ChevronUp, ChevronDown, Copy,
   Building2, ShoppingCart, Layers, CheckCircle, Clock4, AlertCircle,
-  GitBranch, Combine, ChevronRight, FlaskRound
+  GitBranch, Combine, ChevronRight, FlaskRound, ExternalLink
 } from "lucide-react";
 
 const STATUS_CONFIG = {
@@ -207,7 +207,7 @@ export default function PDDetail() {
   }
 
   const { request: req, development: dev, formulas, tests, samples, approval, costs, documents, history, client_info, formula_cost_data, cost_versions, lab_results, updates, pending } = data;
-  const statusConfig = STATUS_CONFIG[req.status];
+  const statusConfig = STATUS_CONFIG[req.status] || { label: req.status, color: "bg-gray-500/10 text-gray-600 border-gray-200", dotColor: "bg-gray-400" };
   const allowedNext = ALLOWED_TRANSITIONS[req.status] || [];
   const hasDev = !!dev;
   const pendingCount = (pending || []).filter(p => p.status === "pendente").length;

@@ -79,6 +79,13 @@ CATEGORIAS_INSUMO = [
 # Statuses that make the order immutable (RN-PI-05)
 STATUSES_IMUTAVEL = {"confirmado", "em_producao", "concluido"}
 
+# Alçadas de aprovação comercial por desconto total (RN-PI-10)
+# desconto_pct ≤ TIER_AUTO     → aprovacao_comercial = "nao_necessaria"
+# TIER_AUTO < pct ≤ TIER_GERENTE → aprovacao_comercial = "pendente", nivel = "gerente_vendas"  (roles: sales_ops, admin)
+# pct > TIER_GERENTE             → aprovacao_comercial = "pendente", nivel = "diretoria"        (roles: admin only)
+TIER_AUTO = 5.0
+TIER_GERENTE = 25.0
+
 
 # ============ MODELS ============
 class OrderItem(BaseModel):
@@ -87,6 +94,8 @@ class OrderItem(BaseModel):
     item: str
     prazo_entrega: str = ""
     valor_unitario: float = 0.0
+    valor_unitario_currency: str = "BRL"
+    desconto_percentual: float = 0.0      # RN-PI-10: 0–100 %
     qtd: float = 0
     valor_total: float = 0.0
     tipo_servico: str = "producao"   # per-item type: producao | reposicao | retrabalho
@@ -139,6 +148,7 @@ class CondicoesData(BaseModel):
 
 class OrderCreate(BaseModel):
     pd_request_id: Optional[str] = None
+    kickoff_id: Optional[str] = None          # Gap A: optional FK to kickoffs collection
     client_card_id: Optional[str] = None
     numero_pedido: Optional[str] = None
     data_pedido: Optional[str] = None
@@ -154,6 +164,7 @@ class OrderCreate(BaseModel):
 
 
 class OrderUpdate(BaseModel):
+    kickoff_id: Optional[str] = None          # Gap A: allow linking/unlinking kickoff
     numero_pedido: Optional[str] = None
     data_pedido: Optional[str] = None
     status: Optional[str] = None
@@ -213,15 +224,51 @@ async def _generate_order_number(tenant_id: str) -> str:
     return f"{month_str}_{seq:02d}"
 
 
-def _calculate_totals(items: List[Dict[str, Any]]) -> float:
-    total = 0.0
+def _calculate_totals(items: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Recalculate item totals (applying per-item discount) and return order-level aggregates."""
+    total_bruto = 0.0
+    total_desconto = 0.0
     for it in items:
-        valor = (it.get("valor_unitario") or 0) * (it.get("qtd") or 0)
-        # Use computed valor_total if provided and >0, else recompute
-        existing = it.get("valor_total") or 0
-        it["valor_total"] = existing if existing > 0 else round(valor, 2)
-        total += it["valor_total"]
-    return round(total, 2)
+        valor_bruto = round((it.get("valor_unitario") or 0) * (it.get("qtd") or 0), 2)
+        desc_pct = max(0.0, min(100.0, float(it.get("desconto_percentual") or 0)))
+        valor_desc = round(valor_bruto * desc_pct / 100, 2)
+        valor_liq = round(valor_bruto - valor_desc, 2)
+        it["valor_desconto"] = valor_desc
+        it["valor_total"] = valor_liq
+        total_bruto += valor_bruto
+        total_desconto += valor_desc
+    total_liquido = round(total_bruto - total_desconto, 2)
+    desc_pct_medio = round((total_desconto / total_bruto * 100) if total_bruto > 0 else 0.0, 2)
+    return {
+        "total_pedido": total_liquido,
+        "total_bruto": round(total_bruto, 2),
+        "total_desconto": round(total_desconto, 2),
+        "desconto_pct_medio": desc_pct_medio,
+    }
+
+
+def _eval_aprovacao_comercial(totals: Dict[str, float], existing: Optional[Dict] = None) -> Dict[str, Any]:
+    """Determine aprovacao_comercial status based on order discount. (RN-PI-10)"""
+    pct = totals.get("desconto_pct_medio", 0.0)
+    if pct <= TIER_AUTO:
+        return {"aprovacao_comercial": "nao_necessaria", "aprovacao_comercial_nivel": None}
+    # Keep existing approval if already approved at the right level
+    if existing:
+        cur = existing.get("aprovacao_comercial")
+        if cur == "aprovada":
+            return {"aprovacao_comercial": "aprovada",
+                    "aprovacao_comercial_nivel": existing.get("aprovacao_comercial_nivel")}
+    nivel = "gerente_vendas" if pct <= TIER_GERENTE else "diretoria"
+    return {"aprovacao_comercial": "pendente", "aprovacao_comercial_nivel": nivel}
+
+
+async def _validate_kickoff_fk(kickoff_id: Optional[str], tenant_id: str) -> None:
+    """Gap A: validate that kickoff_id references an existing kickoff for this tenant."""
+    if not kickoff_id:
+        return
+    doc = await db.kickoffs.find_one({"id": kickoff_id, "tenant_id": tenant_id}, {"_id": 0, "id": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Kickoff '{kickoff_id}' não encontrado (Gap A).")
 
 
 async def _enrich_from_crm(client_card_id: Optional[str], tenant_id: str) -> Dict[str, Any]:
@@ -307,11 +354,21 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
     items = await _build_items_from_pd(pd_request_id, tenant_id)
     numero = await _generate_order_number(tenant_id)
 
+    # Gap A: auto-link kickoff if the PD request's project has one
+    kickoff_id = None
+    crm_proj_id = pd_req.get("crm_project_id")
+    if crm_proj_id:
+        proj = await db.crm_projects.find_one({"id": crm_proj_id, "tenant_id": tenant_id}, {"_id": 0, "kickoff_id": 1})
+        kickoff_id = proj.get("kickoff_id") if proj else None
+
     checklist_default = [{"categoria": c, "ativo": False, "origem": "kuryos", "status": "pendente", "responsavel": "", "data_prevista": None, "observacoes": ""} for c in CATEGORIAS_INSUMO]
+    totals = _calculate_totals(items)
+    ap_comercial = _eval_aprovacao_comercial(totals)
     order = {
         "id": new_id(),
         "tenant_id": tenant_id,
         "pd_request_id": pd_request_id,
+        "kickoff_id": kickoff_id,
         "client_card_id": pd_req.get("client_card_id"),
         "numero_pedido": numero,
         "data_pedido": now_iso(),
@@ -334,7 +391,10 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
         },
         "insumos": [],
         "checklist_insumos": checklist_default,
-        "total_pedido": _calculate_totals(items),
+        "total_pedido": totals["total_pedido"],
+        "total_bruto": totals["total_bruto"],
+        "total_desconto": totals["total_desconto"],
+        "desconto_pct_medio": totals["desconto_pct_medio"],
         "observacoes": "",
         "cgi_status": "pendente",
         "cgi_assinado_em": None,
@@ -342,6 +402,11 @@ async def auto_create_order_on_pd_approval(pd_request_id: str, user: Dict[str, A
         "aprovacao_cliente": "pendente",
         "aprovacao_cliente_obs": "",
         "aprovacao_cliente_em": None,
+        "aprovacao_comercial": ap_comercial["aprovacao_comercial"],
+        "aprovacao_comercial_nivel": ap_comercial["aprovacao_comercial_nivel"],
+        "aprovacao_comercial_por": None,
+        "aprovacao_comercial_em": None,
+        "aprovacao_comercial_obs": "",
         "op_id": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -426,6 +491,9 @@ async def create_order(data: OrderCreate, request: Request):
     if cpgto and not re.match(CONDICAO_PGTO_RE, cpgto):
         raise HTTPException(status_code=400, detail="condicao_pagamento deve ter formato NNN/NNN/NNN (RN-PI-08)")
 
+    # Gap A: validate kickoff FK if provided
+    await _validate_kickoff_fk(data.kickoff_id, user["tenant_id"])
+
     cliente = data.cliente.model_dump()
     if data.client_card_id and not cliente.get("razao_social"):
         cliente = await _enrich_from_crm(data.client_card_id, user["tenant_id"])
@@ -439,11 +507,14 @@ async def create_order(data: OrderCreate, request: Request):
         [{"categoria": c, "ativo": False, "origem": "kuryos", "status": "pendente", "responsavel": "", "data_prevista": None, "observacoes": ""} for c in CATEGORIAS_INSUMO]
 
     numero = data.numero_pedido or await _generate_order_number(user["tenant_id"])
+    totals = _calculate_totals(items)
+    ap_comercial = _eval_aprovacao_comercial(totals)
 
     order = {
         "id": new_id(),
         "tenant_id": user["tenant_id"],
         "pd_request_id": data.pd_request_id,
+        "kickoff_id": data.kickoff_id,
         "client_card_id": data.client_card_id,
         "numero_pedido": numero,
         "data_pedido": data.data_pedido or now_iso(),
@@ -457,7 +528,10 @@ async def create_order(data: OrderCreate, request: Request):
         "condicoes": condicoes,
         "insumos": [it.model_dump() for it in data.insumos],
         "checklist_insumos": checklist,
-        "total_pedido": _calculate_totals(items),
+        "total_pedido": totals["total_pedido"],
+        "total_bruto": totals["total_bruto"],
+        "total_desconto": totals["total_desconto"],
+        "desconto_pct_medio": totals["desconto_pct_medio"],
         "observacoes": data.observacoes,
         "cgi_status": "pendente",
         "cgi_assinado_em": None,
@@ -465,6 +539,12 @@ async def create_order(data: OrderCreate, request: Request):
         "aprovacao_cliente": "pendente",
         "aprovacao_cliente_obs": "",
         "aprovacao_cliente_em": None,
+        # Gap B: aprovacao_comercial
+        "aprovacao_comercial": ap_comercial["aprovacao_comercial"],
+        "aprovacao_comercial_nivel": ap_comercial["aprovacao_comercial_nivel"],
+        "aprovacao_comercial_por": None,
+        "aprovacao_comercial_em": None,
+        "aprovacao_comercial_obs": "",
         "op_id": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -491,10 +571,18 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
     if "status" in payload and payload["status"] not in ORDER_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido. Permitidos: {ORDER_STATUSES}")
 
+    # Gap A: validate kickoff FK if being set
+    if "kickoff_id" in payload:
+        await _validate_kickoff_fk(payload["kickoff_id"], user["tenant_id"])
+
     # RN-PI-01: CGI must be signed before confirming
     if payload.get("status") == "confirmado":
         if existing.get("cgi_status", "pendente") != "assinado":
             raise HTTPException(status_code=422, detail="CGI não assinado. Assine o Contrato Geral de Industrialização antes de confirmar o pedido. (RN-PI-01)")
+        # RN-PI-10: commercial approval must be resolved before confirming
+        if existing.get("aprovacao_comercial") == "pendente":
+            nivel = existing.get("aprovacao_comercial_nivel", "gerente_vendas")
+            raise HTTPException(status_code=422, detail=f"Aprovação comercial pendente (desconto > {TIER_AUTO}%). Requer aprovação de {nivel.replace('_', ' ')} antes de confirmar. (RN-PI-10)")
 
     # RN-PI-05: confirmed/em_producao/concluido orders are immutable — only allowed fields
     IMMUTABLE_BLOCK = {"items", "cliente", "frete", "condicoes", "insumos", "numero_pedido", "data_pedido", "tipo_servico", "nivel_formalizacao"}
@@ -521,7 +609,7 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
         if cpgto and not re.match(CONDICAO_PGTO_RE, cpgto):
             raise HTTPException(status_code=400, detail="condicao_pagamento deve ter formato NNN/NNN/NNN (RN-PI-08)")
 
-    for key in ("numero_pedido", "data_pedido", "status", "observacoes", "cgi_status",
+    for key in ("kickoff_id", "numero_pedido", "data_pedido", "status", "observacoes", "cgi_status",
                 "tipo_servico", "nivel_formalizacao",
                 "aprovacao_cliente", "aprovacao_cliente_obs", "aprovacao_cliente_em"):
         if key in payload:
@@ -534,7 +622,19 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
     if "items" in payload and payload["items"] is not None:
         items = payload["items"]
         update_fields["items"] = items
-        update_fields["total_pedido"] = _calculate_totals(items)
+        totals = _calculate_totals(items)
+        update_fields["total_pedido"] = totals["total_pedido"]
+        update_fields["total_bruto"] = totals["total_bruto"]
+        update_fields["total_desconto"] = totals["total_desconto"]
+        update_fields["desconto_pct_medio"] = totals["desconto_pct_medio"]
+        # Re-evaluate commercial approval tier (RN-PI-10)
+        ap = _eval_aprovacao_comercial(totals, existing)
+        update_fields["aprovacao_comercial"] = ap["aprovacao_comercial"]
+        update_fields["aprovacao_comercial_nivel"] = ap["aprovacao_comercial_nivel"]
+        # Reset approval if discount increased beyond previous approval
+        if ap["aprovacao_comercial"] == "pendente":
+            update_fields["aprovacao_comercial_por"] = None
+            update_fields["aprovacao_comercial_em"] = None
 
     if "insumos" in payload and payload["insumos"] is not None:
         update_fields["insumos"] = payload["insumos"]
@@ -572,6 +672,64 @@ async def aprovar_cliente(order_id: str, request: Request):
             "aprovacao_cliente_obs": obs,
             "aprovacao_cliente_em": now,
             "aprovacao_cliente_por": user["name"],
+            "updated_at": now,
+        }}
+    )
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
+@orders_router.post("/{order_id}/aprovar-comercial")
+async def aprovar_comercial(order_id: str, request: Request):
+    """Register commercial approval (RN-PI-10) — required when order discount exceeds TIER_AUTO.
+    Requires role: sales_ops (desconto ≤ TIER_GERENTE) or admin (desconto > TIER_GERENTE)."""
+    user = await get_current_user(request)
+    body = await request.json()
+    obs = body.get("observacoes", "")
+    existing = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+    if existing.get("aprovacao_comercial") == "nao_necessaria":
+        raise HTTPException(status_code=400, detail="Este pedido não requer aprovação comercial (desconto dentro do limite automático).")
+    # Role check: diretoria level requires admin; gerente level requires sales_ops or admin
+    nivel = existing.get("aprovacao_comercial_nivel", "gerente_vendas")
+    roles_ok = {"admin"} if nivel == "diretoria" else {"sales_ops", "admin"}
+    if user.get("role") not in roles_ok:
+        raise HTTPException(status_code=403, detail=f"Aprovação de nível '{nivel}' requer role: {sorted(roles_ok)}.")
+    now = now_iso()
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "aprovacao_comercial": "aprovada",
+            "aprovacao_comercial_obs": obs,
+            "aprovacao_comercial_em": now,
+            "aprovacao_comercial_por": user.get("name", ""),
+            "updated_at": now,
+        }}
+    )
+    return await db.orders.find_one({"id": order_id}, {"_id": 0})
+
+
+@orders_router.post("/{order_id}/rejeitar-comercial")
+async def rejeitar_comercial(order_id: str, request: Request):
+    """Reject the commercial approval request (RN-PI-10)."""
+    user = await get_current_user(request)
+    body = await request.json()
+    obs = body.get("observacoes", "")
+    existing = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+    nivel = existing.get("aprovacao_comercial_nivel", "gerente_vendas")
+    roles_ok = {"admin"} if nivel == "diretoria" else {"sales_ops", "admin"}
+    if user.get("role") not in roles_ok:
+        raise HTTPException(status_code=403, detail=f"Rejeição de nível '{nivel}' requer role: {sorted(roles_ok)}.")
+    now = now_iso()
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "aprovacao_comercial": "rejeitada",
+            "aprovacao_comercial_obs": obs,
+            "aprovacao_comercial_em": now,
+            "aprovacao_comercial_por": user.get("name", ""),
             "updated_at": now,
         }}
     )

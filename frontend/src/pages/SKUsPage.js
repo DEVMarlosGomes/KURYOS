@@ -17,6 +17,7 @@ import {
   CheckCircle2, Clock, Loader2, Factory
 } from "lucide-react";
 import { toast } from "sonner";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 
 const STATUS_COLORS = {
   ativo: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
@@ -97,6 +98,17 @@ export default function SKUsPage() {
   // Saldo state
   const [saldo, setSaldo] = useState(null);
   const [loadingSaldo, setLoadingSaldo] = useState(false);
+
+  // Price currency state for SKU detail sheet
+  const [skuPriceVal, setSkuPriceVal] = useState("");
+  const [skuPriceCurrency, setSkuPriceCurrency] = useState("BRL");
+
+  useEffect(() => {
+    if (selectedSku) {
+      setSkuPriceVal(selectedSku.preco_unitario ?? "");
+      setSkuPriceCurrency(selectedSku.preco_unitario_currency || "BRL");
+    }
+  }, [selectedSku?.id]);
 
   const loadSkus = useCallback(async () => {
     try {
@@ -318,7 +330,7 @@ export default function SKUsPage() {
                         </span>
                       </TableCell>
                       <TableCell className="text-right mono-num text-sm">
-                        {sku.preco_unitario ? `R$ ${sku.preco_unitario.toFixed(2)}` : "—"}
+                        {sku.preco_unitario ? fmtCurrency(sku.preco_unitario, sku.preco_unitario_currency || "BRL") : "—"}
                       </TableCell>
                       <TableCell className="text-right mono-num text-sm">{sku.moq || "—"}</TableCell>
                       <TableCell className="text-right mono-num text-sm hidden md:table-cell">
@@ -392,9 +404,18 @@ export default function SKUsPage() {
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
-                      <Label className="text-xs text-muted-foreground">Preço Unitário (R$)</Label>
-                      <Input type="number" step="0.01" defaultValue={selectedSku.preco_unitario || 0}
-                        onBlur={(e) => handleUpdateSku(selectedSku.id, { preco_unitario: parseFloat(e.target.value) || 0 })} />
+                      <Label className="text-xs text-muted-foreground">Preço Unitário</Label>
+                      <CurrencyInput
+                        value={skuPriceVal}
+                        currency={skuPriceCurrency}
+                        onValueChange={setSkuPriceVal}
+                        onCurrencyChange={(c) => {
+                          setSkuPriceCurrency(c);
+                          handleUpdateSku(selectedSku.id, { preco_unitario_currency: c });
+                        }}
+                        onBlur={() => handleUpdateSku(selectedSku.id, { preco_unitario: parseFloat(skuPriceVal) || 0 })}
+                        size="sm"
+                      />
                     </div>
                     <div className="space-y-1">
                       <Label className="text-xs text-muted-foreground">MOQ</Label>
@@ -416,6 +437,19 @@ export default function SKUsPage() {
                       </Select>
                     </div>
                   )}
+                  <Separator />
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1.5">Código gerado</p>
+                    <div className="flex items-center gap-2 font-mono text-sm flex-wrap">
+                      <span className="bg-primary/10 text-primary px-2 py-0.5 rounded font-bold">{selectedSku.cat2 || "??"}</span>
+                      <span className="text-muted-foreground">-</span>
+                      <span className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 px-2 py-0.5 rounded font-bold">{selectedSku.cli3 || "???"}</span>
+                      <span className="text-muted-foreground">-</span>
+                      <span className="bg-muted px-2 py-0.5 rounded text-muted-foreground">{selectedSku.codigo_interno?.split("-")[2] || "????"}</span>
+                      <span className="text-[10px] text-muted-foreground ml-1">= {selectedSku.codigo_interno}</span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1">CAT2 · CLI3 · SEQ4 — imutável após geração</p>
+                  </div>
                   <Separator />
                   <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">ANVISA</h4>
                   <div className="grid grid-cols-2 gap-3">

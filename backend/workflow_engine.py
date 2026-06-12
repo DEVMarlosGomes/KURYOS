@@ -200,6 +200,12 @@ def cat2_from_categoria(categoria: str) -> str:
     return "GE"
 
 
+def normalise_cli3(raw: str) -> str:
+    """Return exactly 3 uppercase alpha chars from raw string, padded with 'X' if needed."""
+    letters = "".join(c for c in (raw or "").upper() if c.isalpha())[:3]
+    return letters.ljust(3, "X") if letters else "GEN"
+
+
 async def next_sku_per_pair(tenant_id: str, cat2: str, cli3: str) -> int:
     """Atomic counter per (tenant, cat2, cli3) pair — returns 1-based integer."""
     key = f"sku_{cat2}_{cli3}"

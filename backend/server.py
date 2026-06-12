@@ -2018,6 +2018,7 @@ async def startup():
     await db.crm_samples.create_index([("tenant_id", 1), ("stage", 1)])
     await db.skus.create_index([("tenant_id", 1), ("status", 1)])
     await db.skus.create_index([("tenant_id", 1), ("cliente_id", 1)])
+    await db.skus.create_index([("tenant_id", 1), ("codigo_interno", 1)], unique=True)
     await db.crm_alerts.create_index([("tenant_id", 1), ("status", 1)])
     await db.crm_alerts.create_index([("tenant_id", 1), ("tipo", 1)])
     await db.crm_column_configs.create_index([("tenant_id", 1), ("crm_type", 1)])
@@ -2026,6 +2027,14 @@ async def startup():
     await db.pd_stability_studies.create_index([("tenant_id", 1), ("status", 1)])
     await db.pd_stability_readings.create_index([("tenant_id", 1), ("study_id", 1), ("condition_code", 1), ("day_offset", 1)], unique=True)
     
+    # Faturamento indexes
+    await db.faturamento_notas.create_index([("tenant_id", 1), ("status", 1)])
+    await db.faturamento_notas.create_index([("tenant_id", 1), ("status_pagamento", 1)])
+    await db.faturamento_notas.create_index([("tenant_id", 1), ("created_at", -1)])
+    await db.faturamento_duplicatas.create_index([("tenant_id", 1), ("status", 1)])
+    await db.faturamento_duplicatas.create_index([("tenant_id", 1), ("nf_id", 1)])
+    await db.faturamento_duplicatas.create_index([("tenant_id", 1), ("data_vencimento", 1)])
+
     # Start alert scheduler
     asyncio.create_task(run_alert_scheduler())
     asyncio.create_task(run_workflow_notification_scheduler())

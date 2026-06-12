@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2, Plus, ShoppingCart } from "lucide-react";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 
 const FRETES = ["cif", "fob", "valor_fixo", "percentual"];
 
@@ -19,7 +20,7 @@ export default function ComprasCotacao() {
     const [hist, setHist] = useState(null);
     const [fornecedores, setFornecedores] = useState([]);
     const [loading, setLoading] = useState(true);
-    const [form, setForm] = useState({ fornecedor_id: "", preco_unitario: "", prazo_pagamento_texto: "30 DDL", prazo_pagamento_dias: 30, prazo_entrega_dias_uteis: 7, moq: 1, frete_tipo: "cif", frete_valor: 0, valido_ate: "" });
+    const [form, setForm] = useState({ fornecedor_id: "", preco_unitario: "", preco_unitario_currency: "BRL", prazo_pagamento_texto: "30 DDL", prazo_pagamento_dias: 30, prazo_entrega_dias_uteis: 7, moq: 1, frete_tipo: "cif", frete_valor: 0, frete_valor_currency: "BRL", valido_ate: "" });
     const [saving, setSaving] = useState(false);
     const [criandoPO, setCriandoPO] = useState(false);
 
@@ -131,12 +132,12 @@ export default function ComprasCotacao() {
                                 {hist.comparativo_fornecedores.map((f, i) => (
                                     <tr key={f.fornecedor_id} className={`border-b last:border-0 ${form.fornecedor_id === f.fornecedor_id ? "bg-primary/5" : ""}`}>
                                         <td className="py-1.5">{i === 0 && <span className="text-green-600 mr-1">★</span>}{f.fornecedor_nome}</td>
-                                        <td className="py-1.5 text-right font-mono">R$ {Number(f.ultimo_preco).toFixed(4)}</td>
+                                        <td className="py-1.5 text-right font-mono">{fmtCurrency(f.ultimo_preco, f.ultimo_preco_currency || "BRL")}</td>
                                         <td className="py-1.5 text-right">{f.prazo_entrega_dias_uteis}d</td>
                                         <td className="py-1.5 text-right">{f.moq}</td>
                                         <td className="py-1.5 text-center">
                                             <button className="text-primary hover:underline text-xs"
-                                                onClick={() => setForm(ff => ({ ...ff, fornecedor_id: f.fornecedor_id, preco_unitario: f.ultimo_preco, prazo_entrega_dias_uteis: f.prazo_entrega_dias_uteis || 7, moq: f.moq || 1 }))}>
+                                                onClick={() => setForm(ff => ({ ...ff, fornecedor_id: f.fornecedor_id, preco_unitario: f.ultimo_preco, preco_unitario_currency: f.ultimo_preco_currency || "BRL", prazo_entrega_dias_uteis: f.prazo_entrega_dias_uteis || 7, moq: f.moq || 1 }))}>
                                                 Usar
                                             </button>
                                         </td>
@@ -161,8 +162,15 @@ export default function ComprasCotacao() {
                             </Select>
                         </div>
                         <div>
-                            <Label className="text-xs">Preço Unitário (R$) *</Label>
-                            <Input type="number" className="h-8 text-sm mt-1" value={form.preco_unitario} onChange={e => set("preco_unitario", e.target.value)} />
+                            <Label className="text-xs">Preço Unitário *</Label>
+                            <CurrencyInput
+                                value={form.preco_unitario}
+                                currency={form.preco_unitario_currency}
+                                onValueChange={v => set("preco_unitario", v)}
+                                onCurrencyChange={c => set("preco_unitario_currency", c)}
+                                size="sm"
+                                className="mt-1"
+                            />
                         </div>
                         <div>
                             <Label className="text-xs">MOQ</Label>

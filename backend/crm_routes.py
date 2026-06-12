@@ -29,6 +29,7 @@ from workflow_engine import (
     next_sku_number,
     next_sku_per_pair,
     cat2_from_categoria,
+    normalise_cli3,
     recalc_sku_averages,
     assert_client_exists,
     assert_project_exists,
@@ -419,6 +420,7 @@ class ClientUpdate(BaseModel):
     prazo_urgencia: Optional[str] = None
     amostras_aprovadas: Optional[List[str]] = None
     valor_estimado_projeto: Optional[float] = None
+    valor_estimado_projeto_currency: Optional[str] = None
     moq_negociado: Optional[str] = None
     condicao_pagamento: Optional[str] = None
     anvisa_necessario: Optional[AnvisaInfo] = None
@@ -426,6 +428,7 @@ class ClientUpdate(BaseModel):
     data_pedido: Optional[str] = None
     skus_confirmados: Optional[List[str]] = None
     valor_primeiro_pedido: Optional[float] = None
+    valor_primeiro_pedido_currency: Optional[str] = None
     previsao_segundo_pedido: Optional[str] = None
     motivo_perda: Optional[str] = None
     # Novos campos PRD
@@ -555,6 +558,7 @@ class VariacaoItem(BaseModel):
     percentual_fragrancia: Optional[float] = None
     referencia_fragrancia: str = ""
     custo_fragrancia: Optional[float] = None
+    custo_fragrancia_currency: str = "BRL"
     observacoes_especificas: str = ""
     feedback_cliente: str = ""
     direcoes_retrabalho: str = ""
@@ -600,6 +604,7 @@ class VariacaoUpdate(BaseModel):
     percentual_fragrancia: Optional[float] = None
     referencia_fragrancia: Optional[str] = None
     custo_fragrancia: Optional[float] = None
+    custo_fragrancia_currency: Optional[str] = None
     observacoes_especificas: Optional[str] = None
     feedback_cliente: Optional[str] = None
 
@@ -612,6 +617,7 @@ class VariacaoMove(BaseModel):
 
 class SKUUpdate(BaseModel):
     preco_unitario: Optional[float] = None
+    preco_unitario_currency: Optional[str] = None
     moq: Optional[int] = None
     anvisa_numero: Optional[str] = None
     anvisa_validade: Optional[str] = None
@@ -1187,7 +1193,7 @@ async def create_client(data: ClientCreate, request: Request):
         "site": create_payload["site"],
         "instagram": create_payload["instagram"],
         "observacoes": create_payload["observacoes"],
-        "cli3": (data.cli3 or "").upper()[:3],
+        "cli3": normalise_cli3(data.cli3 or ""),
         "has_grau2_anvisa": create_payload.get("has_grau2_anvisa", False),
         "ultima_atualizacao_temperatura": now,
         # Qualificado fields (empty initially)
@@ -1311,9 +1317,13 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
     if "temperatura_lead" in update_fields:
         update_fields["ultima_atualizacao_temperatura"] = _now_iso()
 
-    # RN-SK-01: cli3 — normalise to uppercase 3-char max
-    if "cli3" in update_fields and update_fields["cli3"]:
-        update_fields["cli3"] = str(update_fields["cli3"]).upper().strip()[:3]
+    # RN-SK-01: cli3 must be exactly 3 uppercase alpha chars
+    if "cli3" in update_fields:
+        raw = str(update_fields["cli3"] or "")
+        letters = "".join(c for c in raw.upper() if c.isalpha())[:3]
+        if letters and len(letters) < 3:
+            raise HTTPException(status_code=400, detail=f"cli3 deve ter 3 letras (ex: 'ABC'). Recebido: '{raw}'")
+        update_fields["cli3"] = letters or ""
 
     payload = dict(existing)
     payload.update(update_fields)
@@ -3628,10 +3638,8 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
     categoria = sample.get("categoria", "")
     cat2 = cat2_from_categoria(categoria)
     client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
-    cli3 = (client.get("cli3") or "").upper().strip()[:3] if client else ""
-    if not cli3:
-        # Fallback: first 3 letters of client name
-        cli3 = "".join(c for c in (client.get("nome_empresa", "") if client else "").upper() if c.isalpha())[:3] or "GEN"
+    raw_cli3 = (client.get("cli3") or client.get("nome_empresa", "") if client else "")
+    cli3 = normalise_cli3(raw_cli3)
     seq = await next_sku_per_pair(tenant_id, cat2, cli3)
     codigo = f"{cat2}-{cli3}-{str(seq).zfill(4)}"
 
@@ -3707,9 +3715,8 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
     # Resolve CAT2 and CLI3 for code format [CAT2]-[CLI3]-[SEQ4]
     cat2 = cat2_from_categoria(categoria)
     client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
-    cli3 = (client.get("cli3") or "").upper().strip()[:3] if client else ""
-    if not cli3:
-        cli3 = "".join(c for c in (client.get("nome_empresa", "") if client else "").upper() if c.isalpha())[:3] or "GEN"
+    raw_cli3 = (client.get("cli3") or client.get("nome_empresa", "") if client else "")
+    cli3 = normalise_cli3(raw_cli3)
     seq = await next_sku_per_pair(tenant_id, cat2, cli3)
     codigo = f"{cat2}-{cli3}-{str(seq).zfill(4)}"
 
@@ -3785,6 +3792,29 @@ async def list_skus(
     return skus
 
 
+@crm_router.get("/skus/preview-code")
+async def preview_sku_code(cliente_id: str, categoria: str, request: Request):
+    """Return the code that would be generated for a new SKU (without consuming the sequence)."""
+    user = await _get_current_user(request)
+    cat2 = cat2_from_categoria(categoria)
+    client = await db.crm_clients.find_one({"id": cliente_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    raw_cli3 = client.get("cli3") or client.get("nome_empresa", "")
+    cli3 = normalise_cli3(raw_cli3)
+    # Peek at next seq without incrementing (counters keyed as "name:tenant_id")
+    counter_key = f"sku_{cat2}_{cli3}:{user['tenant_id']}"
+    seq_doc = await db.counters.find_one({"_id": counter_key})
+    next_seq = (seq_doc.get("seq", 0) if seq_doc else 0) + 1
+    return {
+        "codigo": f"{cat2}-{cli3}-{str(next_seq).zfill(4)}",
+        "cat2": cat2,
+        "cli3": cli3,
+        "seq": next_seq,
+        "cli3_source": "campo_cli3" if client.get("cli3") else "nome_empresa",
+    }
+
+
 @crm_router.get("/skus/{sku_id}")
 async def get_sku(sku_id: str, request: Request):
     user = await _get_current_user(request)
@@ -3806,6 +3836,8 @@ async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
         update_fields["nome_produto"] = data.nome_produto
     if data.preco_unitario is not None:
         update_fields["preco_unitario"] = data.preco_unitario
+    if data.preco_unitario_currency is not None:
+        update_fields["preco_unitario_currency"] = data.preco_unitario_currency
     if data.moq is not None:
         update_fields["moq"] = data.moq
     if data.status is not None:

@@ -24,6 +24,7 @@ import ViewSwitcher from "@/components/ViewSwitcher";
 import FilterBar, { applyFilters } from "@/components/FilterBar";
 import ListView from "@/components/ListView";
 import { formatApiError } from "@/lib/formatError";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 
 function CRMSubNav({ active }) {
     const navigate = useNavigate();
@@ -118,6 +119,7 @@ function createEmptyClient(defaultOwner = "") {
         site: "",
         instagram: "",
         observacoes: "",
+        cli3: "",
     };
 }
 
@@ -713,6 +715,20 @@ export default function CRM1Page() {
                                     />
                                 </div>
                                 <div className="space-y-2">
+                                    <Label className="flex items-center gap-1">
+                                        Código Cliente (CLI3)
+                                        <span className="text-[10px] text-muted-foreground font-normal">— SKU</span>
+                                    </Label>
+                                    <Input
+                                        className="font-mono uppercase tracking-widest"
+                                        maxLength={3}
+                                        value={newClient.cli3}
+                                        placeholder="ABC"
+                                        onChange={(e) => setNewClient({ ...newClient, cli3: e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 3) })}
+                                    />
+                                    <p className="text-[10px] text-muted-foreground">3 letras usadas no código do SKU (ex: CA-ABC-0001). Se vazio, usa as 3 primeiras letras da empresa.</p>
+                                </div>
+                                <div className="space-y-2">
                                     <Label>Temperatura *</Label>
                                     <Select value={newClient.temperatura_lead} onValueChange={(v) => setNewClient({ ...newClient, temperatura_lead: v })}>
                                         <SelectTrigger><SelectValue placeholder="Selecionar" /></SelectTrigger>
@@ -1257,6 +1273,29 @@ function ClientDetailSheet({ client, constants, onClose, onCreateProject }) {
                                 <div className="space-y-3">
                                     <div><Label className="text-xs">Empresa</Label><Input value={val("nome_empresa")} onChange={(e) => setVal("nome_empresa", e.target.value)} /></div>
                                     <div><Label className="text-xs">CNPJ</Label><Input value={val("cnpj")} onChange={(e) => setVal("cnpj", e.target.value)} /></div>
+                                    <div>
+                                        <Label className="text-xs flex items-center gap-1">
+                                            Código Cliente (CLI3)
+                                            <span className="text-[10px] text-muted-foreground font-normal">— usado no código SKU</span>
+                                        </Label>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <Input
+                                                className="h-8 w-24 font-mono uppercase text-center tracking-widest text-sm"
+                                                maxLength={3}
+                                                value={val("cli3") || ""}
+                                                placeholder="ABC"
+                                                onChange={(e) => setVal("cli3", e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 3))}
+                                            />
+                                            {(val("cli3") || data?.cli3) && (
+                                                <span className="text-[11px] text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
+                                                    ex: CA-{(val("cli3") || data?.cli3 || "???").toUpperCase()}-0001
+                                                </span>
+                                            )}
+                                        </div>
+                                        {(val("cli3") || "").length > 0 && (val("cli3") || "").length < 3 && (
+                                            <p className="text-[10px] text-amber-600 mt-0.5">Precisa de exatamente 3 letras</p>
+                                        )}
+                                    </div>
                                     <div><Label className="text-xs">Contato — Nome</Label><Input value={val("contato_principal")?.nome || data.contato_principal?.nome || ""} onChange={(e) => setVal("contato_principal", { ...(data.contato_principal || {}), ...(editing.contato_principal || {}), nome: e.target.value })} /></div>
                                     <div>
                                         <Label className="text-xs">Contato — Cargo</Label>
@@ -1340,7 +1379,16 @@ function ClientDetailSheet({ client, constants, onClose, onCreateProject }) {
                                     <Separator className="mb-3" />
                                     <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Negociação</h4>
                                     <div className="space-y-3">
-                                        <div><Label className="text-xs">Valor Estimado do Projeto (R$)</Label><Input type="number" value={val("valor_estimado_projeto") || ""} onChange={(e) => setVal("valor_estimado_projeto", parseFloat(e.target.value) || 0)} /></div>
+                                        <div>
+                                            <Label className="text-xs">Valor Estimado do Projeto</Label>
+                                            <CurrencyInput
+                                                value={val("valor_estimado_projeto") || ""}
+                                                currency={val("valor_estimado_projeto_currency") || "BRL"}
+                                                onValueChange={(v) => setVal("valor_estimado_projeto", v)}
+                                                onCurrencyChange={(c) => setVal("valor_estimado_projeto_currency", c)}
+                                                className="mt-1"
+                                            />
+                                        </div>
                                         <div><Label className="text-xs">MOQ Negociado</Label><Input value={val("moq_negociado")} onChange={(e) => setVal("moq_negociado", e.target.value)} /></div>
                                         <div><Label className="text-xs">Condição de Pagamento</Label><Input value={val("condicao_pagamento")} onChange={(e) => setVal("condicao_pagamento", e.target.value)} /></div>
                                         <div><Label className="text-xs">Concorrentes Envolvidos</Label><Input value={(val("concorrentes_envolvidos") || []).join(", ")} onChange={(e) => setVal("concorrentes_envolvidos", e.target.value.split(",").map(s => s.trim()).filter(Boolean))} placeholder="Separados por vírgula" /></div>
@@ -1355,7 +1403,16 @@ function ClientDetailSheet({ client, constants, onClose, onCreateProject }) {
                                     <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Fechamento</h4>
                                     <div className="space-y-3">
                                         <div><Label className="text-xs">Data do Pedido</Label><Input type="date" value={val("data_pedido") || ""} onChange={(e) => setVal("data_pedido", e.target.value)} /></div>
-                                        <div><Label className="text-xs">Valor do Primeiro Pedido (R$)</Label><Input type="number" value={val("valor_primeiro_pedido") || ""} onChange={(e) => setVal("valor_primeiro_pedido", parseFloat(e.target.value) || 0)} /></div>
+                                        <div>
+                                            <Label className="text-xs">Valor do Primeiro Pedido</Label>
+                                            <CurrencyInput
+                                                value={val("valor_primeiro_pedido") || ""}
+                                                currency={val("valor_primeiro_pedido_currency") || "BRL"}
+                                                onValueChange={(v) => setVal("valor_primeiro_pedido", v)}
+                                                onCurrencyChange={(c) => setVal("valor_primeiro_pedido_currency", c)}
+                                                className="mt-1"
+                                            />
+                                        </div>
                                         <div><Label className="text-xs">Previsão Segundo Pedido</Label><Input type="date" value={val("previsao_segundo_pedido") || ""} onChange={(e) => setVal("previsao_segundo_pedido", e.target.value)} /></div>
                                     </div>
                                 </section>

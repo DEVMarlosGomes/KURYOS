@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2, Plus, TrendingUp, TrendingDown } from "lucide-react";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
@@ -17,7 +18,7 @@ const CORES = ["#6366f1", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4"]
 const FRETES = ["cif", "fob", "valor_fixo", "percentual"];
 
 function NovaCotacaoDialog({ open, itemId, onClose, onCreated }) {
-    const [form, setForm] = useState({ fornecedor_id: "", preco_unitario: "", prazo_pagamento_texto: "30 DDL", prazo_pagamento_dias: 30, prazo_entrega_dias_uteis: 7, moq: 1, frete_tipo: "cif", frete_valor: 0, valido_ate: "" });
+    const [form, setForm] = useState({ fornecedor_id: "", preco_unitario: "", preco_unitario_currency: "BRL", prazo_pagamento_texto: "30 DDL", prazo_pagamento_dias: 30, prazo_entrega_dias_uteis: 7, moq: 1, frete_tipo: "cif", frete_valor: 0, valido_ate: "" });
     const [fornecedores, setFornecedores] = useState([]);
     const [saving, setSaving] = useState(false);
 
@@ -52,8 +53,15 @@ function NovaCotacaoDialog({ open, itemId, onClose, onCreated }) {
                         </Select>
                     </div>
                     <div>
-                        <Label className="text-xs">Preço Unitário (R$) *</Label>
-                        <Input type="number" className="h-8 text-sm mt-1" value={form.preco_unitario} onChange={e => set("preco_unitario", e.target.value)} />
+                        <Label className="text-xs">Preço Unitário *</Label>
+                        <CurrencyInput
+                            value={form.preco_unitario}
+                            currency={form.preco_unitario_currency}
+                            onValueChange={v => set("preco_unitario", v)}
+                            onCurrencyChange={c => set("preco_unitario_currency", c)}
+                            size="sm"
+                            className="mt-1"
+                        />
                     </div>
                     <div>
                         <Label className="text-xs">MOQ</Label>
@@ -246,7 +254,7 @@ export default function ComprasItemDetalhe() {
                             <div key={i} className="flex items-center gap-3 text-xs border-b last:border-0 pb-1.5">
                                 <span className="text-muted-foreground font-mono w-20 flex-shrink-0">{c.created_at?.slice(0, 10)}</span>
                                 <span className="text-muted-foreground flex-1">{c.fornecedor_nome}</span>
-                                <span className="font-mono font-medium">R$ {Number(c.preco_unitario).toFixed(4)}</span>
+                                <span className="font-mono font-medium">{fmtCurrency(c.preco_unitario, c.preco_unitario_currency || "BRL")}</span>
                                 {c.variacao_pct != null && (
                                     <span className={`flex items-center gap-0.5 ${c.variacao_pct > 0 ? "text-red-600" : "text-green-600"}`}>
                                         {c.variacao_pct > 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}

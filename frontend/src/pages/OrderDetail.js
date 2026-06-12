@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { toast } from "sonner";
 import { ArrowLeft, Save, Download, Loader2, Plus, Trash2, FileText, Pencil, Check, X, ShieldCheck, AlertTriangle, Factory, Lock, CheckCircle2 } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
+import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
 
 const TIPOS_SERVICO = [
   { value: "producao",    label: "Produção",    desc: "Primeiro pedido — amostra aprovada, gera novo SKU" },
@@ -215,6 +216,28 @@ export default function OrderDetail() {
     }
   };
 
+  const approveComercial = async () => {
+    try {
+      const res = await api.post(`/orders/${id}/aprovar-comercial`, { observacoes: "" });
+      setOrder(res.data); setForm(deepClone(res.data));
+      toast.success("Aprovação comercial registrada");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Sem permissão ou erro ao aprovar");
+    }
+  };
+
+  const rejectComercial = async () => {
+    const obs = window.prompt("Motivo da rejeição (obrigatório):");
+    if (!obs?.trim()) return;
+    try {
+      const res = await api.post(`/orders/${id}/rejeitar-comercial`, { observacoes: obs });
+      setOrder(res.data); setForm(deepClone(res.data));
+      toast.success("Pedido rejeitado comercialmente");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Sem permissão ou erro");
+    }
+  };
+
   const ensureChecklist = () => {
     if (!form.checklist_insumos || form.checklist_insumos.length < CATEGORIAS_INSUMO.length) {
       const existing = form.checklist_insumos || [];
@@ -253,11 +276,14 @@ export default function OrderDetail() {
     setForm(p => {
       const items = [...(p.items || [])];
       const it = { ...items[idx], [key]: value };
-      // Auto-recompute valor_total
-      if (key === "valor_unitario" || key === "qtd") {
+      // Auto-recompute valor_total applying discount
+      if (key === "valor_unitario" || key === "qtd" || key === "desconto_percentual") {
         const vu = parseFloat(key === "valor_unitario" ? value : it.valor_unitario) || 0;
         const q = parseFloat(key === "qtd" ? value : it.qtd) || 0;
-        it.valor_total = +(vu * q).toFixed(2);
+        const desc = Math.max(0, Math.min(100, parseFloat(key === "desconto_percentual" ? value : (it.desconto_percentual || 0)) || 0));
+        const bruto = vu * q;
+        it.valor_desconto = +(bruto * desc / 100).toFixed(2);
+        it.valor_total = +(bruto - it.valor_desconto).toFixed(2);
       }
       items[idx] = it;
       return { ...p, items };
@@ -269,7 +295,8 @@ export default function OrderDetail() {
       ...p,
       items: [...(p.items || []), {
         codigo_kuryos: "", codigo_cliente: "", item: "",
-        prazo_entrega: "20 Dias", valor_unitario: 0, qtd: 0, valor_total: 0,
+        prazo_entrega: "20 Dias", valor_unitario: 0, valor_unitario_currency: "BRL",
+        desconto_percentual: 0, valor_desconto: 0, qtd: 0, valor_total: 0,
       }],
     }));
   };
@@ -279,7 +306,11 @@ export default function OrderDetail() {
   };
 
   const totalCalc = (form.items || []).reduce((s, it) => s + (Number(it.valor_total) || 0), 0);
+  const totalBruto = (form.items || []).reduce((s, it) => s + ((it.valor_unitario || 0) * (it.qtd || 0)), 0);
+  const totalDesconto = totalBruto - totalCalc;
+  const descontoPct = totalBruto > 0 ? (totalDesconto / totalBruto * 100) : 0;
   const statusCfg = STATUS_COLORS[form.status] || STATUS_COLORS.rascunho;
+  const apCom = form.aprovacao_comercial || "nao_necessaria";
 
   return (
     <div className="h-full overflow-auto">
@@ -302,6 +333,11 @@ export default function OrderDetail() {
                 {form.auto_created && (
                   <Badge variant="outline" className="text-[10px] gap-1">
                     <FileText className="h-2.5 w-2.5" /> Auto-gerado a partir do P&D
+                  </Badge>
+                )}
+                {form.kickoff_id && (
+                  <Badge variant="outline" className="text-[10px] gap-1 border-violet-300 text-violet-700 dark:text-violet-300">
+                    <ShieldCheck className="h-2.5 w-2.5" /> KO vinculado
                   </Badge>
                 )}
               </div>
@@ -411,6 +447,49 @@ export default function OrderDetail() {
             </Button>
           )}
         </div>
+
+        {/* Aprovação Comercial — RN-PI-10 (só exibe se há desconto além do tier automático) */}
+        {apCom !== "nao_necessaria" && (
+          <div className={`rounded-xl border px-5 py-4 flex items-center justify-between gap-4 ${
+            apCom === "aprovada" ? "bg-green-50 border-green-300 dark:bg-green-950/30 dark:border-green-800"
+            : apCom === "rejeitada" ? "bg-red-50 border-red-300 dark:bg-red-950/30 dark:border-red-800"
+            : "bg-orange-50 border-orange-300 dark:bg-orange-950/30 dark:border-orange-800"
+          }`}>
+            <div className="flex items-center gap-3">
+              {apCom === "aprovada"
+                ? <CheckCircle2 className="h-5 w-5 text-green-600 shrink-0" />
+                : apCom === "rejeitada"
+                ? <X className="h-5 w-5 text-red-600 shrink-0" />
+                : <AlertTriangle className="h-5 w-5 text-orange-600 shrink-0" />
+              }
+              <div>
+                <p className="text-sm font-semibold">
+                  {apCom === "aprovada" ? "Aprovação Comercial Concedida"
+                   : apCom === "rejeitada" ? "Pedido Rejeitado Comercialmente"
+                   : `Aprovação Comercial Pendente (RN-PI-10) — ${(form.aprovacao_comercial_nivel || "gerente_vendas").replace("_", " ")}`}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {apCom === "aprovada" || apCom === "rejeitada"
+                    ? `${form.aprovacao_comercial_por || "—"} em ${form.aprovacao_comercial_em ? new Date(form.aprovacao_comercial_em).toLocaleDateString("pt-BR") : "—"}${form.aprovacao_comercial_obs ? ` · "${form.aprovacao_comercial_obs}"` : ""}`
+                    : `Desconto de ${descontoPct.toFixed(1)}% acima do limite automático de 5%. Aguardando aprovação.`
+                  }
+                </p>
+              </div>
+            </div>
+            {apCom === "pendente" && (
+              <div className="flex gap-2 shrink-0">
+                <Button size="sm" onClick={approveComercial}
+                  className="gap-1.5 bg-green-600 hover:bg-green-700 text-white">
+                  <Check className="h-3.5 w-3.5" /> Aprovar
+                </Button>
+                <Button size="sm" variant="outline" onClick={rejectComercial}
+                  className="gap-1.5 border-red-400 text-red-600 hover:bg-red-50">
+                  <X className="h-3.5 w-3.5" /> Rejeitar
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* 1) Informações Iniciais */}
         <Card>
@@ -552,6 +631,7 @@ export default function OrderDetail() {
                     <th className="text-left p-2 font-medium">Item</th>
                     <th className="text-left p-2 font-medium">Prazo</th>
                     <th className="text-right p-2 font-medium">Valor Unit.</th>
+                    <th className="text-right p-2 font-medium">Desc. %</th>
                     <th className="text-right p-2 font-medium">Qtd.</th>
                     <th className="text-right p-2 font-medium">Total</th>
                     {editing && <th className="w-10"></th>}
@@ -583,8 +663,31 @@ export default function OrderDetail() {
                       </td>
                       <td className="p-1 text-right">
                         {editing ? (
-                          <Input type="number" step="0.01" value={it.valor_unitario || 0} onChange={(e) => updateItem(idx, "valor_unitario", e.target.value)} className="h-8 text-xs text-right font-mono" data-testid={`item-${idx}-valor-unit`} />
-                        ) : formatCurrencyBR(it.valor_unitario)}
+                          <CurrencyInput
+                            value={it.valor_unitario || 0}
+                            currency={it.valor_unitario_currency || "BRL"}
+                            onValueChange={v => updateItem(idx, "valor_unitario", v)}
+                            onCurrencyChange={c => updateItem(idx, "valor_unitario_currency", c)}
+                            showHint={false}
+                            size="sm"
+                          />
+                        ) : fmtCurrency(it.valor_unitario, it.valor_unitario_currency || "BRL")}
+                      </td>
+                      <td className="p-1 text-right">
+                        {editing ? (
+                          <div className="flex items-center gap-0.5 justify-end">
+                            <Input
+                              type="number" min="0" max="100" step="0.5"
+                              value={it.desconto_percentual || 0}
+                              onChange={(e) => updateItem(idx, "desconto_percentual", e.target.value)}
+                              className="h-8 text-xs text-right font-mono w-16"
+                              data-testid={`item-${idx}-desconto`}
+                            />
+                            <span className="text-xs text-muted-foreground">%</span>
+                          </div>
+                        ) : (it.desconto_percentual > 0 ? (
+                          <span className="text-orange-600 font-mono text-xs font-semibold">{Number(it.desconto_percentual).toFixed(1)}%</span>
+                        ) : <span className="text-muted-foreground text-xs">—</span>)}
                       </td>
                       <td className="p-1 text-right">
                         {editing ? (
@@ -592,7 +695,12 @@ export default function OrderDetail() {
                         ) : (Number(it.qtd) || 0).toLocaleString("pt-BR")}
                       </td>
                       <td className="p-2 text-right font-mono text-xs font-semibold">
-                        {formatCurrencyBR(it.valor_total)}
+                        {fmtCurrency(it.valor_total, it.valor_unitario_currency || "BRL")}
+                        {it.desconto_percentual > 0 && (
+                          <div className="text-[10px] text-orange-500 font-normal">
+                            - {fmtCurrency(it.valor_desconto || 0, it.valor_unitario_currency || "BRL")}
+                          </div>
+                        )}
                       </td>
                       {editing && (
                         <td className="p-2 text-center">
@@ -610,8 +718,22 @@ export default function OrderDetail() {
                   )}
                 </tbody>
                 <tfoot>
+                  {totalDesconto > 0 && (
+                    <>
+                      <tr className="border-t text-muted-foreground text-xs">
+                        <td colSpan={8} className="p-2 text-right">Total bruto</td>
+                        <td className="p-2 text-right font-mono">{formatCurrencyBR(totalBruto)}</td>
+                        {editing && <td></td>}
+                      </tr>
+                      <tr className="text-xs text-orange-700">
+                        <td colSpan={8} className="p-2 text-right">Desconto ({descontoPct.toFixed(1)}%)</td>
+                        <td className="p-2 text-right font-mono">- {formatCurrencyBR(totalDesconto)}</td>
+                        {editing && <td></td>}
+                      </tr>
+                    </>
+                  )}
                   <tr className="border-t-2 bg-muted/30 font-bold">
-                    <td colSpan={editing ? 7 : 6} className="p-2 text-right">Total do Pedido</td>
+                    <td colSpan={8} className="p-2 text-right">Total do Pedido</td>
                     <td className="p-2 text-right text-green-600 font-mono">{formatCurrencyBR(totalCalc)}</td>
                     {editing && <td></td>}
                   </tr>
