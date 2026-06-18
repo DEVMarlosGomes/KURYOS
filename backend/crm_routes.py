@@ -1363,7 +1363,43 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
     client = await db.crm_clients.find_one({"id": client_id}, {"_id": 0})
+
+    # Auto-complete "qualificacao" blocking task when all 4 fields are present
+    await _auto_complete_qualificacao_task(client, user["tenant_id"], user)
+
     return client
+
+
+async def _auto_complete_qualificacao_task(client: dict, tenant_id: str, user: dict):
+    """Mark the 'Qualificar lead' blocking task as done when all required fields are filled.
+    The three fields below have no default value — only non-empty means 'filled'."""
+    decisores_ok = bool(client.get("decisores"))          # at least one entry in list
+    anvisa_ok = bool(str(client.get("tem_anvisa") or "").strip())   # e.g. "sim" / "nao"
+    volume_ok = bool(str(client.get("volume_estimado_mensal") or "").strip())
+
+    if not (decisores_ok and anvisa_ok and volume_ok):
+        return
+
+    now = _now_iso()
+    await db.workflow_tasks.update_many(
+        {
+            "tenant_id": tenant_id,
+            "entity_type": "client",
+            "entity_id": client["id"],
+            "category": "qualificacao",
+            "status": {"$in": ["pendente", "em_andamento", "em_atraso"]},
+        },
+        {
+            "$set": {
+                "status": "concluida",
+                "completed_at": now,
+                "completed_by": user["id"],
+                "completed_by_name": user.get("name", ""),
+                "completion_comment": "Concluído automaticamente — decisores, ANVISA, volume e fornecedor preenchidos.",
+                "updated_at": now,
+            }
+        }
+    )
 
 
 @crm_router.put("/clients/{client_id}/move")
@@ -1395,6 +1431,9 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
 
     if is_regression and not (data.justificativa or "").strip():
         raise HTTPException(status_code=400, detail="Justificativa obrigatória para movimentações retroativas")
+
+    # Auto-complete qualificacao task if fields are already filled
+    await _auto_complete_qualificacao_task(client, user["tenant_id"], user)
 
     # ERP v3.0: bloquear avanço se houver tarefas obrigatórias pendentes
     _validate_client_transition_requirements(client, new_stage)

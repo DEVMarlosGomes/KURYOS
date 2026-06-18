@@ -106,6 +106,7 @@ export default function PDDetail() {
   const navigate = useNavigate();
   const { user: authUser } = useAuth();
   const canEdit = authUser && ["admin", "gestor", "formulador", "lider_pd", "engenharia_produto"].includes(authUser.role);
+  const canApproveCommercial = authUser && ["admin", "vendedor", "sales_ops", "sucesso_cliente"].includes(authUser.role);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
@@ -212,7 +213,7 @@ export default function PDDetail() {
   const hasDev = !!dev;
   const pendingCount = (pending || []).filter(p => p.status === "pendente").length;
   const isInternalResearch = !!req.is_internal_research;
-  const canViewCommercial = authUser && ["admin", "compras"].includes(authUser.role);
+  const canViewCommercial = authUser && ["admin", "compras", "vendedor", "sales_ops", "sucesso_cliente"].includes(authUser.role);
   const canLinkToCRM = authUser && ["admin", "lider_pd", "formulador", "engenharia_produto", "vendedor", "sales_ops"].includes(authUser.role);
 
   const linkToCRM = async () => {
@@ -312,24 +313,49 @@ export default function PDDetail() {
                 <ArrowLeft className="h-3.5 w-3.5" /> Retroceder
               </Button>
             )}
-            {canEdit && allowedNext.map(ns => {
-              const isEntrega = req.status === "IN_TESTS" && ns === "WAITING_APPROVAL";
-              const label = isEntrega ? "Entregar ao Comercial" : STATUS_CONFIG[ns]?.label;
-              const Icon = ns === "REJECTED" ? XCircle : isEntrega ? Send : ArrowRight;
-              return (
-                <Button
-                  key={ns}
-                  size="sm"
-                  variant={ns === "REJECTED" ? "destructive" : "default"}
-                  onClick={() => handleStatusChange(ns)}
-                  className="gap-1.5"
-                >
-                  <Icon className="h-3.5 w-3.5" />
-                  {label}
+            {canEdit && allowedNext
+              .filter(ns => !(req.status === "WAITING_APPROVAL" && ["APPROVED", "REJECTED"].includes(ns)))
+              .map(ns => {
+                const isEntrega = req.status === "IN_TESTS" && ns === "WAITING_APPROVAL";
+                const label = isEntrega ? "Entregar ao Comercial" : STATUS_CONFIG[ns]?.label;
+                const Icon = ns === "REJECTED" ? XCircle : isEntrega ? Send : ArrowRight;
+                return (
+                  <Button key={ns} size="sm" variant={ns === "REJECTED" ? "destructive" : "default"}
+                    onClick={() => handleStatusChange(ns)} className="gap-1.5">
+                    <Icon className="h-3.5 w-3.5" />{label}
+                  </Button>
+                );
+              })
+            }
+            {/* Botões de aprovação comercial — visíveis apenas para roles comerciais */}
+            {canApproveCommercial && req.status === "WAITING_APPROVAL" && (
+              <>
+                <Button size="sm" variant="destructive" onClick={() => handleStatusChange("REJECTED")} className="gap-1.5">
+                  <XCircle className="h-3.5 w-3.5" /> Reprovar
                 </Button>
-              );
-            })}
+                <Button size="sm" className="gap-1.5 bg-green-600 hover:bg-green-700 text-white" onClick={() => handleStatusChange("APPROVED")}>
+                  <CheckCircle2 className="h-3.5 w-3.5" /> Aprovar
+                </Button>
+              </>
+            )}
           </div>
+
+          {/* Banner: aguardando aprovação comercial */}
+          {req.status === "WAITING_APPROVAL" && (
+            <div className="mt-4 flex items-start gap-3 rounded-lg border border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-950/30 p-3">
+              <Send className="h-4 w-4 text-orange-600 mt-0.5 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-orange-800 dark:text-orange-200">
+                  Aguardando aprovação comercial
+                </p>
+                <p className="text-xs text-orange-700 dark:text-orange-300 mt-0.5">
+                  {canApproveCommercial
+                    ? "Use os botões acima para aprovar ou reprovar esta formulação."
+                    : "O responsável comercial (vendedor / sales_ops) deve aprovar para prosseguir."}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Banner: próximo passo após aprovação */}
           {(req.status === "APPROVED" || req.status === "COMPLETED") && (

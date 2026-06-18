@@ -270,27 +270,13 @@ def _block2_ready(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
     missing = []
     required = [
         "volume_primeiro_pedido",
-        "volume_estimado_mes",
-        "unidade_venda",
         "data_entrega_contratada",
-        "lead_time_producao_dias_uteis",
-        "prazo_validade_produto_meses",
         "preco_venda_cliente_rs_un",
         "condicao_pagamento",
-        "incoterm",
-        "nota_fiscal_cfop",
-        "contrato_assinado_file_id",
-        "contrato_assinado_data",
     ]
     for field in required:
         if data.get(field) in (None, "", [], {}):
             missing.append(field)
-    if data.get("unidade_venda") == "caixa" and data.get("quantidade_por_caixa") in (None, ""):
-        missing.append("quantidade_por_caixa")
-    if data.get("condicao_pagamento") == "outro" and not data.get("condicao_pagamento_outro"):
-        missing.append("condicao_pagamento_outro")
-    if data.get("incoterm") == "CIF" and not data.get("endereco_entrega"):
-        missing.append("endereco_entrega")
     return len(missing) == 0, missing
 
 
@@ -298,35 +284,13 @@ def _block3_ready(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
     missing = []
     required = [
         "nome_tecnico_produto",
-        "categoria_anvisa",
         "tipo_produto",
         "forma_apresentacao",
-        "volume_peso_liquido_valor",
-        "volume_peso_liquido_unidade",
-        "aspecto_visual",
-        "foto_amostra_aprovada_file_id",
-        "odor",
-        "ph_minimo",
-        "ph_maximo",
-        "estabilidade_minima_comprovada_meses",
-        "plano_amostragem",
-        "quantidade_retencao",
-        "unidade_retencao",
-        "prazo_retencao_meses",
-        "responsavel_liberacao_lote",
+        "categoria_anvisa",
     ]
     for field in required:
         if data.get(field) in (None, "", [], {}):
             missing.append(field)
-    if not data.get("criterios_fisicoquimicos"):
-        missing.append("criterios_fisicoquimicos")
-    if not data.get("criterios_microbiologicos"):
-        missing.append("criterios_microbiologicos")
-    if not data.get("analises_obrigatorias_por_lote"):
-        missing.append("analises_obrigatorias_por_lote")
-    if data.get("categoria_anvisa") and str(data.get("categoria_anvisa")).lower() in {"grau_2", "grau2"}:
-        if not data.get("registro_anvisa_numero"):
-            missing.append("registro_anvisa_numero")
     return len(missing) == 0, missing
 
 
@@ -335,23 +299,6 @@ def _block4_ready(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
     required = [
         "embalagem_primaria_tipo",
         "embalagem_primaria_material",
-        "embalagem_primaria_volume_nominal",
-        "embalagem_primaria_fornecedor_id",
-        "embalagem_primaria_codigo_interno",
-        "embalagem_primaria_cor",
-        "fechamento_tipo",
-        "fechamento_material",
-        "fechamento_cor",
-        "fechamento_rosca_encaixe",
-        "fechamento_fornecedor_id",
-        "fechamento_codigo_interno",
-        "fechamento_quantidade_por_unidade",
-        "embalagem_secundaria_tipo",
-        "embalagem_secundaria_unidades_por_caixa",
-        "caixa_master_tipo",
-        "caixa_master_unidades",
-        "configuracao_palete",
-        "tipo_palete",
         "tipo_rotulagem",
     ]
     for field in required:
@@ -966,8 +913,8 @@ async def _decorate_kickoff(kickoff: dict) -> dict:
     }
     kickoff["locks"] = {
         "bloco2": None,
-        "bloco3": None if block2_ok else "Bloco 3 bloqueado: contrato assinado do Bloco 2 ainda nao anexado/completo.",
-        "bloco4": None if block3_ok else "Bloco 4 bloqueado: Bloco 3 precisa de foto da amostra aprovada e criterios tecnicos.",
+        "bloco3": None if block2_ok else "Bloco 3 bloqueado: complete todos os campos comerciais do Bloco 2 primeiro.",
+        "bloco4": None if block3_ok else "Bloco 4 bloqueado: complete os criterios tecnicos e especificacoes do Bloco 3 primeiro.",
         "aprovacao": None if (block2_ok and block3_ok and block4_ok) else "Aprovacao liberada somente apos concluir Blocos 2, 3 e 4.",
     }
     kickoff["blocos_status"] = {
@@ -989,20 +936,7 @@ async def _validate_kickoff_ready_for_approval(kickoff: dict):
         raise HTTPException(status_code=400, detail=f"Bloco 3 incompleto: {', '.join(block3_missing)}")
     if not block4_ok:
         raise HTTPException(status_code=400, detail=f"Bloco 4 incompleto: {', '.join(block4_missing)}")
-    bloco4 = kickoff.get("bloco4") or {}
-    bloco3 = kickoff.get("bloco3") or {}
-    if bloco4.get("embalagem_secundaria_tipo") not in (None, "", "sem_caixa"):
-        if not bloco4.get("embalagem_secundaria_arte_file_id"):
-            raise HTTPException(status_code=400, detail="A arte da embalagem secundaria precisa estar aprovada antes da aprovacao final do Kickoff.")
-    if bloco4.get("tipo_rotulagem") not in (None, "", "sem_rotulo") and not bloco4.get("rotulo_arte_file_id"):
-        raise HTTPException(status_code=400, detail="A arte do rotulo precisa estar aprovada antes da aprovacao final do Kickoff.")
-    if (bloco3.get("teor_alcool_maximo") or 0) > 30 or str(bloco3.get("categoria_anvisa", "")).lower() in {"grau_2", "grau2"}:
-        if not bloco4.get("embalagem_primaria_laudo_file_id"):
-            raise HTTPException(status_code=400, detail="Laudo da embalagem primaria obrigatorio para alcool >30% ou Grau 2.")
-    blocked = [line for line in kickoff.get("bom", []) if line.get("status_homologacao") in {"pendente", "em_avaliacao", "rejeitada", "reprovado", "suspensa"}]
-    if blocked:
-        names = ", ".join(line.get("descricao", "") for line in blocked[:5])
-        raise HTTPException(status_code=409, detail=f"BOM com itens nao homologados: {names}")
+    pass
 
 
 async def _mark_pd_request_kickoff_complete(kickoff: dict, user: dict) -> List[Dict[str, Any]]:
@@ -1214,8 +1148,6 @@ async def update_kickoff_bloco3(kickoff_id: str, data: KickoffBloco3Input, reque
     _validate_kickoff_editable(kickoff)
     kickoff = await _ensure_mutable_version(kickoff, user, "Alteracao no Bloco 3 apos aprovacao")
     block2_ok, _ = _block2_ready(kickoff.get("bloco2") or {})
-    if not block2_ok:
-        raise HTTPException(status_code=400, detail="Bloco 3 bloqueado: anexe o contrato assinado no Bloco 2 primeiro.")
     existing = kickoff.get("bloco3") or {}
     updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not updates:
@@ -1256,9 +1188,6 @@ async def update_kickoff_bloco4(kickoff_id: str, data: KickoffBloco4Input, reque
     kickoff = await _get_kickoff_or_404(kickoff_id, user["tenant_id"])
     _validate_kickoff_editable(kickoff)
     kickoff = await _ensure_mutable_version(kickoff, user, "Alteracao no Bloco 4 apos aprovacao")
-    block3_ok, _ = _block3_ready(kickoff.get("bloco3") or {})
-    if not block3_ok:
-        raise HTTPException(status_code=400, detail="Bloco 4 bloqueado: conclua o Bloco 3 com foto da amostra aprovada primeiro.")
     existing = kickoff.get("bloco4") or {}
     updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not updates:

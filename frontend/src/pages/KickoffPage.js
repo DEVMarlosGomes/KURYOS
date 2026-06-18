@@ -77,6 +77,7 @@ export default function KickoffPage() {
   const [block4, setBlock4] = useState({});
   const [approvalNotes, setApprovalNotes] = useState("");
   const [approvalReason, setApprovalReason] = useState("");
+  const [activeTab, setActiveTab] = useState("bloco1");
 
   const loadKickoff = async () => {
     setLoading(true);
@@ -104,12 +105,18 @@ export default function KickoffPage() {
     return (APPROVAL_ROLES[currentApproval.etapa] || []).includes(user.role) || user.role === "admin";
   }, [currentApproval, user]);
 
-  const saveBlock = async (endpoint, payloadBuilder) => {
+  const saveBlock = async (endpoint, payloadBuilder, nextTab) => {
     setSaving(true);
     try {
-      await api.put(endpoint, payloadBuilder());
+      const { data } = await api.put(endpoint, payloadBuilder());
       toast.success("Kickoff atualizado.");
-      await loadKickoff();
+      setKickoff(data);
+      setBlock2(data.bloco2 || {});
+      setBlock3(normalizeBlock3(data));
+      setBlock4(normalizeBlock4(data));
+      if (nextTab && !data.locks?.[nextTab]) {
+        setActiveTab(nextTab);
+      }
     } catch (error) {
       toast.error(formatApiError(error));
     } finally {
@@ -189,7 +196,7 @@ export default function KickoffPage() {
         </CardContent>
       </Card>
 
-      <Tabs defaultValue="bloco1" className="space-y-4">
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
         <TabsList className="grid w-full grid-cols-5">
           <TabsTrigger value="bloco1">Bloco 1</TabsTrigger>
           <TabsTrigger value="bloco2">Bloco 2</TabsTrigger>
@@ -242,7 +249,7 @@ export default function KickoffPage() {
               <div><Label>Numero pedido cliente</Label><Input value={block2.numero_pedido_cliente || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, numero_pedido_cliente: e.target.value }))} /></div>
               <div className="md:col-span-2"><Label>Observacoes comerciais</Label><Textarea value={block2.observacoes_comerciais || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, observacoes_comerciais: e.target.value }))} /></div>
             </div>
-            <Button disabled={saving} onClick={() => saveBlock(`/kickoff/${id}/bloco2`, () => block2)}>Salvar Bloco 2</Button>
+            <Button disabled={saving} onClick={() => saveBlock(`/kickoff/${id}/bloco2`, () => block2, "bloco3")}>Salvar Bloco 2</Button>
           </CardContent></Card>
         </TabsContent>
 
@@ -280,7 +287,7 @@ export default function KickoffPage() {
                 criterios_fisicoquimicos: safeJsonParse(block3.criterios_fisicoquimicos || "[]", []),
                 criterios_microbiologicos: safeJsonParse(block3.criterios_microbiologicos || "[]", []),
                 analises_obrigatorias_por_lote: safeJsonParse(block3.analises_obrigatorias_por_lote || "[]", []),
-              }))}
+              }), "bloco4")}
             >
               Salvar Bloco 3
             </Button>
@@ -315,7 +322,7 @@ export default function KickoffPage() {
                 onClick={() => saveBlock(`/kickoff/${id}/bloco4`, () => ({
                   ...block4,
                   rotulo_informacoes_obrigatorias_checklist: safeJsonParse(block4.rotulo_informacoes_obrigatorias_checklist || "{}", {}),
-                }))}
+                }), "aprovacao")}
               >
                 Salvar Bloco 4
               </Button>

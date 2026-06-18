@@ -1239,13 +1239,20 @@ async def delete_pd_request(req_id: str, request: Request):
 @pd_router.put("/requests/{req_id}/status")
 async def transition_status(req_id: str, data: StatusTransition, request: Request):
     user = await get_current_user(request)
-    require_roles(user, PD_FULL)
     pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    
+
     current = pd_req["status"]
     new_status = data.new_status
+
+    # Aprovação/rejeição comercial: roles comerciais podem agir somente nessa transição
+    COMERCIAL_FULL = {"admin", "vendedor", "sales_ops", "sucesso_cliente"}
+    is_comercial_action = current == "WAITING_APPROVAL" and new_status in ("APPROVED", "REJECTED")
+    if is_comercial_action:
+        require_roles(user, PD_FULL | COMERCIAL_FULL)
+    else:
+        require_roles(user, PD_FULL)
     
     if new_status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido: {new_status}")
@@ -1298,7 +1305,7 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             titles = " | ".join(t.get("title", "") for t in blocking[:3])
             raise HTTPException(status_code=409, detail=f"Existem tarefas bloqueantes pendentes: {titles}")
 
-    # Check approval requirements for APPROVED status
+    # Check / auto-register approval for APPROVED status
     if new_status == "APPROVED":
         dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
         if dev:
@@ -1306,19 +1313,55 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             failed_tests = [t for t in tests if t["status"] == "FAILED"]
             if failed_tests:
                 raise HTTPException(status_code=400, detail="Existem testes com falha. Corrija antes de aprovar.")
+
             approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
-            if not approval:
-                raise HTTPException(status_code=400, detail="Registre uma aprovação antes de mover para APROVADO.")
-            if not approval.get("approved_by_internal"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Aprovação interna pendente. O líder de P&D deve aprovar internamente antes de marcar como APROVADO.",
-                )
-            if not approval.get("approved_by_client"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Aprovação do cliente pendente. Registre a confirmação do cliente antes de marcar como APROVADO.",
-                )
+
+            if is_comercial_action:
+                # Comercial clicking "Aprovar" IS the approval — upsert the record automatically
+                now = now_iso()
+                if approval:
+                    await db.pd_approvals.update_one(
+                        {"development_id": dev["id"]},
+                        {"$set": {
+                            "approved_by_internal": True,
+                            "approved_by_client": True,
+                            "approved_by_comercial": True,
+                            "approved_by_comercial_id": user["id"],
+                            "approved_by_comercial_name": user.get("name", ""),
+                            "approved_at": now,
+                            "updated_at": now,
+                        }}
+                    )
+                else:
+                    await db.pd_approvals.insert_one({
+                        "id": new_id(),
+                        "development_id": dev["id"],
+                        "pd_request_id": req_id,
+                        "tenant_id": user["tenant_id"],
+                        "approved_by_internal": True,
+                        "approved_by_client": True,
+                        "approved_by_comercial": True,
+                        "approved_by_comercial_id": user["id"],
+                        "approved_by_comercial_name": user.get("name", ""),
+                        "notes": f"Aprovado comercialmente por {user.get('name', '')}",
+                        "approved_at": now,
+                        "created_at": now,
+                        "updated_at": now,
+                    })
+            else:
+                # P&D team approval — enforce existing checklist
+                if not approval:
+                    raise HTTPException(status_code=400, detail="Registre uma aprovação antes de mover para APROVADO.")
+                if not approval.get("approved_by_internal"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Aprovação interna pendente. O líder de P&D deve aprovar internamente antes de marcar como APROVADO.",
+                    )
+                if not approval.get("approved_by_client"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Aprovação do cliente pendente. Registre a confirmação do cliente antes de marcar como APROVADO.",
+                    )
     
     await db.pd_requests.update_one(
         {"id": req_id},

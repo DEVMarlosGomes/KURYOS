@@ -1614,43 +1614,29 @@ async def erp_overview(request: Request):
     """Aggregated KPIs from all ERP modules for the global dashboard."""
     user = await get_current_user(request)
     tid = user["tenant_id"]
+    now = now_iso()
 
     import asyncio
     (
-        # CRM
-        total_clientes,
-        clientes_ativos,
-        total_projetos,
-        projetos_ativos,
-        total_amostras,
-        amostras_andamento,
-        # P&D
-        pd_total,
-        pd_open,
-        pd_in_progress,
-        pd_in_tests,
-        pd_waiting,
-        pd_approved,
-        pd_completed,
-        total_formulas,
-        # CQ
-        ras_pendentes,
-        rncs_abertas,
-        retencoes_ativas,
-        # Compras
-        fornecedores_homologados,
-        pos_abertas,
-        # Pedidos
-        pedidos_abertos,
-        # Tarefas
-        tasks_pendentes,
-        tasks_atrasadas,
+        total_clientes, clientes_ativos, total_projetos, projetos_ativos,
+        projetos_pedido_aprovado, total_amostras, amostras_andamento,
+        pd_total, pd_open, pd_in_progress, pd_in_tests, pd_waiting,
+        pd_approved, pd_completed, total_formulas,
+        kickoffs_preenchimento, kickoffs_aguardando, kickoffs_aprovados,
+        ras_pendentes, ras_aprovadas, rncs_abertas, retencoes_ativas, checklists_pendentes,
+        fornecedores_homologados, fornecedores_em_avaliacao, pos_abertas, pos_atrasadas,
+        pedidos_abertos, pedidos_em_producao,
+        dup_abertas, dup_vencidas,
+        nfs_rascunho, recebimento_pendentes,
+        contratos_total,
+        wf_tasks_pendentes, wf_tasks_atrasadas,
     ) = await asyncio.gather(
         # CRM
         db.crm_clients.count_documents({"tenant_id": tid}),
         db.crm_clients.count_documents({"tenant_id": tid, "stage": {"$nin": ["cliente_perdido"]}}),
         db.crm_projects.count_documents({"tenant_id": tid}),
         db.crm_projects.count_documents({"tenant_id": tid, "stage": {"$nin": ["projeto_arquivado", "projeto_cancelado"]}}),
+        db.crm_projects.count_documents({"tenant_id": tid, "stage": "pedido_aprovado"}),
         db.crm_samples.count_documents({"tenant_id": tid}),
         db.crm_samples.count_documents({"tenant_id": tid, "stage": {"$in": ["solicitada", "em_elaboracao", "retrabalho", "enviada"]}}),
         # P&D
@@ -1662,19 +1648,47 @@ async def erp_overview(request: Request):
         db.pd_requests.count_documents({"tenant_id": tid, "status": "APPROVED"}),
         db.pd_requests.count_documents({"tenant_id": tid, "status": "COMPLETED"}),
         db.pd_formulas.count_documents({"tenant_id": tid}),
+        # Kickoffs
+        db.kickoffs.count_documents({"tenant_id": tid, "status": "em_preenchimento"}),
+        db.kickoffs.count_documents({"tenant_id": tid, "status": "aguardando_aprovacao"}),
+        db.kickoffs.count_documents({"tenant_id": tid, "status": "aprovado"}),
         # CQ
         db.cq_registros_analise.count_documents({"tenant_id": tid, "status": {"$in": ["rascunho", "em_analise"]}}),
+        db.cq_registros_analise.count_documents({"tenant_id": tid, "status": "aprovado"}),
         db.cq_rncs.count_documents({"tenant_id": tid, "status": {"$in": ["aberta", "em_tratamento"]}}),
         db.cq_retencoes.count_documents({"tenant_id": tid, "status": "em_guarda"}),
+        db.cq_checklists.count_documents({"tenant_id": tid, "status": {"$in": ["pendente", "em_andamento"]}}),
         # Compras
         db.compras_fornecedores.count_documents({"tenant_id": tid, "homologacao.status": "homologado"}),
+        db.compras_fornecedores.count_documents({"tenant_id": tid, "homologacao.status": "em_avaliacao"}),
         db.compras_pos.count_documents({"tenant_id": tid, "status": {"$in": ["emitida", "confirmada"]}}),
+        db.compras_pos.count_documents({"tenant_id": tid, "status": {"$in": ["emitida", "confirmada"]}, "data_entrega_prevista": {"$lt": now}}),
         # Pedidos
         db.orders.count_documents({"tenant_id": tid, "status": {"$in": ["rascunho", "aprovado", "em_producao"]}}),
-        # Tarefas
-        db.tasks.count_documents({"tenant_id": tid, "status": "pendente"}),
-        db.tasks.count_documents({"tenant_id": tid, "status": "pendente", "due_date": {"$lt": now_iso()}}),
+        db.orders.count_documents({"tenant_id": tid, "status": "em_producao"}),
+        # Faturamento
+        db.faturamento_duplicatas.count_documents({"tenant_id": tid, "status": "aberta"}),
+        db.faturamento_duplicatas.count_documents({"tenant_id": tid, "status": "vencida"}),
+        db.faturamento_notas.count_documents({"tenant_id": tid, "status": "rascunho"}),
+        # Recebimento
+        db.recebimento_notas.count_documents({"tenant_id": tid, "status": {"$in": ["pendente", "em_conferencia"]}}),
+        # Contratos
+        db.contratos.count_documents({"tenant_id": tid}),
+        # Workflow tasks
+        db.workflow_tasks.count_documents({"tenant_id": tid, "status": {"$in": ["pendente", "em_andamento", "em_atraso"]}}),
+        db.workflow_tasks.count_documents({"tenant_id": tid, "status": "em_atraso"}),
     )
+
+    # Faturamento financial aggregations
+    dup_agg = await db.faturamento_duplicatas.aggregate([
+        {"$match": {"tenant_id": tid, "status": {"$in": ["aberta", "vencida"]}}},
+        {"$group": {"_id": None,
+            "total_em_aberto": {"$sum": "$valor"},
+            "total_vencido": {"$sum": {"$cond": [{"$eq": ["$status", "vencida"]}, "$valor", 0]}},
+        }},
+    ]).to_list(1)
+    fat_em_aberto = round((dup_agg[0]["total_em_aberto"] if dup_agg else 0), 2)
+    fat_vencido = round((dup_agg[0]["total_vencido"] if dup_agg else 0), 2)
 
     return {
         "crm": {
@@ -1682,6 +1696,7 @@ async def erp_overview(request: Request):
             "clientes_ativos": clientes_ativos,
             "total_projetos": total_projetos,
             "projetos_ativos": projetos_ativos,
+            "projetos_pedido_aprovado": projetos_pedido_aprovado,
             "total_amostras": total_amostras,
             "amostras_andamento": amostras_andamento,
         },
@@ -1694,22 +1709,47 @@ async def erp_overview(request: Request):
             "approved": pd_approved,
             "completed": pd_completed,
             "formulas": total_formulas,
+            "ativos": pd_in_progress + pd_in_tests + pd_waiting,
+        },
+        "kickoffs": {
+            "em_preenchimento": kickoffs_preenchimento,
+            "aguardando_aprovacao": kickoffs_aguardando,
+            "aprovados": kickoffs_aprovados,
+            "total": kickoffs_preenchimento + kickoffs_aguardando + kickoffs_aprovados,
         },
         "cq": {
             "ras_pendentes": ras_pendentes,
+            "ras_aprovadas": ras_aprovadas,
             "rncs_abertas": rncs_abertas,
             "retencoes_ativas": retencoes_ativas,
+            "checklists_pendentes": checklists_pendentes,
         },
         "compras": {
             "fornecedores_homologados": fornecedores_homologados,
+            "fornecedores_em_avaliacao": fornecedores_em_avaliacao,
             "pos_abertas": pos_abertas,
+            "pos_atrasadas": pos_atrasadas,
         },
         "pedidos": {
             "abertos": pedidos_abertos,
+            "em_producao": pedidos_em_producao,
+        },
+        "faturamento": {
+            "duplicatas_abertas": dup_abertas,
+            "duplicatas_vencidas": dup_vencidas,
+            "nfs_rascunho": nfs_rascunho,
+            "total_em_aberto": fat_em_aberto,
+            "total_vencido": fat_vencido,
+        },
+        "recebimento": {
+            "pendentes": recebimento_pendentes,
+        },
+        "contratos": {
+            "total": contratos_total,
         },
         "tasks": {
-            "pendentes": tasks_pendentes,
-            "atrasadas": tasks_atrasadas,
+            "pendentes": wf_tasks_pendentes,
+            "atrasadas": wf_tasks_atrasadas,
         },
     }
 

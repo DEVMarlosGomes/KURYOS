@@ -44,8 +44,8 @@ function GenerateDialog({ open, onClose, onGenerated }) {
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    api.get("/compras/boms").then(({ data }) => {
-      setKickoffs(data.boms || []);
+    api.get("/kickoffs?status=aprovado").then(({ data }) => {
+      setKickoffs(Array.isArray(data) ? data : []);
     }).catch(() => toast.error("Erro ao carregar kickoffs aprovados"))
     .finally(() => setLoading(false));
   }, [open]);
@@ -74,7 +74,7 @@ function GenerateDialog({ open, onClose, onGenerated }) {
     setOverrides({ inscricao_estadual: "", endereco_completo: "", representante_nome: "", representante_cpf: "", representante_rg: "", representante_cargo: "" });
   };
 
-  const selectedData = kickoffs.find(k => k.kickoff_id === selectedKickoff);
+  const selectedData = kickoffs.find(k => k.id === selectedKickoff);
 
   return (
     <Dialog open={open} onOpenChange={o => { if (!o) { reset(); onClose(); } }}>
@@ -102,15 +102,15 @@ function GenerateDialog({ open, onClose, onGenerated }) {
                 <SelectContent>
                   {kickoffs.length === 0 && <SelectItem value="__none" disabled>Nenhum Kickoff aprovado</SelectItem>}
                   {kickoffs.map(k => (
-                    <SelectItem key={k.kickoff_id} value={k.kickoff_id}>
-                      {k.numero_kickoff} — {k.cliente || k.projeto_vinculado || k.kickoff_id}
+                    <SelectItem key={k.id} value={k.id}>
+                      {k.numero_kickoff} — {k.bloco1?.cliente || k.bloco1?.projeto_vinculado || k.id}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
               {selectedData && (
                 <div className="mt-1 p-2 bg-muted/40 rounded text-xs space-y-0.5">
-                  <p><span className="text-muted-foreground">Cliente:</span> {selectedData.cliente || "—"}</p>
+                  <p><span className="text-muted-foreground">Cliente:</span> {selectedData.bloco1?.cliente || "—"}</p>
                   <p><span className="text-muted-foreground">Aprovado em:</span> {formatDate(selectedData.approved_at)}</p>
                 </div>
               )}
