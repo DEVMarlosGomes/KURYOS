@@ -78,11 +78,14 @@ async def run(db):
 
         print(f"  Tenant {tenant_id}: inserted {inserted}, skipped {skipped}")
 
-    # Ensure unique index exists
-    await db.categorias.create_index(
-        [("tenant_id", 1), ("cat3", 1)], unique=True, name="tenant_cat3_unique"
-    )
-    print("  Index tenant_cat3 ensured")
+    # Ensure unique index exists (ignore if already created with different name)
+    try:
+        await db.categorias.create_index(
+            [("tenant_id", 1), ("cat3", 1)], unique=True, name="tenant_cat3_unique"
+        )
+        print("  Index tenant_cat3 created")
+    except Exception as e:
+        print(f"  Index tenant_cat3 already exists ({e.__class__.__name__}) — skipping")
     print("=== m002 complete ===")
 
 
