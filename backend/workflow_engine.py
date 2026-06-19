@@ -200,6 +200,37 @@ CAT2_MAP: Dict[str, str] = {
     "profissional / salão": "PS",
 }
 
+# CAT3: 3-letter codes for the new SKU format [CAT3]-[CLI4]-[SEQ4].
+# Kept in sync with db.categorias — this map is a read-through cache for internal use.
+CAT3_MAP: Dict[str, str] = {
+    "capilares": "CAP", "capilar": "CAP",
+    "skin_care": "SKC", "skincare": "SKC", "skin care": "SKC",
+    "dermocosmeticos": "SKC", "dermocosmetico": "SKC", "dermo": "SKC",
+    "higiene_pessoal": "HGP", "higiene pessoal": "HGP", "higiene": "HGP",
+    "perfumaria": "PFM",
+    "maquiagem": "MAQ", "makeup": "MAQ",
+    "corporal": "COR", "spa": "COR", "corporal_spa": "COR", "corporal / spa": "COR",
+    "infantil": "INF",
+    "masculino": "MAS",
+    "profissional": "PRS", "salao": "PRS", "profissional_salao": "PRS",
+    "profissional / salão": "PRS",
+    "body_splash": "BSP", "body splash": "BSP",
+}
+
+# Canonical seed categories (id, cat3, nome) — used by migration m002 and as fallback.
+SEED_CATEGORIAS = [
+    ("CAP", "Capilares"),
+    ("SKC", "Skin Care / Dermocosméticos"),
+    ("HGP", "Higiene Pessoal"),
+    ("PFM", "Perfumaria"),
+    ("MAQ", "Maquiagem"),
+    ("COR", "Corporal / Spa"),
+    ("INF", "Infantil"),
+    ("MAS", "Masculino"),
+    ("PRS", "Profissional / Salão"),
+    ("BSP", "Body Splash"),
+]
+
 
 def cat2_from_categoria(categoria: str) -> str:
     """Return the 2-letter CAT2 code for a product category string."""
@@ -215,6 +246,22 @@ def cat2_from_categoria(categoria: str) -> str:
         if k in key or key in k:
             return v
     return "GE"
+
+
+def cat3_from_categoria(categoria: str) -> str:
+    """Return the 3-letter CAT3 code for a product category string (new SKU format)."""
+    if not categoria:
+        return "GEN"
+    key = categoria.lower().strip()
+    if key in CAT3_MAP:
+        return CAT3_MAP[key]
+    key_norm = key.replace(" ", "_").replace("/", "_").replace("ã", "a").replace("é", "e").replace("ó", "o")
+    if key_norm in CAT3_MAP:
+        return CAT3_MAP[key_norm]
+    for k, v in CAT3_MAP.items():
+        if k in key or key in k:
+            return v
+    return "GEN"
 
 
 def normalise_cli3(raw: str) -> str:
