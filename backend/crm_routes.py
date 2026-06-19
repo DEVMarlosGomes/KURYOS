@@ -32,6 +32,8 @@ from workflow_engine import (
     next_sku_per_pair,
     cat2_from_categoria,
     normalise_cli3,
+    normalise_cli4,
+    suggest_cli4_candidates,
     recalc_sku_averages,
     assert_client_exists,
     assert_project_exists,
@@ -402,8 +404,9 @@ class ClientCreate(BaseModel):
     site: str = ""
     instagram: str = ""
     observacoes: str = ""
-    # SKU identifier (RN-SK-01: obrigatório antes da aprovação do pedido)
+    # SKU identifiers
     cli3: str = ""
+    cli4: str = ""  # R23: 4-letter code — auto-suggested from nome_empresa if empty
 
 
 class ClientUpdate(BaseModel):
@@ -444,6 +447,7 @@ class ClientUpdate(BaseModel):
     observacoes: Optional[str] = None
     ultima_atualizacao_temperatura: Optional[str] = None
     cli3: Optional[str] = None
+    cli4: Optional[str] = None  # R23: frozen after first SKU
 
 class ClientMove(BaseModel):
     stage: str
@@ -659,6 +663,37 @@ def _serialize(doc: dict) -> dict:
 async def _get_next_sample_code(projeto_id: str, tenant_id: str) -> str:
     """Retorna o próximo código de amostra GLOBAL no formato {ANO}-{NNNN} (ERP v3.0)."""
     return await next_sample_code(tenant_id)
+
+
+async def _resolve_cli4(tenant_id: str, requested: str, nome_empresa: str) -> str:
+    """
+    Return the CLI4 to use for a new client.
+    - If `requested` is provided and unique: use it.
+    - If `requested` is empty: auto-suggest from `nome_empresa`.
+    - Raises HTTPException 409 if the requested code conflicts.
+    """
+    if requested:
+        code = normalise_cli4(requested)
+        conflict = await db.crm_clients.find_one(
+            {"tenant_id": tenant_id, "cli4": code}, {"_id": 0, "nome_empresa": 1}
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"CLI4 '{code}' já está em uso pelo cliente '{conflict['nome_empresa']}'"
+            )
+        return code
+
+    # Auto-suggest from name
+    candidates = suggest_cli4_candidates(nome_empresa)
+    for code in candidates:
+        conflict = await db.crm_clients.find_one(
+            {"tenant_id": tenant_id, "cli4": code}, {"_id": 0}
+        )
+        if not conflict:
+            return code
+    # Fallback: first candidate even if occupied (caller can update later)
+    return candidates[0] if candidates else normalise_cli4(nome_empresa)
 
 LEGACY_PROJECT_STAGE_ALIASES = {
     "amostras": "amostra_solicitada",
@@ -1134,6 +1169,28 @@ def _validate_project_transition_requirements(project: dict, target_stage: str):
 #  CRM 1 — CLIENTS (Pipeline Comercial)
 # ======================================================================
 
+@crm_router.get("/clients/suggest-cli4")
+async def suggest_cli4_endpoint(nome: str, request: Request):
+    """
+    R23: Retorna sugestões de CLI4 (4 letras) para um nome de empresa,
+    indicando disponibilidade de cada código.
+    """
+    user = await _get_current_user(request)
+    candidates = suggest_cli4_candidates(nome)
+    result = []
+    for code in candidates[:6]:
+        conflict = await db.crm_clients.find_one(
+            {"tenant_id": user["tenant_id"], "cli4": code},
+            {"_id": 0, "nome_empresa": 1},
+        )
+        result.append({
+            "cli4": code,
+            "disponivel": conflict is None,
+            "ocupado_por": conflict["nome_empresa"] if conflict else None,
+        })
+    return {"sugestoes": result}
+
+
 @crm_router.post("/clients")
 async def create_client(data: ClientCreate, request: Request):
     user = await _get_current_user(request)
@@ -1187,6 +1244,8 @@ async def create_client(data: ClientCreate, request: Request):
         "instagram": create_payload["instagram"],
         "observacoes": create_payload["observacoes"],
         "cli3": normalise_cli3(data.cli3 or ""),
+        "cli4": await _resolve_cli4(user["tenant_id"], data.cli4, data.nome_empresa),
+        "cli4_congelado": False,
         "has_grau2_anvisa": create_payload.get("has_grau2_anvisa", False),
         "ultima_atualizacao_temperatura": now,
         # Qualificado fields (empty initially)
@@ -1317,6 +1376,25 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
         if letters and len(letters) < 3:
             raise HTTPException(status_code=400, detail=f"cli3 deve ter 3 letras (ex: 'ABC'). Recebido: '{raw}'")
         update_fields["cli3"] = letters or ""
+
+    # R23: cli4 freeze — not editable after first SKU
+    if "cli4" in update_fields:
+        if existing.get("cli4_congelado"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"CLI4 '{existing.get('cli4')}' está congelado — já existe SKU gerado para este cliente e o código não pode mais ser alterado"
+            )
+        new_cli4 = normalise_cli4(str(update_fields["cli4"] or ""))
+        conflict = await db.crm_clients.find_one(
+            {"tenant_id": user["tenant_id"], "cli4": new_cli4, "id": {"$ne": client_id}},
+            {"_id": 0, "nome_empresa": 1},
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"CLI4 '{new_cli4}' já está em uso pelo cliente '{conflict['nome_empresa']}'"
+            )
+        update_fields["cli4"] = new_cli4
 
     payload = dict(existing)
     payload.update(update_fields)
@@ -3796,6 +3874,13 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
 
     await db.skus.insert_one(sku)
     sku.pop("_id", None)
+
+    # R23: freeze cli4 after first SKU
+    if client and not client.get("cli4_congelado"):
+        await db.crm_clients.update_one(
+            {"id": sample["cliente_id"], "tenant_id": tenant_id},
+            {"$set": {"cli4_congelado": True, "updated_at": now}},
+        )
 
     logger.info(f"Auto-created SKU {codigo} from sample {sample['id']}")
     return sku

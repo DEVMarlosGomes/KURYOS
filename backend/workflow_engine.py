@@ -270,6 +270,41 @@ def normalise_cli3(raw: str) -> str:
     return letters.ljust(3, "X") if letters else "GEN"
 
 
+def normalise_cli4(raw: str) -> str:
+    """Return exactly 4 uppercase alpha chars from raw string, padded with 'X' if needed."""
+    letters = "".join(c for c in (raw or "").upper() if c.isalpha())[:4]
+    return letters.ljust(4, "X") if letters else "GENX"
+
+
+def suggest_cli4_candidates(nome: str) -> List[str]:
+    """Return ordered list of CLI4 candidates for a company name, deduplicated."""
+    nome_up = (nome or "").upper()
+    words = nome_up.split()
+    word_letters = ["".join(c for c in w if c.isalpha()) for w in words if any(c.isalpha() for c in w)]
+    all_letters = "".join(word_letters)
+
+    candidates: List[str] = []
+    if all_letters:
+        candidates.append(all_letters[:4].ljust(4, "X"))
+    if len(word_letters) >= 2 and len(word_letters[0]) >= 3:
+        candidates.append((word_letters[0][:3] + word_letters[1][0]).ljust(4, "X"))
+    if len(word_letters) >= 2:
+        candidates.append((word_letters[0][:2] + word_letters[1][:2]).ljust(4, "X"))
+    initials = "".join(w[0] for w in word_letters if w)
+    if len(initials) >= 2:
+        candidates.append(initials[:4].ljust(4, "X"))
+    for start in range(1, max(0, len(all_letters) - 3)):
+        candidates.append(all_letters[start : start + 4].ljust(4, "X"))
+
+    seen: set = set()
+    result: List[str] = []
+    for c in candidates:
+        if c not in seen and len(c) == 4 and c.isalpha():
+            seen.add(c)
+            result.append(c)
+    return result
+
+
 async def next_sku_per_pair(tenant_id: str, cat2: str, cli3: str) -> int:
     """Atomic counter per (tenant, cat2, cli3) pair — returns 1-based integer."""
     key = f"sku_{cat2}_{cli3}"
