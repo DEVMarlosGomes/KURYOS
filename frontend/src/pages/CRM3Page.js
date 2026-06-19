@@ -951,12 +951,13 @@ export default function CRM3Page() {
                     <div className="flex-1 overflow-y-auto space-y-3 p-1">
                         {newVariacoes.map((v, idx) => {
                             const existingCount = selectedSample?.variacoes?.length || 0;
-                            const nextLetter = String.fromCharCode(65 + existingCount + idx);
+                            const intToLetters = (n) => { let r = ''; while (n >= 0) { r = String.fromCharCode(97 + (n % 26)) + r; n = Math.floor(n / 26) - 1; } return r; };
+                            const nextLetter = intToLetters(existingCount + idx);
                             return (
                                 <div key={idx} className="border border-border rounded-lg p-3 space-y-3 bg-muted/20">
                                     <div className="flex items-center justify-between">
                                         <h4 className="text-sm font-semibold">
-                                            Variação {selectedSample?.numero_amostra}/{nextLetter}
+                                            Variação {selectedSample?.numero_amostra}-{nextLetter}
                                         </h4>
                                         {newVariacoes.length > 1 && (
                                             <Button

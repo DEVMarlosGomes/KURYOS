@@ -5973,7 +5973,7 @@ async def generate_sample_label(variacao_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Variação não encontrada")
 
     # Build label data
-    numero_amostra = f"{sample.get('numero_amostra', '?')}/{variacao.get('letra', 'A')}"
+    numero_amostra = variacao.get("codigo") or f"{sample.get('numero_amostra', '?')}-{variacao.get('letra', 'a')}"
     nome_produto = sample.get("nome_produto", "")
     produto_tipo = sample.get("categoria", sample.get("tipo_amostra", ""))
     responsavel = sample.get("responsavel_pd", "")

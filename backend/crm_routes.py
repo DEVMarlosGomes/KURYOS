@@ -26,6 +26,8 @@ from workflow_engine import (
     audit_log,
     create_workflow_task,
     next_sample_number,
+    next_sample_code,
+    int_to_letters,
     next_sku_number,
     next_sku_per_pair,
     cat2_from_categoria,
@@ -654,18 +656,9 @@ def _serialize(doc: dict) -> dict:
         doc.pop("_id", None)
     return doc
 
-async def _get_next_sample_number(projeto_id: str, tenant_id: str) -> int:
-    """Retorna o próximo número de amostra GLOBAL do tenant (ERP v3.0).
-    Mantém compat de assinatura: aceita projeto_id mas ignora — numeração é global."""
-    return await next_sample_number(tenant_id)
-
-def _generate_variacao_letra(index: int) -> str:
-    """Gera letra da variação (A, B, C, ..., Z, AA, AB, ...)"""
-    result = ""
-    while index >= 0:
-        result = chr(65 + (index % 26)) + result
-        index = index // 26 - 1
-    return result
+async def _get_next_sample_code(projeto_id: str, tenant_id: str) -> str:
+    """Retorna o próximo código de amostra GLOBAL no formato {ANO}-{NNNN} (ERP v3.0)."""
+    return await next_sample_code(tenant_id)
 
 LEGACY_PROJECT_STAGE_ALIASES = {
     "amostras": "amostra_solicitada",
@@ -2136,16 +2129,16 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
 
     for item in data.samples:
         # ERP v3.0: numeração GLOBAL sequencial (counter atômico no tenant)
-        numero_amostra = await _get_next_sample_number(data.projeto_id, user["tenant_id"])
-        
+        numero_amostra = await _get_next_sample_code(data.projeto_id, user["tenant_id"])
+
         # Criar amostra pai
         sample_id = _new_id()
-        
+
         # Criar variações
         variacoes_data = []
         for idx, var in enumerate(item.variacoes):
-            letra = _generate_variacao_letra(idx)
-            codigo = f"{numero_amostra}/{letra}"
+            letra = int_to_letters(idx)
+            codigo = f"{numero_amostra}-{letra}"
             variacao_id = _new_id()
             
             variacao = {
@@ -2183,8 +2176,8 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
         
         # Se não houver variações, criar uma padrão
         if not variacoes_data:
-            letra = "A"
-            codigo = f"{numero_amostra}/{letra}"
+            letra = "a"
+            codigo = f"{numero_amostra}-{letra}"
             variacao_id = _new_id()
             variacao = {
                 "id": variacao_id,
@@ -2924,7 +2917,7 @@ async def create_rework_sample(sample_id: str, data: SampleReworkInput, request:
     project = await assert_project_exists(user["tenant_id"], original["projeto_id"])
 
     now = _now_iso()
-    novo_numero = await next_sample_number(user["tenant_id"])
+    novo_numero = await next_sample_code(user["tenant_id"])
 
     # Determinar variação base para herança (se especificada)
     base_variacao = None
@@ -2933,11 +2926,11 @@ async def create_rework_sample(sample_id: str, data: SampleReworkInput, request:
             (v for v in original.get("variacoes", []) if v["id"] == data.variacao_id), None
         )
 
-    nova_letra = "A"
+    nova_letra = "a"
     nova_var_id = _new_id()
     nova_variacao = {
         "id": nova_var_id,
-        "codigo": f"{novo_numero}/{nova_letra}",
+        "codigo": f"{novo_numero}-{nova_letra}",
         "letra": nova_letra,
         "descricao_aplicacao": (base_variacao or {}).get("descricao_aplicacao", ""),
         "percentual_fragrancia": (base_variacao or {}).get("percentual_fragrancia"),
@@ -3616,8 +3609,8 @@ async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, req
     new_variacoes = []
     for offset, var in enumerate(data.variacoes):
         idx = start_index + offset
-        letra = _generate_variacao_letra(idx)
-        codigo = f"{numero_amostra}/{letra}"
+        letra = int_to_letters(idx)
+        codigo = f"{numero_amostra}-{letra}"
         variacao_id = _new_id()
         variacao = {
             "id": variacao_id,

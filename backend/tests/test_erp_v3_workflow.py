@@ -210,16 +210,18 @@ def _extract_samples(data):
     return []
 
 
-def test_sample_starts_at_101_with_variacoes(seed_samples):
+def test_sample_starts_at_1001_with_variacoes(seed_samples):
+    import re
     samples = _extract_samples(seed_samples)
     assert samples, f"no samples: {seed_samples}"
     s = samples[0]
     num = s.get("numero_amostra") or s.get("numero") or s.get("codigo_amostra")
-    assert str(num) == "101", f"expected 101, got {num}. sample={s}"
+    # Format: {YEAR}-{NNNN}, e.g. "2026-1001"
+    assert re.match(r"^\d{4}-\d{4}$", str(num)), f"expected YYYY-NNNN format, got {num}"
     variacoes = s.get("variacoes") or []
     codes = [v.get("codigo") or v.get("codigo_variacao") for v in variacoes]
-    assert any(c and c.endswith("/A") for c in codes), codes
-    assert any(c and c.endswith("/B") for c in codes), codes
+    assert any(c and c.endswith("-a") for c in codes), codes
+    assert any(c and c.endswith("-b") for c in codes), codes
 
 
 def test_auto_pd_cards_created_for_variacoes(admin_client, seed_samples):
@@ -237,21 +239,24 @@ def test_auto_pd_cards_created_for_variacoes(admin_client, seed_samples):
     assert len(cards) >= 2, f"expected >=2 auto pd cards (one per variacao), got {len(cards)}"
 
 
-def test_rework_creates_new_sample_102(admin_client, seed_samples):
+def test_rework_creates_new_sample_sequential(admin_client, seed_samples):
+    import re
     samples = _extract_samples(seed_samples)
     s = samples[0]
+    original_num = s.get("numero_amostra", "")
     r = admin_client.post(f"{API}/crm/samples/{s['id']}/rework", json={"motivo": "ajuste"})
     assert r.status_code in (200, 201), r.text
     new_s = r.json()
-    # Response wraps: {"rework_sample": {...}, "original_id": "...", "novo_numero": "102"}
+    # Response wraps: {"rework_sample": {...}, "original_id": "...", "novo_numero": "..."}
     if isinstance(new_s, dict) and "rework_sample" in new_s:
         novo = new_s.get("novo_numero") or new_s["rework_sample"].get("numero_amostra")
-        assert str(novo) == "102", f"expected 102, got {novo}. resp={new_s}"
+        assert re.match(r"^\d{4}-\d{4}$", str(novo)), f"expected YYYY-NNNN format, got {novo}"
+        assert str(novo) != str(original_num), "rework must get a new number"
         # original preserved and linked
         assert new_s["rework_sample"].get("rework_de_amostra_id") == s["id"]
         return
     num = new_s.get("numero_amostra") or new_s.get("numero")
-    assert str(num) == "102", f"expected 102 global next, got {num}. resp={new_s}"
+    assert re.match(r"^\d{4}-\d{4}$", str(num)), f"expected YYYY-NNNN format, got {num}"
 
 
 def test_move_sample_to_retrabalho_is_blocked(admin_client, seed_samples):

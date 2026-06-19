@@ -157,8 +157,25 @@ async def peek_sequence(tenant_id: str, name: str, start: int = 100) -> int:
 
 
 async def next_sample_number(tenant_id: str) -> int:
-    """Global sample sequential number, starts at 101."""
+    """Global sample sequential number, starts at 101. Legacy — prefer next_sample_code()."""
     return await next_sequence(tenant_id, "sample", start=100)
+
+
+def int_to_letters(n: int) -> str:
+    """Convert 0-based index to lowercase letter suffix: 0→'a', 25→'z', 26→'aa', 51→'az', …"""
+    result = ""
+    while n >= 0:
+        result = chr(ord("a") + (n % 26)) + result
+        n = n // 26 - 1
+    return result
+
+
+async def next_sample_code(tenant_id: str, year: int = None) -> str:
+    """Return next sample base code in format '{YEAR}-{NNNN}', starting at 1001 per year."""
+    if year is None:
+        year = datetime.now(timezone.utc).year
+    seq = await next_sequence(tenant_id, f"sample_seq:{year}", start=1000)
+    return f"{year}-{str(seq).zfill(4)}"
 
 
 async def next_sku_number(tenant_id: str) -> int:

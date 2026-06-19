@@ -597,15 +597,16 @@ class TestSampleCreation:
         samples = _extract_list(r.json())
         assert samples, f"No samples in response"
         s = samples[0]
-        # Must have sequentially-issued numero_amostra ≥ 101
-        num = int(s.get("numero_amostra", 0))
-        assert num >= 101, f"numero_amostra should be >= 101, got {num}"
+        # Must have sequentially-issued numero_amostra in format YYYY-NNNN
+        import re
+        num_str = str(s.get("numero_amostra", ""))
+        assert re.match(r"^\d{4}-\d{4}$", num_str), f"numero_amostra should be YYYY-NNNN, got {num_str}"
         # Variacoes
         variacoes = s.get("variacoes", [])
         assert len(variacoes) >= 2, f"Expected 2 variacoes, got {len(variacoes)}"
         codes = [v.get("codigo", "") for v in variacoes]
-        assert any("/A" in c for c in codes), f"Missing /A variação: {codes}"
-        assert any("/B" in c for c in codes), f"Missing /B variação: {codes}"
+        assert any(c.endswith("-a") for c in codes), f"Missing -a variação: {codes}"
+        assert any(c.endswith("-b") for c in codes), f"Missing -b variação: {codes}"
 
     def test_pd_cards_auto_created(self, admin, project_at_amostras):
         """After sample creation, PD cards must auto-exist (one per variação)."""
@@ -633,9 +634,13 @@ class TestSampleCreation:
         }, timeout=15)
         assert r2.status_code in (200, 201)
         s2 = _extract_list(r2.json())[0]
-        n1 = int(s1.get("numero_amostra", 0))
-        n2 = int(s2.get("numero_amostra", 0))
-        assert n2 == n1 + 1, f"Numbering not sequential: {n1} → {n2}"
+        n1 = s1.get("numero_amostra", "")
+        n2 = s2.get("numero_amostra", "")
+        # Both must be YYYY-NNNN format and sequentially different
+        assert n1 != n2, f"Numbering not sequential: {n1} → {n2}"
+        seq1 = int(n1.split("-")[1]) if "-" in str(n1) else 0
+        seq2 = int(n2.split("-")[1]) if "-" in str(n2) else 0
+        assert seq2 == seq1 + 1, f"Seq not sequential: {n1} → {n2}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
