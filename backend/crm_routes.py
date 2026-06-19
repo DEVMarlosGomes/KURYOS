@@ -562,7 +562,8 @@ class SampleMove(BaseModel):
 class VariacaoItem(BaseModel):
     descricao_aplicacao: str
     percentual_fragrancia: Optional[float] = None
-    referencia_fragrancia: str = ""
+    referencia_fragrancia: str = ""   # R07: deve seguir padrão "FR-NNNNN - Nome"
+    fr_codigo: str = ""               # R08: código interno do cadastro db.fragrancias
     custo_fragrancia: Optional[float] = None
     custo_fragrancia_currency: str = "BRL"
     observacoes_especificas: str = ""
@@ -2226,6 +2227,7 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
                 "descricao_aplicacao": var.descricao_aplicacao,
                 "percentual_fragrancia": var.percentual_fragrancia,
                 "referencia_fragrancia": var.referencia_fragrancia,
+                "fr_codigo": var.fr_codigo or "",
                 "custo_fragrancia": var.custo_fragrancia,
                 "observacoes_especificas": var.observacoes_especificas,
                 "status": "solicitada",

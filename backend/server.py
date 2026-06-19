@@ -51,6 +51,7 @@ from compras_routes import compras_router, init_compras, create_compras_indexes
 from contratos_routes import contratos_router, init_contratos
 from cq_routes import cq_router, init_cq, create_cq_indexes
 from categorias_routes import categorias_router, init_categorias, create_categorias_indexes
+from fragrancias_routes import fragrancias_router, init_fragrancias, create_fragrancias_indexes
 from workflow_engine import init_workflow, run_workflow_notification_scheduler
 from workflow_routes import workflow_router, init_workflow_routes
 from rbac import (
@@ -2020,9 +2021,11 @@ async def startup():
     init_workflow(db, new_id, now_iso)
     init_workflow_routes(db, get_current_user, new_id, now_iso)
 
-    # Initialize Cadastros (R22 Categorias)
+    # Initialize Cadastros (R22 Categorias, R08 Fragrâncias)
     init_categorias(db, get_current_user, new_id, now_iso)
     await create_categorias_indexes()
+    init_fragrancias(db, get_current_user, new_id, now_iso)
+    await create_fragrancias_indexes()
 
     # Workflow indexes
     await db.workflow_tasks.create_index([("tenant_id", 1), ("entity_type", 1), ("entity_id", 1)])
@@ -2111,6 +2114,7 @@ app.include_router(compras_router)
 app.include_router(contratos_router)
 app.include_router(cq_router)
 app.include_router(categorias_router)
+app.include_router(fragrancias_router)
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
