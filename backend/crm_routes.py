@@ -30,7 +30,10 @@ from workflow_engine import (
     int_to_letters,
     next_sku_number,
     next_sku_per_pair,
+    next_sku_per_pair_v2,
+    build_sku_code_v2,
     cat2_from_categoria,
+    cat3_from_categoria,
     normalise_cli3,
     normalise_cli4,
     suggest_cli4_candidates,
@@ -3816,21 +3819,97 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
 #  SKU (auto-generated from approved samples)
 # ======================================================================
 
+async def _check_sku_dependency_chain(sample: dict, tenant_id: str) -> None:
+    """
+    R25: Validate full dependency chain before generating SKU.
+    Raises HTTPException 409 with the first missing prerequisite.
+    Chain: Categoria exists → Cliente com CLI4 → CGI assinado → Projeto →
+           Amostra aprovada (define categoria) → Pedido de Industrialização aprovado
+    """
+    cliente_id = sample.get("cliente_id")
+    projeto_id = sample.get("projeto_id")
+
+    # 1. Cliente with CLI4
+    client = await db.crm_clients.find_one({"id": cliente_id, "tenant_id": tenant_id}, {"_id": 0})
+    if not client:
+        raise HTTPException(status_code=409, detail="[R25] Cliente não encontrado — pré-requisito para geração de SKU")
+    if not client.get("cli4"):
+        raise HTTPException(status_code=409, detail="[R25] Cliente sem CLI4 definido — cadastre o código CLI4 antes de gerar o SKU")
+
+    # 2. Categoria exists and is active (must be in db.categorias)
+    categoria = sample.get("categoria") or ""
+    if not categoria:
+        project = await db.crm_projects.find_one({"id": projeto_id, "tenant_id": tenant_id}, {"_id": 0})
+        categoria = (project or {}).get("categoria", "")
+    cat3 = cat3_from_categoria(categoria)
+    if cat3 == "GEN":
+        raise HTTPException(status_code=409, detail=f"[R25] Categoria '{categoria}' não possui CAT3 mapeado — cadastre a categoria antes de gerar o SKU")
+
+    cat_doc = await db.categorias.find_one({"tenant_id": tenant_id, "cat3": cat3}, {"_id": 0})
+    if not cat_doc or cat_doc.get("status") != "ativa":
+        status_msg = f"status: {cat_doc.get('status', 'não encontrada')}" if cat_doc else "não cadastrada"
+        raise HTTPException(
+            status_code=409,
+            detail=f"[R25] Categoria CAT3={cat3} ({status_msg}) — só categorias ativas podem gerar SKU"
+        )
+
+    # 3. CGI assinado (contratos vinculados ao cliente/projeto)
+    cgi = await db.contratos.find_one(
+        {"tenant_id": tenant_id, "cliente_id": cliente_id, "status": {"$in": ["assinado", "vigente"]}},
+        {"_id": 0, "numero_contrato": 1},
+    )
+    if not cgi:
+        raise HTTPException(
+            status_code=409,
+            detail="[R25] CGI (Contrato Geral de Industrialização) não assinado — assine o contrato antes de gerar o SKU"
+        )
+
+    # 4. Amostra em stage 'aprovada' (already guaranteed by caller, but validate explicitly)
+    if sample.get("stage") != "aprovada":
+        raise HTTPException(
+            status_code=409,
+            detail=f"[R25] Amostra deve estar em stage 'aprovada' — atual: {sample.get('stage')}"
+        )
+
+    # 5. Pedido de Industrialização aprovado (pedido_aprovado stage on project)
+    project = await db.crm_projects.find_one({"id": projeto_id, "tenant_id": tenant_id}, {"_id": 0})
+    if not project or project.get("stage") not in ("pedido_aprovado", "cliente_fechado"):
+        proj_stage = (project or {}).get("stage", "não encontrado")
+        raise HTTPException(
+            status_code=409,
+            detail=f"[R25] Projeto deve estar em 'pedido_aprovado' — atual: {proj_stage}"
+        )
+
+
 async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
-    """Auto-create SKU entity when a sample is approved"""
+    """
+    Auto-create SKU entity when a sample is approved.
+    Uses new format [CAT3]-[CLI4]-[SEQ4] (R11). Validates R25 chain first.
+    """
     tenant_id = sample["tenant_id"]
 
-    # Resolve category from project if not on sample
+    # R25: dependency chain
+    try:
+        await _check_sku_dependency_chain(sample, tenant_id)
+    except HTTPException as exc:
+        logger.warning(f"SKU generation blocked for sample {sample['id']}: {exc.detail}")
+        return {"blocked": True, "reason": exc.detail}
+
+    # Resolve category
     project = await db.crm_projects.find_one({"id": sample["projeto_id"]}, {"_id": 0})
     categoria = sample.get("categoria") or (project.get("categoria") if project else "") or ""
 
-    # Resolve CAT2 and CLI3 for code format [CAT2]-[CLI3]-[SEQ4]
-    cat2 = cat2_from_categoria(categoria)
+    # New format: [CAT3]-[CLI4]-[SEQ4]
+    cat3 = cat3_from_categoria(categoria)
     client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
-    raw_cli3 = (client.get("cli3") or client.get("nome_empresa", "") if client else "")
+    cli4 = normalise_cli4(client.get("cli4") or client.get("nome_empresa", ""))
+    seq = await next_sku_per_pair_v2(tenant_id, cat3, cli4)
+    codigo = build_sku_code_v2(cat3, cli4, seq)
+
+    # Legacy fields preserved for backward compat queries
+    cat2 = cat2_from_categoria(categoria)
+    raw_cli3 = client.get("cli3") or client.get("nome_empresa", "")
     cli3 = normalise_cli3(raw_cli3)
-    seq = await next_sku_per_pair(tenant_id, cat2, cli3)
-    codigo = f"{cat2}-{cli3}-{str(seq).zfill(4)}"
 
     now = _now_iso()
     sku_id = _new_id()
@@ -3839,9 +3918,11 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         "id": sku_id,
         "tenant_id": tenant_id,
         "codigo_interno": codigo,
+        "cat3": cat3,
+        "cli4": cli4,
         "cat2": cat2,
         "cli3": cli3,
-        "nome_produto": sample.get("nome_amostra", ""),
+        "nome_produto": sample.get("nome_amostra", "") or sample.get("nome_produto", ""),
         "categoria": categoria,
         "formula_vinculada": "",
         "cliente_id": sample["cliente_id"],
@@ -3849,6 +3930,7 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         "projeto_id": sample["projeto_id"],
         "projeto_nome": sample.get("projeto_nome", ""),
         "amostra_id": sample["id"],
+        "produto_pai_id": None,
         "preco_unitario": 0.0,
         "moq": 0,
         "anvisa": {"numero": "", "validade": None},

@@ -306,9 +306,20 @@ def suggest_cli4_candidates(nome: str) -> List[str]:
 
 
 async def next_sku_per_pair(tenant_id: str, cat2: str, cli3: str) -> int:
-    """Atomic counter per (tenant, cat2, cli3) pair — returns 1-based integer."""
+    """Atomic counter per (tenant, cat2, cli3) pair — returns 1-based integer. Legacy."""
     key = f"sku_{cat2}_{cli3}"
     return await next_sequence(tenant_id, key, start=0)
+
+
+async def next_sku_per_pair_v2(tenant_id: str, cat3: str, cli4: str) -> int:
+    """Atomic counter per (tenant, cat3, cli4) pair for new [CAT3]-[CLI4]-[SEQ4] format."""
+    key = f"skuv2_{cat3}_{cli4}"
+    return await next_sequence(tenant_id, key, start=0)
+
+
+def build_sku_code_v2(cat3: str, cli4: str, seq: int) -> str:
+    """Build new-format SKU code: CAT3-CLI4-SEQ4. Forces uppercase."""
+    return f"{cat3.upper()}-{cli4.upper()}-{str(seq).zfill(4)}"
 
 
 async def next_lote_per_day(tenant_id: str, data_iso: str) -> int:
