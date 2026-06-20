@@ -48,6 +48,7 @@ import ComprasPOLista from "@/pages/ComprasPOLista";
 import ComprasPODetalhe from "@/pages/ComprasPODetalhe";
 import ComprasEstoqueProjetado from "@/pages/ComprasEstoqueProjetado";
 import EstoquePage from "@/pages/EstoquePage";
+import MovimentacaoPage from "@/pages/MovimentacaoPage";
 import RecebimentoPage from "@/pages/RecebimentoPage";
 import CQRetrabalho from "@/pages/CQRetrabalho";
 import ExpedicaoPage from "@/pages/ExpedicaoPage";
@@ -141,6 +142,7 @@ function AppLayout() {
                     <Route path="/compras/pos/:id" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasPODetalhe /></RoleGuard>} />
                     <Route path="/compras/estoque-projetado" element={<RoleGuard allowed={COMPRAS_ROLES}><ComprasEstoqueProjetado /></RoleGuard>} />
                     <Route path="/estoque" element={<EstoquePage />} />
+                    <Route path="/estoque/movimentacao" element={<MovimentacaoPage />} />
                     <Route path="/recebimento" element={<RecebimentoPage />} />
                     <Route path="/contratos" element={<RoleGuard allowed={CONTRATOS_ROLES}><ContratosPage /></RoleGuard>} />
                     <Route path="/audit" element={<RoleGuard allowed={AUDIT_ROLES}><AuditLogPage /></RoleGuard>} />

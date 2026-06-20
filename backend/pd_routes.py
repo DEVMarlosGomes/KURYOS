@@ -3989,6 +3989,7 @@ class StockItemCreate(BaseModel):
     categoria: str  # mp, insumo, amostra_acabada
     nome: str
     codigo_interno: Optional[str] = None
+    fragrancia_id: Optional[str] = None  # R09: FR-NNNNN do cadastro de fragrâncias
     unidade_medida: str = "kg"  # kg, g, mL, L, un
     quantidade_atual: float = 0.0
     quantidade_minima: float = 0.0
@@ -4325,13 +4326,27 @@ async def create_stock_item(data: StockItemCreate, request: Request):
     if data.categoria not in VALID_STOCK_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Categoria inválida. Use: {VALID_STOCK_CATEGORIES}")
 
+    # R05: auto-gerar código interno se vazio
+    codigo = (data.codigo_interno or "").strip()
+    if not codigo:
+        if data.fragrancia_id:
+            # R09: usar o FR-NNNNN do cadastro de fragrâncias
+            fr_doc = await db.fragrancias.find_one(
+                {"tenant_id": user["tenant_id"], "codigo_interno": data.fragrancia_id.upper()},
+                {"codigo_interno": 1},
+            )
+            codigo = fr_doc["codigo_interno"] if fr_doc else await _next_lab_seq(user["tenant_id"], data.categoria)
+        else:
+            codigo = await _next_lab_seq(user["tenant_id"], data.categoria)
+
     item_id = new_id()
     item = {
         "id": item_id,
         "tenant_id": user["tenant_id"],
         "categoria": data.categoria,
         "nome": data.nome.strip(),
-        "codigo_interno": (data.codigo_interno or "").strip(),
+        "codigo_interno": codigo,
+        "fragrancia_id": data.fragrancia_id or None,
         "unidade_medida": data.unidade_medida or "kg",
         "quantidade_atual": float(data.quantidade_atual or 0),
         "quantidade_minima": float(data.quantidade_minima or 0),
@@ -4415,6 +4430,87 @@ async def stock_alerts(request: Request):
             except Exception:
                 pass
     return {"low_stock": low_stock, "expiring": expiring}
+
+_LAB_SEQ_MAP = {
+    "mp":              ("lab_mp_seq",  "MP"),
+    "insumo":          ("lab_in_seq",  "IN"),
+    "amostra_acabada": ("lab_am_seq",  "AM"),
+}
+
+async def _next_lab_seq(tenant_id: str, categoria: str) -> str:
+    """R05: Gera código interno automático para Estoque Lab. MP-NNNNN / IN-NNNNN / AM-NNNNN."""
+    from workflow_engine import next_sequence
+    seq_key, prefix = _LAB_SEQ_MAP.get(categoria, ("lab_xx_seq", "XX"))
+    seq = await next_sequence(tenant_id, seq_key, start=0)
+    return f"{prefix}-{str(seq).zfill(5)}"
+
+
+@pd_router.get("/stock/movements")
+async def list_all_lab_movements(
+    request: Request,
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    tipo: Optional[str] = None,
+    categoria: Optional[str] = None,
+    limit: int = 500,
+):
+    """R06: Movimentações agregadas do Estoque Lab (para relatório)."""
+    user = await get_current_user(request)
+    t_id = user["tenant_id"]
+
+    # Busca itens para filtrar por categoria e enriquecer movimentos
+    items_cursor = db.pd_stock_items.find({"tenant_id": t_id}, {"_id": 0})
+    items_list = await items_cursor.to_list(10000)
+    items_map = {i["id"]: i for i in items_list}
+
+    if categoria:
+        valid_ids = {i["id"] for i in items_list if i.get("categoria") == categoria}
+    else:
+        valid_ids = set(items_map.keys())
+
+    query: dict = {"tenant_id": t_id}
+    if valid_ids:
+        query["stock_item_id"] = {"$in": list(valid_ids)}
+    else:
+        return {"movimentos": [], "kpis": {"entradas": 0, "saidas": 0, "saldo": 0, "itens_abaixo_minimo": 0}}
+
+    if tipo:
+        query["tipo"] = tipo
+    if data_inicio or data_fim:
+        dt: dict = {}
+        if data_inicio:
+            dt["$gte"] = data_inicio
+        if data_fim:
+            dt["$lte"] = data_fim + "T23:59:59"
+        query["created_at"] = dt
+
+    movs = await db.pd_stock_movements.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
+
+    # Enriquecer com nome/categoria do item
+    for m in movs:
+        item = items_map.get(m.get("stock_item_id"), {})
+        m["item_nome"] = item.get("nome", "")
+        m["item_categoria"] = item.get("categoria", "")
+        m["item_codigo"] = item.get("codigo_interno", "")
+        m["deposito"] = "lab"
+
+    total_entradas = sum(m["quantidade"] for m in movs if m.get("tipo") == "entrada")
+    total_saidas = sum(m["quantidade"] for m in movs if m.get("tipo") == "saida")
+    itens_abaixo = sum(
+        1 for i in items_list
+        if i.get("quantidade_minima", 0) > 0 and i.get("quantidade_atual", 0) <= i.get("quantidade_minima", 0)
+    )
+
+    return {
+        "movimentos": movs,
+        "kpis": {
+            "entradas": round(total_entradas, 3),
+            "saidas": round(total_saidas, 3),
+            "saldo": round(total_entradas - total_saidas, 3),
+            "itens_abaixo_minimo": itens_abaixo,
+        },
+    }
+
 
 @pd_router.get("/stock/{item_id}")
 async def get_stock_item(item_id: str, request: Request):

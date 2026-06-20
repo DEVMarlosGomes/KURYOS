@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Plus, Search, Pencil, Trash2, Package, AlertTriangle, ArrowUpCircle, ArrowDownCircle, Edit3, History, MapPin, Calendar, AlertCircle } from "lucide-react";
+import { Plus, Search, Pencil, Trash2, Package, AlertTriangle, ArrowUpCircle, ArrowDownCircle, Edit3, History, MapPin, Calendar, AlertCircle, Loader2, FlaskConical, X } from "lucide-react";
 import { toast } from "sonner";
 import PDSubNav from "@/components/PDSubNav";
 
@@ -23,7 +23,8 @@ const CATEGORIAS = [
 const emptyForm = {
   categoria: "mp",
   nome: "",
-  codigo_interno: "",
+  codigo_interno: "",       // R05: read-only em novos itens, gerado pelo backend
+  fragrancia_id: "",        // R09: FR-NNNNN do cadastro de fragrâncias
   unidade_medida: "kg",
   quantidade_atual: "",
   quantidade_minima: "",
@@ -53,6 +54,14 @@ export default function PDStock() {
   const [moveForm, setMoveForm] = useState({ tipo: "entrada", quantidade: "", motivo: "", lote: "" });
   const [historyItem, setHistoryItem] = useState(null);
   const [movements, setMovements] = useState([]);
+
+  // R09: fragrância search
+  const [fragSearch, setFragSearch] = useState("");
+  const [fragOptions, setFragOptions] = useState([]);
+  const [loadingFrags, setLoadingFrags] = useState(false);
+  const [selectedFrag, setSelectedFrag] = useState(null);
+  const [showFragDropdown, setShowFragDropdown] = useState(false);
+  const fragRef = useRef(null);
 
   const loadItems = useCallback(async () => {
     setLoading(true);
@@ -85,18 +94,47 @@ export default function PDStock() {
   useEffect(() => { loadItems(); loadAlerts(); }, [loadItems, loadAlerts]);
   useEffect(() => { loadCatalog(); }, [loadCatalog]);
 
+  // R09: busca de fragrâncias com debounce
+  useEffect(() => {
+    if (!fragSearch.trim() || fragSearch.length < 2) { setFragOptions([]); return; }
+    const t = setTimeout(async () => {
+      setLoadingFrags(true);
+      try {
+        const { data } = await api.get("/api/cadastros/fragrancias", { params: { search: fragSearch } });
+        setFragOptions(data.fragrancias || []);
+        setShowFragDropdown(true);
+      } catch { setFragOptions([]); }
+      finally { setLoadingFrags(false); }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [fragSearch]);
+
+  // Fecha dropdown ao clicar fora
+  useEffect(() => {
+    const handler = (e) => { if (fragRef.current && !fragRef.current.contains(e.target)) setShowFragDropdown(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
   const openCreate = () => {
     setEditingId(null);
+    setSelectedFrag(null);
+    setFragSearch("");
+    setFragOptions([]);
     setForm({ ...emptyForm, categoria: activeTab });
     setShowForm(true);
   };
 
   const openEdit = (item) => {
     setEditingId(item.id);
+    setSelectedFrag(null);
+    setFragSearch("");
+    setFragOptions([]);
     setForm({
       categoria: item.categoria,
       nome: item.nome || "",
       codigo_interno: item.codigo_interno || "",
+      fragrancia_id: item.fragrancia_id || "",
       unidade_medida: item.unidade_medida || "kg",
       quantidade_atual: String(item.quantidade_atual ?? ""),
       quantidade_minima: String(item.quantidade_minima ?? ""),
@@ -125,6 +163,9 @@ export default function PDStock() {
         fragrancia_percentual: form.fragrancia_percentual ? parseFloat(form.fragrancia_percentual) : null,
         validade: form.validade || null,
         catalog_id: form.catalog_id || null,
+        fragrancia_id: form.fragrancia_id || null,
+        // R05: código gerado no backend — não enviar vazio para sobrescrever
+        codigo_interno: editingId ? form.codigo_interno : (form.codigo_interno || undefined),
       };
       if (editingId) {
         // remove quantidade_atual from update payload (controlled via movements)
@@ -289,8 +330,92 @@ export default function PDStock() {
             </div>
             <div>
               <Label>Código Interno</Label>
-              <Input value={form.codigo_interno} onChange={(e) => setForm(p => ({ ...p, codigo_interno: e.target.value }))} placeholder="Ex: MP-001" />
+              {/* R05: somente leitura em novos itens — gerado pelo backend */}
+              {editingId ? (
+                <Input value={form.codigo_interno} onChange={(e) => setForm(p => ({ ...p, codigo_interno: e.target.value }))} placeholder="Ex: MP-00001" />
+              ) : (
+                <div className="flex items-center h-9 px-3 rounded-md border bg-muted/50 text-sm text-muted-foreground gap-2">
+                  {form.fragrancia_id
+                    ? <><FlaskConical className="h-3.5 w-3.5" /> {form.fragrancia_id}</>
+                    : "Gerado automaticamente"
+                  }
+                </div>
+              )}
             </div>
+
+            {/* R09: picker de fragrância (somente em mp, somente no create) */}
+            {!editingId && form.categoria === "mp" && (
+              <div className="col-span-2" ref={fragRef}>
+                <Label>Vincular Fragrância (opcional)</Label>
+                <div className="relative mt-1">
+                  {selectedFrag ? (
+                    <div className="flex items-center gap-2 h-9 px-3 rounded-md border bg-emerald-50 border-emerald-300 text-sm">
+                      <FlaskConical className="h-3.5 w-3.5 text-emerald-600" />
+                      <span className="font-mono text-emerald-700">{selectedFrag.codigo_interno}</span>
+                      <span className="text-emerald-800 truncate">{selectedFrag.inspiracao}</span>
+                      {selectedFrag.fornecedores?.[0] && (
+                        <span className="ml-auto text-xs text-emerald-600">Cod. fornecedor: {selectedFrag.fornecedores[0].codigo_fornecedor}</span>
+                      )}
+                      <button type="button" onClick={() => {
+                        setSelectedFrag(null);
+                        setFragSearch("");
+                        setForm(p => ({ ...p, fragrancia_id: "", fornecedor: "" }));
+                      }}>
+                        <X className="h-3.5 w-3.5 text-emerald-600 hover:text-red-500" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="relative">
+                      <FlaskConical className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                      <Input
+                        className="pl-8"
+                        placeholder="Buscar por FR-xxxxx ou inspiração..."
+                        value={fragSearch}
+                        onChange={(e) => { setFragSearch(e.target.value); setShowFragDropdown(true); }}
+                        onFocus={() => fragSearch.length >= 2 && setShowFragDropdown(true)}
+                      />
+                      {loadingFrags && <Loader2 className="absolute right-2.5 top-2.5 h-4 w-4 animate-spin text-muted-foreground" />}
+                    </div>
+                  )}
+                  {showFragDropdown && fragOptions.length > 0 && !selectedFrag && (
+                    <div className="absolute z-50 mt-1 w-full rounded-md border bg-background shadow-lg max-h-52 overflow-y-auto">
+                      {fragOptions.map((fr) => (
+                        <button
+                          key={fr.codigo_interno}
+                          type="button"
+                          className="w-full text-left px-3 py-2 hover:bg-muted text-sm flex items-center gap-2"
+                          onClick={() => {
+                            setSelectedFrag(fr);
+                            setShowFragDropdown(false);
+                            setFragSearch("");
+                            const priCodforn = fr.fornecedores?.[0]?.codigo_fornecedor || "";
+                            const priFornNome = fr.fornecedores?.[0]?.fornecedor_nome || "";
+                            setForm(p => ({
+                              ...p,
+                              fragrancia_id: fr.codigo_interno,
+                              nome: p.nome || fr.inspiracao,
+                              fornecedor: p.fornecedor || priFornNome || priCodforn,
+                            }));
+                          }}
+                        >
+                          <span className="font-mono text-xs text-primary">{fr.codigo_interno}</span>
+                          <span className="flex-1 truncate">{fr.inspiracao}</span>
+                          {fr.fornecedores?.[0] && (
+                            <span className="text-xs text-muted-foreground shrink-0">{fr.fornecedores[0].codigo_fornecedor}</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {form.fragrancia_id && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Código FR do cadastro será usado como código interno deste item.
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="col-span-2">
               <Label>Nome *</Label>
               <Input value={form.nome} onChange={(e) => setForm(p => ({ ...p, nome: e.target.value }))} placeholder={form.categoria === "amostra_acabada" ? "Ex: Body Splash La Vie 3% fragrância" : "Ex: Álcool de Cereais 96°"} />

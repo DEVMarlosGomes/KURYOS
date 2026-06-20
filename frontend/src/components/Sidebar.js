@@ -5,7 +5,7 @@ import {
     LayoutDashboard, Kanban, Users, LogOut, Moon, Sun, FlaskConical, Building2,
     Package, ChevronDown, ChevronRight, ShieldCheck, BarChart3, Warehouse, ClipboardList,
     CheckSquare, History, BookOpen, Database, Menu, X, ShoppingCart, FileText, Microscope, Factory,
-    Truck, Receipt, Calendar
+    Truck, Receipt, Calendar, ArrowLeftRight
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -69,11 +69,15 @@ const NAV_MODULES = [
     },
     {
         key: "estoque",
-        type: "link",
-        path: "/estoque",
+        type: "group",
         label: "Estoque / WMS",
         icon: Warehouse,
+        basePaths: ["/estoque"],
         roles: ["admin", "lider_pd", "formulador", "qa", "engenharia_produto", "compras", "gestor"],
+        children: [
+            { path: "/estoque",               label: "Estoque Geral",        icon: Warehouse },
+            { path: "/estoque/movimentacao",   label: "Movimentação",         icon: ArrowLeftRight },
+        ],
     },
     {
         key: "recebimento",
