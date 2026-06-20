@@ -421,6 +421,12 @@ INHERITED_FROM_PROJECT = {
     "briefing_tecnico": "briefing_tecnico_projeto",
     "responsavel_interno": "responsavel_pd",
     "prazo_prometido_cliente": "prazo_prometido_cliente",
+    # R02: campos ricos do projeto → amostra (quando sample ainda não preencheu o campo)
+    "ideia_conceito": "objetivo_projeto",
+    "referencia_mercado": "referencias",
+    "sensorial_desejado": "sensorial",
+    "claims_desejados": "ativos_claims",
+    "prazo_desejado_amostra": "prazo_entrega_cliente",
 }
 
 INHERITED_FROM_SAMPLE = {

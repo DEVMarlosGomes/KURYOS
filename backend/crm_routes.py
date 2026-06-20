@@ -608,6 +608,8 @@ class SampleBatchItemV2(BaseModel):
 class SampleBatchCreateV2(BaseModel):
     projeto_id: str
     samples: List[SampleBatchItemV2]
+    # R02: campos do card a atualizar no projeto antes de criar amostras
+    projeto_updates: Optional[dict] = None
 
 class VariacaoUpdate(BaseModel):
     descricao_aplicacao: Optional[str] = None
@@ -2206,6 +2208,25 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
     if not data.samples:
         raise HTTPException(status_code=400, detail="Nenhuma amostra fornecida")
 
+    # R02: atualizar campos do card antes de criar amostras (sync CRM→P&D)
+    if data.projeto_updates:
+        _ALLOWED_PROJETO_FIELDS = {
+            "categoria", "responsavel_comercial", "responsavel_interno",
+            "ideia_conceito", "referencia_mercado", "publico_alvo", "posicionamento",
+            "tipo_servico", "faixa_preco_venda", "volume_estimado_pedido",
+            "prazo_desejado_amostra", "sensorial_desejado", "claims_desejados",
+            "restricoes_tecnicas", "observacoes_livres",
+        }
+        patch = {k: v for k, v in data.projeto_updates.items() if k in _ALLOWED_PROJETO_FIELDS}
+        if patch:
+            patch["updated_at"] = _now_iso()
+            await db.crm_projects.update_one(
+                {"id": data.projeto_id, "tenant_id": user["tenant_id"]},
+                {"$set": patch},
+            )
+            # Recarregar projeto com campos atualizados
+            project = await assert_project_exists(user["tenant_id"], data.projeto_id)
+
     now = _now_iso()
     created_samples = []
 
@@ -2341,12 +2362,23 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
             "stage": "solicitada",
             "rework_de_amostra_id": None,
             "rework_motivo": "",
+            # R02: snapshot dos campos ricos do projeto no momento da criação
+            "projeto_briefing": {
+                "publico_alvo": project.get("publico_alvo", ""),
+                "posicionamento": project.get("posicionamento", ""),
+                "tipo_servico": project.get("tipo_servico", ""),
+                "faixa_preco_venda": project.get("faixa_preco_venda"),
+                "volume_estimado_pedido": project.get("volume_estimado_pedido"),
+                "restricoes_tecnicas": project.get("restricoes_tecnicas", []),
+                "observacoes_livres": project.get("observacoes_livres", ""),
+                "responsavel_comercial": project.get("responsavel_comercial", ""),
+            },
             "created_by": user["id"],
             "created_by_name": user["name"],
             "created_at": now,
             "updated_at": now,
         }
-        # ERP v3.0: inheritance from project (categoria, briefing if missing)
+        # R02: inheritance do projeto → amostra (preenche campos vazios)
         inherit(sample, project, INHERITED_FROM_PROJECT)
 
         await db.crm_samples.insert_one(sample)
@@ -2694,6 +2726,14 @@ async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict)
         "ph": sample.get("ph", ""),
         "observacoes_especificas": variacao.get("observacoes_especificas", ""),
         "responsavel_pd": sample.get("responsavel_pd", ""),
+        # R02: campos contextuais do projeto (para Detalhes da Solicitação no P&D)
+        "publico_alvo": sample.get("projeto_briefing", {}).get("publico_alvo", ""),
+        "posicionamento": sample.get("projeto_briefing", {}).get("posicionamento", ""),
+        "tipo_servico": sample.get("projeto_briefing", {}).get("tipo_servico", ""),
+        "faixa_preco_venda": sample.get("projeto_briefing", {}).get("faixa_preco_venda"),
+        "volume_estimado_pedido": sample.get("projeto_briefing", {}).get("volume_estimado_pedido"),
+        "restricoes_tecnicas": sample.get("projeto_briefing", {}).get("restricoes_tecnicas", []),
+        "observacoes_livres": sample.get("projeto_briefing", {}).get("observacoes_livres", ""),
         "data_solicitacao": now,
         "prazo_prometido": None,
         "status_pd": "solicitado",

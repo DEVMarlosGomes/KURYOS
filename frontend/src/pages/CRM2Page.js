@@ -119,6 +119,7 @@ export default function CRM2Page() {
     const [showBatchSamples, setShowBatchSamples] = useState(false);
     const [batchProjectId, setBatchProjectId] = useState(null);
     const [batchSamples, setBatchSamples] = useState([createEmptySample()]);
+    const [batchProjetoData, setBatchProjetoData] = useState(null);
     const [showArchiveDialog, setShowArchiveDialog] = useState(false);
     const [pendingArchiveProject, setPendingArchiveProject] = useState(null);
     const [archiveReason, setArchiveReason] = useState("");
@@ -249,6 +250,24 @@ export default function CRM2Page() {
         return accumulator;
     }, {}), [filteredProjects]);
 
+    const projetoDataFromProject = (proj) => ({
+        nome_projeto: proj?.nome_projeto || "",
+        categoria: proj?.categoria || "",
+        responsavel_comercial: proj?.responsavel_comercial || "",
+        ideia_conceito: proj?.ideia_conceito || "",
+        referencia_mercado: proj?.referencia_mercado || "",
+        publico_alvo: proj?.publico_alvo || "",
+        posicionamento: proj?.posicionamento || "",
+        tipo_servico: proj?.tipo_servico || "",
+        faixa_preco_venda: proj?.faixa_preco_venda ?? "",
+        volume_estimado_pedido: proj?.volume_estimado_pedido ?? "",
+        prazo_desejado_amostra: proj?.prazo_desejado_amostra || "",
+        sensorial_desejado: proj?.sensorial_desejado || "",
+        claims_desejados: proj?.claims_desejados || "",
+        restricoes_tecnicas: proj?.restricoes_tecnicas || [],
+        observacoes_livres: proj?.observacoes_livres || "",
+    });
+
     const generateVariacaoLetters = (count) => {
         const letters = [];
         for (let index = 0; index < count; index += 1) {
@@ -305,6 +324,7 @@ export default function CRM2Page() {
                 if (proj.categoria) inherited.categoria = proj.categoria;
                 if (proj.responsavel_interno) inherited.responsavel_pd = proj.responsavel_interno;
             }
+            setBatchProjetoData(projetoDataFromProject(proj));
             setBatchSamples([inherited]);
             setShowBatchSamples(true);
         }
@@ -361,6 +381,22 @@ export default function CRM2Page() {
         }
 
         try {
+            const projetoUpdates = batchProjetoData ? {
+                categoria: batchProjetoData.categoria,
+                responsavel_comercial: batchProjetoData.responsavel_comercial,
+                ideia_conceito: batchProjetoData.ideia_conceito,
+                referencia_mercado: batchProjetoData.referencia_mercado,
+                publico_alvo: batchProjetoData.publico_alvo,
+                posicionamento: batchProjetoData.posicionamento,
+                tipo_servico: batchProjetoData.tipo_servico,
+                faixa_preco_venda: batchProjetoData.faixa_preco_venda !== "" ? Number(batchProjetoData.faixa_preco_venda) || null : null,
+                volume_estimado_pedido: batchProjetoData.volume_estimado_pedido !== "" ? parseInt(batchProjetoData.volume_estimado_pedido, 10) || null : null,
+                prazo_desejado_amostra: batchProjetoData.prazo_desejado_amostra,
+                sensorial_desejado: batchProjetoData.sensorial_desejado,
+                claims_desejados: batchProjetoData.claims_desejados,
+                restricoes_tecnicas: batchProjetoData.restricoes_tecnicas,
+                observacoes_livres: batchProjetoData.observacoes_livres,
+            } : undefined;
             const payload = {
                 projeto_id: batchProjectId,
                 samples: validSamples.map((sample) => ({
@@ -372,12 +408,14 @@ export default function CRM2Page() {
                         custo_fragrancia: variacao.custo_fragrancia ? parseFloat(variacao.custo_fragrancia) : null,
                     })),
                 })),
+                projeto_updates: projetoUpdates,
             };
             const { data } = await api.post("/crm/samples/batch/v2", payload);
             toast.success(`${data.count} amostra(s) criada(s)!`);
             setShowBatchSamples(false);
             setBatchProjectId(null);
             setBatchSamples([createEmptySample()]);
+            setBatchProjetoData(null);
             await loadProjects();
             if (selectedProjectId) {
                 await loadProjectDetail(selectedProjectId);
@@ -408,6 +446,7 @@ export default function CRM2Page() {
             if (selectedProject.categoria) inherited.categoria = selectedProject.categoria;
             if (selectedProject.responsavel_interno) inherited.responsavel_pd = selectedProject.responsavel_interno;
         }
+        setBatchProjetoData(projetoDataFromProject(selectedProject));
         setBatchSamples([inherited]);
         setShowBatchSamples(true);
     };
@@ -878,10 +917,13 @@ export default function CRM2Page() {
                     if (!open) {
                         setBatchProjectId(null);
                         setBatchSamples([createEmptySample()]);
+                        setBatchProjetoData(null);
                     }
                 }}
                 batchSamples={batchSamples}
                 setBatchSamples={setBatchSamples}
+                projetoData={batchProjetoData}
+                onProjetoDataChange={setBatchProjetoData}
                 onSubmit={handleBatchSampleSubmit}
                 addVariacao={addVariacao}
                 removeVariacao={removeVariacao}

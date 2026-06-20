@@ -1,10 +1,12 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, ChevronDown, ChevronUp, X } from "lucide-react";
 import { FieldHint } from "@/components/ui/FieldHint";
 
 function formatSlugLabel(value) {
@@ -20,6 +22,8 @@ export default function SampleBatchModal({
     onOpenChange,
     batchSamples,
     setBatchSamples,
+    projetoData,
+    onProjetoDataChange,
     onSubmit,
     addVariacao,
     removeVariacao,
@@ -28,6 +32,9 @@ export default function SampleBatchModal({
     constants,
     onAddSample,
 }) {
+    const [projetoExpanded, setProjetoExpanded] = useState(true);
+    const [restricaoInput, setRestricaoInput] = useState("");
+
     const sampleTypes = constants?.sample_tipos || [];
     const sampleUnits = constants?.sample_unidades || [];
     const variationParams = constants?.sample_parametros_variacao || [];
@@ -36,6 +43,25 @@ export default function SampleBatchModal({
         const next = [...batchSamples];
         next[index] = { ...next[index], [field]: value };
         setBatchSamples(next);
+    };
+
+    const updateProjeto = (field, value) => {
+        onProjetoDataChange?.({ ...projetoData, [field]: value });
+    };
+
+    const addRestricao = (texto) => {
+        const trimmed = texto.trim();
+        if (!trimmed) return;
+        const atual = projetoData?.restricoes_tecnicas || [];
+        if (!atual.includes(trimmed)) {
+            updateProjeto("restricoes_tecnicas", [...atual, trimmed]);
+        }
+        setRestricaoInput("");
+    };
+
+    const removeRestricao = (index) => {
+        const atual = projetoData?.restricoes_tecnicas || [];
+        updateProjeto("restricoes_tecnicas", atual.filter((_, i) => i !== index));
     };
 
     return (
@@ -50,6 +76,186 @@ export default function SampleBatchModal({
 
                 <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4">
                     <div className="space-y-6">
+
+                        {/* R02: Dados do Projeto */}
+                        {projetoData && (
+                            <div className="rounded-2xl border border-violet-200 bg-violet-50/50 overflow-hidden">
+                                <button
+                                    type="button"
+                                    className="w-full flex items-center justify-between px-5 py-3 text-left"
+                                    onClick={() => setProjetoExpanded(!projetoExpanded)}
+                                >
+                                    <div>
+                                        <span className="text-sm font-semibold text-violet-800">Dados do Projeto</span>
+                                        {projetoData.nome_projeto && (
+                                            <span className="ml-2 text-xs text-violet-600">{projetoData.nome_projeto}</span>
+                                        )}
+                                    </div>
+                                    {projetoExpanded
+                                        ? <ChevronUp className="h-4 w-4 text-violet-600" />
+                                        : <ChevronDown className="h-4 w-4 text-violet-600" />
+                                    }
+                                </button>
+
+                                {projetoExpanded && (
+                                    <div className="px-5 pb-5 space-y-4 border-t border-violet-200">
+                                        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 pt-4">
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Nome do projeto</Label>
+                                                <Input
+                                                    readOnly
+                                                    value={projetoData.nome_projeto || ""}
+                                                    className="bg-violet-50 border-violet-200 cursor-default"
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Categoria</Label>
+                                                <Input
+                                                    value={projetoData.categoria || ""}
+                                                    onChange={(e) => updateProjeto("categoria", e.target.value)}
+                                                    placeholder="Ex: Capilares"
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Responsável comercial</Label>
+                                                <Input
+                                                    value={projetoData.responsavel_comercial || ""}
+                                                    onChange={(e) => updateProjeto("responsavel_comercial", e.target.value)}
+                                                    placeholder="Nome do responsável"
+                                                />
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Ideia / conceito</Label>
+                                                <Textarea
+                                                    rows={2}
+                                                    value={projetoData.ideia_conceito || ""}
+                                                    onChange={(e) => updateProjeto("ideia_conceito", e.target.value)}
+                                                    placeholder="Descreva o conceito do produto"
+                                                />
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Referência de mercado</Label>
+                                                <Textarea
+                                                    rows={2}
+                                                    value={projetoData.referencia_mercado || ""}
+                                                    onChange={(e) => updateProjeto("referencia_mercado", e.target.value)}
+                                                    placeholder="Concorrentes, inspirações, benchmarks"
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Público-alvo</Label>
+                                                <Input
+                                                    value={projetoData.publico_alvo || ""}
+                                                    onChange={(e) => updateProjeto("publico_alvo", e.target.value)}
+                                                    placeholder="Ex: Mulheres 25-45 anos"
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Posicionamento</Label>
+                                                <Input
+                                                    value={projetoData.posicionamento || ""}
+                                                    onChange={(e) => updateProjeto("posicionamento", e.target.value)}
+                                                    placeholder="Premium, masstige, popular..."
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Tipo de serviço</Label>
+                                                <Input
+                                                    value={projetoData.tipo_servico || ""}
+                                                    onChange={(e) => updateProjeto("tipo_servico", e.target.value)}
+                                                    placeholder="Desenvolvimento, adaptação..."
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Prazo desejado</Label>
+                                                <Input
+                                                    type="date"
+                                                    value={projetoData.prazo_desejado_amostra || ""}
+                                                    onChange={(e) => updateProjeto("prazo_desejado_amostra", e.target.value)}
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Faixa de preço (R$)</Label>
+                                                <Input
+                                                    type="number"
+                                                    value={projetoData.faixa_preco_venda ?? ""}
+                                                    onChange={(e) => updateProjeto("faixa_preco_venda", e.target.value)}
+                                                    placeholder="0,00"
+                                                />
+                                            </div>
+                                            <div className="space-y-2">
+                                                <Label className="text-violet-700">Volume estimado / pedido</Label>
+                                                <Input
+                                                    type="number"
+                                                    value={projetoData.volume_estimado_pedido ?? ""}
+                                                    onChange={(e) => updateProjeto("volume_estimado_pedido", e.target.value)}
+                                                    placeholder="Unidades"
+                                                />
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Sensorial desejado</Label>
+                                                <Textarea
+                                                    rows={2}
+                                                    value={projetoData.sensorial_desejado || ""}
+                                                    onChange={(e) => updateProjeto("sensorial_desejado", e.target.value)}
+                                                    placeholder="Textura, espalhabilidade, acabamento, fragrância..."
+                                                />
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Claims desejados</Label>
+                                                <Textarea
+                                                    rows={2}
+                                                    value={projetoData.claims_desejados || ""}
+                                                    onChange={(e) => updateProjeto("claims_desejados", e.target.value)}
+                                                    placeholder="Hidratante 72h, sem sulfato, vegano..."
+                                                />
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Restrições técnicas</Label>
+                                                <div className="flex gap-2">
+                                                    <Input
+                                                        value={restricaoInput}
+                                                        onChange={(e) => setRestricaoInput(e.target.value)}
+                                                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addRestricao(restricaoInput); } }}
+                                                        placeholder="Digite e pressione Enter"
+                                                    />
+                                                    <Button
+                                                        type="button"
+                                                        variant="outline"
+                                                        size="sm"
+                                                        onClick={() => addRestricao(restricaoInput)}
+                                                    >
+                                                        <Plus className="h-4 w-4" />
+                                                    </Button>
+                                                </div>
+                                                {(projetoData.restricoes_tecnicas || []).length > 0 && (
+                                                    <div className="flex flex-wrap gap-1.5 mt-2">
+                                                        {(projetoData.restricoes_tecnicas || []).map((r, i) => (
+                                                            <Badge key={i} variant="secondary" className="gap-1 text-xs">
+                                                                {r}
+                                                                <button type="button" onClick={() => removeRestricao(i)}>
+                                                                    <X className="h-3 w-3" />
+                                                                </button>
+                                                            </Badge>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div className="space-y-2 md:col-span-2">
+                                                <Label className="text-violet-700">Observações</Label>
+                                                <Textarea
+                                                    rows={2}
+                                                    value={projetoData.observacoes_livres || ""}
+                                                    onChange={(e) => updateProjeto("observacoes_livres", e.target.value)}
+                                                    placeholder="Observações gerais do projeto"
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
                         {batchSamples.map((sample, sampleIndex) => (
                             <div key={sampleIndex} className="rounded-2xl border border-border bg-card p-5 space-y-5">
                                 <div className="flex items-center justify-between">
