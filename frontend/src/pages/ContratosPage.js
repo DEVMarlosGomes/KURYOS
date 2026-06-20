@@ -179,10 +179,10 @@ function GenerateDialog({ open, onClose, onGenerated }) {
   );
 }
 
-function ContratoCard({ contrato }) {
+function useDownloadContrato(contrato) {
   const [downloading, setDownloading] = useState(false);
-
-  const handleDownload = async () => {
+  const handleDownload = async (e) => {
+    e?.stopPropagation();
     setDownloading(true);
     try {
       const token = localStorage.getItem("token") || sessionStorage.getItem("token");
@@ -201,9 +201,88 @@ function ContratoCard({ contrato }) {
       toast.error("Erro ao baixar PDF do contrato");
     } finally { setDownloading(false); }
   };
+  return { downloading, handleDownload };
+}
+
+function ContratoDetailModal({ contrato, onClose }) {
+  const { downloading, handleDownload } = useDownloadContrato(contrato || {});
+  if (!contrato) return null;
+  const c = contrato.contratante || {};
+  const f = contrato.fabricante || {};
+  return (
+    <Dialog open={!!contrato} onOpenChange={(v) => { if (!v) onClose(); }}>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileText className="h-5 w-5 text-indigo-600" />
+            {contrato.numero_contrato}
+          </DialogTitle>
+          <DialogDescription className="flex items-center gap-2 flex-wrap">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-green-100 text-green-700 border border-green-200">
+              <CheckCircle2 className="h-3 w-3" />gerado
+            </span>
+            <span className="text-xs text-muted-foreground">Kickoff: {contrato.numero_kickoff} · v{contrato.kickoff_versao}</span>
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-5">
+          <div>
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Contratante</p>
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              {[
+                ["Razão Social", c.razao_social],
+                ["CNPJ", c.cnpj],
+                ["Inscrição Estadual", c.inscricao_estadual],
+                ["Endereço", c.endereco_completo],
+                ["Representante", c.representante_nome],
+                ["CPF", c.representante_cpf],
+                ["RG", c.representante_rg],
+                ["Cargo", c.representante_cargo],
+              ].filter(([, v]) => v).map(([label, value]) => (
+                <div key={label} className={label === "Endereço" ? "col-span-2" : ""}>
+                  <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{label}</p>
+                  <p className="font-medium">{value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Fabricante</p>
+            <div className="p-3 bg-indigo-50 dark:bg-indigo-950/30 rounded-lg text-xs space-y-0.5">
+              <p className="font-semibold">{f.razao_social}</p>
+              {f.cnpj && <p>CNPJ: {f.cnpj}</p>}
+              {f.endereco && <p>{f.endereco}</p>}
+              {f.anvisa && <p>ANVISA: {f.anvisa}</p>}
+              {f.foro && <p>Foro: {f.foro}</p>}
+            </div>
+          </div>
+          {contrato.observacoes && (
+            <div>
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">Observações</p>
+              <p className="text-sm whitespace-pre-wrap">{contrato.observacoes}</p>
+            </div>
+          )}
+          <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
+            <span className="flex items-center gap-1"><Calendar className="h-3 w-3" />Gerado em {formatDateTime(contrato.created_at)}</span>
+            {contrato.created_by_name && <span>por {contrato.created_by_name}</span>}
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="outline" onClick={onClose}>Fechar</Button>
+          <Button onClick={handleDownload} disabled={downloading} className="gap-1.5">
+            {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            Baixar PDF
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ContratoCard({ contrato, onClick }) {
+  const { downloading, handleDownload } = useDownloadContrato(contrato);
 
   return (
-    <Card className="hover:shadow-md transition-shadow">
+    <Card className="hover:shadow-md transition-shadow cursor-pointer" onClick={onClick}>
       <CardContent className="p-4">
         <div className="flex items-start gap-3">
           <div className="flex items-center justify-center h-10 w-10 rounded-lg bg-indigo-50 text-indigo-600 flex-shrink-0">
@@ -251,6 +330,7 @@ export default function ContratosPage() {
   const [search, setSearch] = useState("");
 
   const canGenerate = user && ["admin", "sales_ops", "vendedor", "compras"].includes(user.role);
+  const [selectedContrato, setSelectedContrato] = useState(null);
 
   const fetchContratos = useCallback(async () => {
     setLoading(true);
@@ -315,12 +395,13 @@ export default function ContratosPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {filtered.map(c => <ContratoCard key={c.id} contrato={c} />)}
+          {filtered.map(c => <ContratoCard key={c.id} contrato={c} onClick={() => setSelectedContrato(c)} />)}
           <p className="text-xs text-muted-foreground text-right pt-1">{filtered.length} contrato{filtered.length !== 1 ? "s" : ""}</p>
         </div>
       )}
 
       <GenerateDialog open={generateOpen} onClose={() => setGenerateOpen(false)} onGenerated={fetchContratos} />
+      <ContratoDetailModal contrato={selectedContrato} onClose={() => setSelectedContrato(null)} />
     </div>
   );
 }

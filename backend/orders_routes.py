@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import io
 import logging
 
@@ -182,6 +182,7 @@ class OrderUpdate(BaseModel):
     aprovacao_cliente: Optional[str] = None   # pendente | aprovado
     aprovacao_cliente_obs: Optional[str] = None
     aprovacao_cliente_em: Optional[str] = None
+    justificativa: Optional[str] = None        # R21: required to edit locked fields
 
 
 # ===== OP MODELS =====
@@ -207,6 +208,20 @@ class OPUpdate(BaseModel):
 
 
 OP_STATUSES = ["aberta", "em_processo", "concluida", "cancelada"]
+
+
+# ===== R15: REPRODUZIR MODELS =====
+class ItemOverride(BaseModel):
+    codigo_kuryos: str = ""
+    valor_unitario: Optional[float] = None
+    prazo_entrega: Optional[str] = None
+    qtd: Optional[float] = None
+
+
+class ReproduzirInput(BaseModel):
+    items_override: List[ItemOverride] = []
+    endereco_entrega: Optional[str] = None
+    observacoes: Optional[str] = None
 
 
 # ============ HELPERS ============
@@ -584,15 +599,35 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
             nivel = existing.get("aprovacao_comercial_nivel", "gerente_vendas")
             raise HTTPException(status_code=422, detail=f"Aprovação comercial pendente (desconto > {TIER_AUTO}%). Requer aprovação de {nivel.replace('_', ' ')} antes de confirmar. (RN-PI-10)")
 
-    # RN-PI-05: confirmed/em_producao/concluido orders are immutable — only allowed fields
+    # RN-PI-05 + R21: confirmed/em_producao/concluido orders are immutable — only allowed fields
     IMMUTABLE_BLOCK = {"items", "cliente", "frete", "condicoes", "insumos", "numero_pedido", "data_pedido", "tipo_servico", "nivel_formalizacao"}
     if existing.get("status") in STATUSES_IMUTAVEL:
         blocked = IMMUTABLE_BLOCK & set(payload.keys())
         if blocked:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Pedido {existing['status']} é imutável (RN-PI-05). Campos bloqueados: {sorted(blocked)}. Crie um aditivo para alterações comerciais."
-            )
+            justificativa = (payload.get("justificativa") or "").strip()
+            if not justificativa:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Pedido {existing['status']} é imutável (RN-PI-05). Campos bloqueados: {sorted(blocked)}. Forneça uma justificativa para editar campos comerciais. (R21)"
+                )
+            # R21: write audit log entry
+            old_vals = {k: existing.get(k) for k in blocked}
+            new_vals = {k: payload.get(k) for k in blocked}
+            audit_entry = {
+                "id": new_id(),
+                "tenant_id": user["tenant_id"],
+                "order_id": order_id,
+                "order_numero": existing.get("numero_pedido", ""),
+                "user_id": user["id"],
+                "user_name": user.get("name", ""),
+                "action": "edit_locked",
+                "fields_changed": sorted(blocked),
+                "old_values": old_vals,
+                "new_values": new_vals,
+                "justificativa": justificativa,
+                "created_at": now_iso(),
+            }
+            await db.order_audit_log.insert_one(audit_entry)
 
     # CQ hard stops — verify CK prerequisites before starting production
     if payload.get("status") == "em_producao":
@@ -644,6 +679,16 @@ async def update_order(order_id: str, data: OrderUpdate, request: Request):
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    # R19: Auto-create followups when order first transitions to concluido
+    if payload.get("status") == "concluido" and existing.get("status") != "concluido":
+        if not existing.get("followups"):
+            now_dt = datetime.now(timezone.utc)
+            marcos_dias = [("1m", 30), ("3m", 90), ("6m", 180)]
+            update_fields["followups"] = [
+                {"marco": marco, "vence_em": (now_dt + timedelta(days=dias)).isoformat(), "notificado": False}
+                for marco, dias in marcos_dias
+            ]
 
     update_fields["updated_at"] = now_iso()
     await db.orders.update_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"$set": update_fields})
@@ -821,6 +866,138 @@ async def create_op_from_order(order_id: str, request: Request):
     # Link back to the order
     await db.orders.update_one({"id": order_id}, {"$set": {"op_id": op["id"], "status": "em_producao", "updated_at": now_iso()}})
     return op
+
+
+# ============ R15: REPRODUZIR PEDIDO ============
+@orders_router.post("/{order_id}/reproduzir")
+async def reproduzir_pedido(order_id: str, data: ReproduzirInput, request: Request):
+    """Clone an existing locked order and immediately create a new OP (R15)."""
+    import copy
+    user = await get_current_user(request)
+    if user.get("role") not in {"admin", "vendedor", "sales_ops"}:
+        raise HTTPException(status_code=403, detail="Permissão negada. Apenas Comercial e Admin podem reproduzir pedidos.")
+
+    original = await db.orders.find_one({"id": order_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not original:
+        raise HTTPException(status_code=404, detail="Pedido original não encontrado")
+    if original.get("status") not in STATUSES_IMUTAVEL:
+        raise HTTPException(status_code=422, detail="Só é possível reproduzir pedidos Confirmados, Em Produção ou Concluídos.")
+
+    # Clone items applying overrides keyed by codigo_kuryos
+    items = copy.deepcopy(original.get("items", []))
+    override_map = {ov.codigo_kuryos: ov for ov in data.items_override if ov.codigo_kuryos}
+    for it in items:
+        ov = override_map.get(it.get("codigo_kuryos", ""))
+        if ov:
+            if ov.valor_unitario is not None:
+                it["valor_unitario"] = ov.valor_unitario
+            if ov.prazo_entrega is not None:
+                it["prazo_entrega"] = ov.prazo_entrega
+            if ov.qtd is not None:
+                it["qtd"] = ov.qtd
+
+    totals = _calculate_totals(items)
+    ap_comercial = _eval_aprovacao_comercial(totals)
+    numero = await _generate_order_number(user["tenant_id"])
+
+    frete = copy.deepcopy(original.get("frete", {}))
+    if data.endereco_entrega is not None:
+        frete["endereco"] = data.endereco_entrega
+
+    checklist_default = [
+        {"categoria": c, "ativo": False, "origem": "kuryos", "status": "pendente",
+         "responsavel": "", "data_prevista": None, "observacoes": ""}
+        for c in CATEGORIAS_INSUMO
+    ]
+    ts = now_iso()
+    new_order = {
+        "id": new_id(),
+        "tenant_id": user["tenant_id"],
+        "pd_request_id": original.get("pd_request_id"),
+        "kickoff_id": original.get("kickoff_id"),
+        "client_card_id": original.get("client_card_id"),
+        "numero_pedido": numero,
+        "data_pedido": ts,
+        "status": "confirmado",
+        "tipo_servico": original.get("tipo_servico", "producao"),
+        "nivel_formalizacao": original.get("nivel_formalizacao", 1),
+        "project_name": original.get("project_name", ""),
+        "cliente": copy.deepcopy(original.get("cliente", {})),
+        "frete": frete,
+        "items": items,
+        "condicoes": copy.deepcopy(original.get("condicoes", {})),
+        "insumos": [],
+        "checklist_insumos": checklist_default,
+        "total_pedido": totals["total_pedido"],
+        "total_bruto": totals["total_bruto"],
+        "total_desconto": totals["total_desconto"],
+        "desconto_pct_medio": totals["desconto_pct_medio"],
+        "observacoes": data.observacoes or "",
+        "cgi_status": "assinado",
+        "cgi_assinado_em": ts,
+        "cgi_assinado_por": user.get("name", ""),
+        "aprovacao_cliente": "aprovado",
+        "aprovacao_cliente_obs": f"Reprodução do pedido #{original.get('numero_pedido', '')}",
+        "aprovacao_cliente_em": ts,
+        "aprovacao_cliente_por": user.get("name", ""),
+        "aprovacao_comercial": ap_comercial["aprovacao_comercial"],
+        "aprovacao_comercial_nivel": ap_comercial["aprovacao_comercial_nivel"],
+        "aprovacao_comercial_por": None,
+        "aprovacao_comercial_em": None,
+        "aprovacao_comercial_obs": "",
+        "op_id": None,
+        "reproducao_de": order_id,
+        "followups": [],
+        "created_at": ts,
+        "updated_at": ts,
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "auto_created": False,
+    }
+    await db.orders.insert_one(new_order)
+    new_order.pop("_id", None)
+
+    # Immediately create the OP
+    numero_op = await _generate_op_number(user["tenant_id"])
+    op_items = [
+        {
+            "item": it.get("item", ""),
+            "codigo_kuryos": it.get("codigo_kuryos", ""),
+            "qtd_planejada": it.get("qtd", 0),
+            "qtd_produzida": 0,
+            "lote": "",
+            "prazo_sla": it.get("prazo_entrega", ""),
+        }
+        for it in items
+    ]
+    op = {
+        "id": new_id(),
+        "tenant_id": user["tenant_id"],
+        "numero_op": numero_op,
+        "pedido_id": new_order["id"],
+        "numero_pedido": numero,
+        "cliente_nome": new_order["cliente"].get("nome") or new_order["cliente"].get("razao_social", ""),
+        "project_name": new_order.get("project_name", ""),
+        "status": "aberta",
+        "items": op_items,
+        "observacoes": "",
+        "created_at": ts,
+        "updated_at": ts,
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+    }
+    await db.ops.insert_one(op)
+    op.pop("_id", None)
+
+    # Link OP to new order and set status to em_producao
+    await db.orders.update_one(
+        {"id": new_order["id"]},
+        {"$set": {"op_id": op["id"], "status": "em_producao", "updated_at": ts}}
+    )
+    new_order["op_id"] = op["id"]
+    new_order["status"] = "em_producao"
+
+    return {"order": new_order, "op": op}
 
 
 # ============ PDF GENERATION ============

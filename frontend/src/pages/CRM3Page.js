@@ -56,7 +56,7 @@ const STAGES = [
     { id: "aguardando_aprovacao",label: "Aguardando Aprovação", color: "bg-yellow-400" },
     { id: "retrabalho_interno",  label: "Retrabalho",           color: "bg-red-400" },
     { id: "aprovado",            label: "Aprovado",             color: "bg-green-500" },
-    { id: "concluido",           label: "Concluído",            color: "bg-emerald-600" },
+    { id: "concluido",           label: "Plano Futuro",         color: "bg-emerald-600" },
 ];
 
 const STAGE_LABELS = Object.fromEntries(STAGES.map(s => [s.id, s.label]));
@@ -170,6 +170,34 @@ export default function CRM3Page() {
         };
     }, []);
 
+    // Coletar variações reprovadas (arquivadas) separadamente
+    const variacoesReprovadas = [];
+    samples.forEach(sample => {
+        try {
+            if (!sample || typeof sample !== 'object' || !sample.id) return;
+            (sample.variacoes || []).forEach(variacao => {
+                if (!variacao || typeof variacao !== 'object') return;
+                if (variacao.status === "reprovada") {
+                    variacoesReprovadas.push({
+                        id: variacao.id || `${sample.id}-var`,
+                        codigo: variacao.codigo || '',
+                        status: "reprovada",
+                        status_pd_raw: "reprovada",
+                        status_pd_label: "Reprovada pelo Cliente",
+                        sample_id: sample.id,
+                        sample_numero: sample.numero_amostra || '',
+                        nome_produto: sample.nome_produto || sample.nome_amostra || '',
+                        projeto_nome: sample.projeto_nome || '',
+                        cliente_nome: sample.cliente_nome || '',
+                        descricao_aplicacao: variacao.descricao_aplicacao || '',
+                        feedback_cliente: variacao.feedback_cliente || variacao.reprovacao_motivo || '',
+                        sample_completa: sample,
+                    });
+                }
+            });
+        } catch {}
+    });
+
     // Agrupar variações por estágio P&D (status_pd_raw) — espelho do Pipeline P&D
     const variacoesByStage = STAGES.reduce((acc, stage) => {
         acc[stage.id] = [];
@@ -188,6 +216,8 @@ export default function CRM3Page() {
                             console.warn("Invalid variacao:", variacao);
                             return;
                         }
+                        // Reprovadas ficam na seção de arquivo
+                        if (variacao.status === "reprovada") return;
                         // Usa status_pd_raw; se ainda não houver (card recém-criado), assume "solicitado"
                         const pdStage = variacao.status_pd_raw || "solicitado";
                         if (pdStage === stage.id) {
@@ -304,6 +334,7 @@ export default function CRM3Page() {
         }
     };
 
+    const [showReprovadas, setShowReprovadas] = useState(false);
     const [showAddVariacoes, setShowAddVariacoes] = useState(false);
     const [newVariacoes, setNewVariacoes] = useState([{
         descricao_aplicacao: "",
@@ -571,6 +602,42 @@ export default function CRM3Page() {
                     </>
                 );
             })()}
+
+            {/* Reprovadas Archive Section */}
+            {variacoesReprovadas.length > 0 && (
+                <div className="mt-6 border border-border rounded-lg overflow-hidden" data-testid="reprovadas-section">
+                    <button
+                        className="w-full flex items-center justify-between px-4 py-3 bg-muted/40 hover:bg-muted/60 transition-colors text-sm font-medium"
+                        onClick={() => setShowReprovadas(v => !v)}
+                    >
+                        <span className="flex items-center gap-2 text-muted-foreground">
+                            <X className="h-4 w-4 text-red-500" />
+                            Reprovadas ({variacoesReprovadas.length})
+                        </span>
+                        <span className="text-xs text-muted-foreground">{showReprovadas ? "▲ Recolher" : "▼ Expandir"}</span>
+                    </button>
+                    {showReprovadas && (
+                        <div className="divide-y divide-border">
+                            {variacoesReprovadas.map(v => (
+                                <div
+                                    key={v.id}
+                                    className="px-4 py-3 flex items-center gap-3 hover:bg-muted/20 cursor-pointer"
+                                    onClick={() => { setSelectedSample(v.sample_completa); setSelectedVariacao(v); setTab("variacoes"); }}
+                                >
+                                    <span className="px-1.5 py-0.5 bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300 rounded text-[10px] font-bold mono-num shrink-0">
+                                        {v.codigo || v.sample_numero || "?"}
+                                    </span>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm font-medium truncate">{v.nome_produto}</p>
+                                        <p className="text-xs text-muted-foreground truncate">{v.cliente_nome}{v.feedback_cliente ? ` · ${v.feedback_cliente}` : ""}</p>
+                                    </div>
+                                    <Badge variant="destructive" className="text-[10px] shrink-0">Reprovada</Badge>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* Sample Detail Sheet */}
             <Sheet open={!!selectedSample} onOpenChange={(v) => { if (!v) { setSelectedSample(null); loadSamples(); } }}>

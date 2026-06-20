@@ -9,10 +9,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { ArrowLeft, Save, Download, Loader2, Plus, Trash2, FileText, Pencil, Check, X, ShieldCheck, AlertTriangle, Factory, Lock, CheckCircle2 } from "lucide-react";
+import { ArrowLeft, Save, Download, Loader2, Plus, Trash2, FileText, Pencil, Check, X, ShieldCheck, AlertTriangle, Factory, Lock, CheckCircle2, Copy } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { CurrencyInput, fmtCurrency } from "@/components/ui/CurrencyInput";
+import { useAuth } from "@/contexts/AuthContext";
 
 const TIPOS_SERVICO = [
   { value: "producao",    label: "Produção",    desc: "Primeiro pedido — amostra aprovada, gera novo SKU" },
@@ -99,11 +101,16 @@ function dateInputValue(iso) {
 export default function OrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState(null);
+  const [justificativa, setJustificativa] = useState("");
+  const [showReproduzir, setShowReproduzir] = useState(false);
+  const [reproducaoData, setReproducaoData] = useState({ items_override: [], endereco_entrega: "", observacoes: "" });
+  const [reproducaoLoading, setReproducaoLoading] = useState(false);
 
   const fetchOrder = useCallback(async () => {
     try {
@@ -129,6 +136,21 @@ export default function OrderDetail() {
   const cancelEdit = () => {
     setForm(deepClone(order));
     setEditing(false);
+    setJustificativa("");
+  };
+
+  const openReproduzir = () => {
+    setReproducaoData({
+      items_override: (order.items || []).map(it => ({
+        codigo_kuryos: it.codigo_kuryos || "",
+        valor_unitario: it.valor_unitario,
+        prazo_entrega: it.prazo_entrega || "",
+        qtd: it.qtd,
+      })),
+      endereco_entrega: order.frete?.endereco || "",
+      observacoes: "",
+    });
+    setShowReproduzir(true);
   };
 
   const saveOrder = async () => {
@@ -140,6 +162,17 @@ export default function OrderDetail() {
             status: form.status,
             observacoes: form.observacoes,
             checklist_insumos: form.checklist_insumos,
+            // R21: always include full payload for locked orders; backend decides
+            numero_pedido: form.numero_pedido,
+            data_pedido: form.data_pedido,
+            tipo_servico: form.tipo_servico,
+            nivel_formalizacao: form.nivel_formalizacao,
+            cliente: form.cliente,
+            frete: form.frete,
+            items: form.items,
+            condicoes: form.condicoes,
+            insumos: form.insumos,
+            ...(justificativa.trim() ? { justificativa: justificativa.trim() } : {}),
           }
         : {
             numero_pedido: form.numero_pedido,
@@ -159,11 +192,30 @@ export default function OrderDetail() {
       setOrder(res.data);
       setForm(deepClone(res.data));
       setEditing(false);
+      setJustificativa("");
       toast.success("Pedido atualizado!");
     } catch (err) {
       toast.error(err.response?.data?.detail || "Erro ao salvar");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const reproduzirPedido = async () => {
+    setReproducaoLoading(true);
+    try {
+      const res = await api.post(`/orders/${id}/reproduzir`, {
+        items_override: reproducaoData.items_override.filter(ov => ov.codigo_kuryos),
+        endereco_entrega: reproducaoData.endereco_entrega || null,
+        observacoes: reproducaoData.observacoes || null,
+      });
+      toast.success(`Nova produção criada! Pedido #${res.data.order.numero_pedido} → OP ${res.data.op.numero_op}`);
+      setShowReproduzir(false);
+      navigate(`/orders/${res.data.order.id}`);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Erro ao reproduzir pedido");
+    } finally {
+      setReproducaoLoading(false);
     }
   };
 
@@ -364,6 +416,11 @@ export default function OrderDetail() {
                 <Factory className="h-4 w-4" /> Ver OP
               </Button>
             )}
+            {STATUSES_IMUTAVEL.has(form.status) && ["admin", "vendedor", "sales_ops"].includes(user?.role) && !editing && (
+              <Button variant="outline" onClick={openReproduzir} className="gap-1.5 border-violet-400 text-violet-700 hover:bg-violet-50 dark:text-violet-300 dark:border-violet-600" data-testid="reproduzir-btn">
+                <Copy className="h-4 w-4" /> Nova Produção
+              </Button>
+            )}
             <Button onClick={downloadPDF} className="gap-1.5" data-testid="download-pdf-btn">
               <Download className="h-4 w-4" /> Gerar PDF
             </Button>
@@ -413,11 +470,26 @@ export default function OrderDetail() {
 
         {/* Imutabilidade banner */}
         {STATUSES_IMUTAVEL.has(form.status) && (
-          <div className="rounded-xl border border-blue-300 bg-blue-50 dark:bg-blue-950/30 dark:border-blue-800 px-5 py-3 flex items-center gap-3">
-            <Lock className="h-4 w-4 text-blue-600 shrink-0" />
-            <p className="text-sm text-blue-700 dark:text-blue-300">
-              <strong>Pedido imutável (RN-PI-05)</strong> — Status <em>{form.status}</em>. Campos comerciais bloqueados. Apenas checklist de insumos e observações podem ser atualizados. Para alterações, crie um aditivo.
-            </p>
+          <div className="rounded-xl border border-blue-300 bg-blue-50 dark:bg-blue-950/30 dark:border-blue-800 px-5 py-3 space-y-2">
+            <div className="flex items-center gap-3">
+              <Lock className="h-4 w-4 text-blue-600 shrink-0" />
+              <p className="text-sm text-blue-700 dark:text-blue-300">
+                <strong>Pedido imutável (RN-PI-05)</strong> — Status <em>{form.status}</em>. Campos comerciais bloqueados. Forneça uma justificativa para editar e registrar no audit log (R21).
+              </p>
+            </div>
+            {editing && (
+              <div className="pl-7">
+                <Label className="text-xs text-blue-700 dark:text-blue-400">Justificativa para edição (obrigatória para campos comerciais)</Label>
+                <Textarea
+                  value={justificativa}
+                  onChange={e => setJustificativa(e.target.value)}
+                  placeholder="Descreva o motivo da alteração..."
+                  rows={2}
+                  className="mt-1 text-sm border-blue-300 focus:border-blue-500"
+                  data-testid="justificativa-input"
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -897,14 +969,140 @@ export default function OrderDetail() {
           </Card>
         )}
 
+        {/* Follow-up marcos (R19) */}
+        {(order.followups || []).length > 0 && (
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center gap-2">Follow-ups de Pós-Produção</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex gap-3 flex-wrap">
+                {(order.followups || []).map(fu => {
+                  const vence = new Date(fu.vence_em);
+                  const overdue = vence < new Date() && !fu.notificado;
+                  return (
+                    <div key={fu.marco} className={`rounded-lg border px-4 py-3 text-center min-w-[120px] ${fu.notificado ? "bg-green-50 border-green-300" : overdue ? "bg-red-50 border-red-300" : "bg-slate-50 border-slate-200"}`}>
+                      <div className={`text-lg font-bold font-mono ${fu.notificado ? "text-green-700" : overdue ? "text-red-700" : "text-slate-700"}`}>{fu.marco}</div>
+                      <div className="text-xs text-muted-foreground mt-0.5">{vence.toLocaleDateString("pt-BR")}</div>
+                      <div className={`text-[10px] mt-1 font-medium ${fu.notificado ? "text-green-600" : overdue ? "text-red-600" : "text-slate-500"}`}>
+                        {fu.notificado ? "Notificado" : overdue ? "Vencido" : "Pendente"}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Footer info */}
         <div className="text-[11px] text-muted-foreground pt-2">
           Criado por <strong>{order.created_by_name}</strong> em {order.created_at ? new Date(order.created_at).toLocaleString("pt-BR") : "—"}
           {order.pd_request_id && (
             <> • <button onClick={() => navigate(`/pd/${order.pd_request_id}`)} className="text-primary hover:underline" data-testid="link-to-pd">Ver projeto P&D</button></>
           )}
+          {order.reproducao_de && (
+            <> • <button onClick={() => navigate(`/orders/${order.reproducao_de}`)} className="text-primary hover:underline">Ver pedido original</button></>
+          )}
         </div>
       </div>
+
+      {/* R15: Reproduzir Pedido Dialog */}
+      <Dialog open={showReproduzir} onOpenChange={setShowReproduzir}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Copy className="h-5 w-5 text-violet-600" />
+              Nova Produção — Reproduzir Pedido #{form?.numero_pedido}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-muted-foreground">
+              Cria um novo pedido clonando os dados deste, gera OP automaticamente. Ajuste valores, prazos e endereço conforme necessário.
+            </p>
+            {/* Item overrides */}
+            <div>
+              <Label className="text-sm font-medium">Itens (ajuste valor unitário e prazo)</Label>
+              <div className="mt-2 space-y-2">
+                {(reproducaoData.items_override || []).map((ov, idx) => (
+                  <div key={idx} className="grid grid-cols-12 gap-2 items-center text-xs">
+                    <div className="col-span-4 font-mono text-muted-foreground truncate">{ov.codigo_kuryos || `Item ${idx + 1}`}</div>
+                    <div className="col-span-3">
+                      <Label className="text-[10px] text-muted-foreground">Valor Unit.</Label>
+                      <Input
+                        type="number"
+                        value={ov.valor_unitario ?? ""}
+                        onChange={e => {
+                          const ovs = [...reproducaoData.items_override];
+                          ovs[idx] = { ...ovs[idx], valor_unitario: parseFloat(e.target.value) || 0 };
+                          setReproducaoData(p => ({ ...p, items_override: ovs }));
+                        }}
+                        className="h-7 text-xs"
+                        placeholder="0.00"
+                      />
+                    </div>
+                    <div className="col-span-3">
+                      <Label className="text-[10px] text-muted-foreground">Prazo</Label>
+                      <Input
+                        value={ov.prazo_entrega ?? ""}
+                        onChange={e => {
+                          const ovs = [...reproducaoData.items_override];
+                          ovs[idx] = { ...ovs[idx], prazo_entrega: e.target.value };
+                          setReproducaoData(p => ({ ...p, items_override: ovs }));
+                        }}
+                        className="h-7 text-xs"
+                        placeholder="ex: 20 Dias"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="text-[10px] text-muted-foreground">Qtd</Label>
+                      <Input
+                        type="number"
+                        value={ov.qtd ?? ""}
+                        onChange={e => {
+                          const ovs = [...reproducaoData.items_override];
+                          ovs[idx] = { ...ovs[idx], qtd: parseFloat(e.target.value) || 0 };
+                          setReproducaoData(p => ({ ...p, items_override: ovs }));
+                        }}
+                        className="h-7 text-xs"
+                        placeholder="0"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* Endereço */}
+            <div>
+              <Label className="text-sm font-medium">Endereço de Entrega</Label>
+              <Input
+                value={reproducaoData.endereco_entrega}
+                onChange={e => setReproducaoData(p => ({ ...p, endereco_entrega: e.target.value }))}
+                className="mt-1"
+                placeholder="Endereço completo..."
+              />
+            </div>
+            {/* Observações */}
+            <div>
+              <Label className="text-sm font-medium">Observações (opcional)</Label>
+              <Textarea
+                value={reproducaoData.observacoes}
+                onChange={e => setReproducaoData(p => ({ ...p, observacoes: e.target.value }))}
+                rows={2}
+                className="mt-1"
+                placeholder="Notas sobre esta reprodução..."
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setShowReproduzir(false)}>Cancelar</Button>
+            <Button onClick={reproduzirPedido} disabled={reproducaoLoading} className="gap-1.5 bg-violet-600 hover:bg-violet-700 text-white">
+              {reproducaoLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Copy className="h-4 w-4" />}
+              Criar Nova Produção
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

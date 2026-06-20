@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { ClipboardList, Search, Loader2, FileText, ArrowRight, Building2, Calendar, DollarSign } from "lucide-react";
+import { ClipboardList, Search, Loader2, FileText, ArrowRight, Building2, Calendar, DollarSign, Bell } from "lucide-react";
 
 const STATUS_CONFIG = {
   rascunho: { label: "Rascunho", color: "bg-slate-500/10 text-slate-600 border-slate-300 dark:text-slate-300" },
@@ -27,12 +27,31 @@ function formatDateBR(iso) {
   try { return new Date(iso).toLocaleDateString("pt-BR"); } catch { return iso; }
 }
 
+const FOLLOWUP_LABELS = { "1m": "1 mês", "3m": "3 meses", "6m": "6 meses" };
+
+function getOrderFollowupState(order) {
+  const now = new Date();
+  const fus = order.followups || [];
+  if (!fus.length) return null;
+  const pending = fus.filter(fu => !fu.notificado);
+  if (!pending.length) return { label: "Todos notificados", color: "bg-green-100 text-green-700", marco: null };
+  const next = pending.reduce((a, b) => new Date(a.vence_em) <= new Date(b.vence_em) ? a : b);
+  const overdue = new Date(next.vence_em) < now;
+  return {
+    label: `Follow-up ${next.marco}${overdue ? " (vencido)" : ""}`,
+    color: overdue ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700",
+    marco: next.marco,
+    overdue,
+  };
+}
+
 export default function OrdersPage() {
   const navigate = useNavigate();
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [followupFilter, setFollowupFilter] = useState("all");
 
   const fetchOrders = useCallback(async () => {
     setLoading(true);
@@ -110,6 +129,19 @@ export default function OrdersPage() {
               <SelectItem value="cancelado">Cancelado</SelectItem>
             </SelectContent>
           </Select>
+          <Select value={followupFilter} onValueChange={setFollowupFilter}>
+            <SelectTrigger className="w-44" data-testid="orders-followup-filter">
+              <Bell className="h-3.5 w-3.5 mr-1" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">Follow-up: Todos</SelectItem>
+              <SelectItem value="1m">Follow-up 1 mês</SelectItem>
+              <SelectItem value="3m">Follow-up 3 meses</SelectItem>
+              <SelectItem value="6m">Follow-up 6 meses</SelectItem>
+              <SelectItem value="pendente">Com follow-up pendente</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
 
         {/* List */}
@@ -129,8 +161,16 @@ export default function OrdersPage() {
           </Card>
         ) : (
           <div className="space-y-2">
-            {orders.map(order => {
+            {orders
+              .filter(order => {
+                if (followupFilter === "all") return true;
+                const fus = order.followups || [];
+                if (followupFilter === "pendente") return fus.some(fu => !fu.notificado);
+                return fus.some(fu => fu.marco === followupFilter && !fu.notificado);
+              })
+              .map(order => {
               const cfg = STATUS_CONFIG[order.status] || STATUS_CONFIG.rascunho;
+              const fuState = getOrderFollowupState(order);
               return (
                 <Card
                   key={order.id}
@@ -148,6 +188,17 @@ export default function OrdersPage() {
                             <Badge variant="outline" className="text-[10px] gap-1">
                               <FileText className="h-2.5 w-2.5" />
                               Auto-gerado
+                            </Badge>
+                          )}
+                          {order.reproducao_de && (
+                            <Badge variant="outline" className="text-[10px] gap-1 border-violet-300 text-violet-700">
+                              Reprodução
+                            </Badge>
+                          )}
+                          {fuState && (
+                            <Badge className={`text-[10px] gap-1 ${fuState.color}`}>
+                              <Bell className="h-2.5 w-2.5" />
+                              {fuState.label}
                             </Badge>
                           )}
                         </div>

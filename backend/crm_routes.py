@@ -3521,6 +3521,7 @@ async def resultado_cliente(
         set_ops["variacoes.$.resultado"] = "reprovada"
         set_ops["variacoes.$.aprovacao_externa"] = False
         set_ops["variacoes.$.reprovacao_motivo"] = data.feedback_cliente or ""
+        set_ops["variacoes.$.arquivada"] = True
     if data.resultado == "retrabalho":
         set_ops["variacoes.$.aprovacao_externa"] = False
         set_ops["variacoes.$.reprovacao_motivo"] = data.feedback_cliente or ""

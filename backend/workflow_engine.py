@@ -1373,6 +1373,37 @@ async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
     return created
 
 
+async def check_followup_notifications_for_tenant(tenant_id: str):
+    """R19: Notify commercial users when order follow-up marcos (1m/3m/6m) are reached."""
+    now = datetime.now(timezone.utc).isoformat()
+    orders = await db.orders.find(
+        {
+            "tenant_id": tenant_id,
+            "status": "concluido",
+            "followups": {"$elemMatch": {"notificado": False, "vence_em": {"$lte": now}}},
+        },
+        {"_id": 0, "id": 1, "numero_pedido": 1, "followups": 1, "cliente": 1, "created_by": 1},
+    ).to_list(500)
+
+    for order in orders:
+        for i, fu in enumerate(order.get("followups", [])):
+            if fu.get("notificado") or fu.get("vence_em", "9999") > now:
+                continue
+            cliente_nome = (order.get("cliente") or {}).get("nome") or (order.get("cliente") or {}).get("razao_social", "")
+            await create_user_notification(
+                tenant_id=tenant_id,
+                user_id=order.get("created_by", ""),
+                notif_type="followup",
+                title=f"Follow-up {fu['marco']} — Pedido #{order.get('numero_pedido', '')}",
+                message=f"Marco de {fu['marco']} atingido para o pedido #{order.get('numero_pedido', '')} — {cliente_nome}",
+                metadata={"order_id": order["id"], "marco": fu["marco"]},
+            )
+            await db.orders.update_one(
+                {"id": order["id"]},
+                {"$set": {f"followups.{i}.notificado": True}},
+            )
+
+
 async def run_workflow_notification_scheduler():
     await asyncio.sleep(45)
     while True:
@@ -1380,6 +1411,7 @@ async def run_workflow_notification_scheduler():
             tenants = await db.tenants.find({}, {"_id": 0, "id": 1}).to_list(500)
             for tenant in tenants:
                 await check_workflow_due_notifications_for_tenant(tenant["id"])
+                await check_followup_notifications_for_tenant(tenant["id"])
         except Exception as exc:  # pragma: no cover
             logger.error(f"Workflow notification scheduler error: {exc}")
         await asyncio.sleep(3600)

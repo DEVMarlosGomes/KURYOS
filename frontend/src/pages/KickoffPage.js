@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import api from "@/lib/api";
 import { formatApiError } from "@/lib/formatError";
@@ -12,7 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { CheckCircle2, Clock3, Download, Lock, XCircle, FileText } from "lucide-react";
+import { CheckCircle2, Clock3, Download, XCircle, FileText, Upload, ExternalLink, Package, Loader2 as Loader2Icon } from "lucide-react";
 import { toast } from "sonner";
 import { hasRole } from "@/components/RoleGuard";
 
@@ -64,6 +64,68 @@ function normalizeBlock4(kickoff) {
   };
 }
 
+const SAMPLE_STATUS_LABELS = {
+  solicitada: "Solicitada", em_elaboracao: "Em Elaboração", retrabalho: "Retrabalho",
+  enviada: "Enviada ao Cliente", aprovada: "Aprovada", reprovada: "Reprovada",
+};
+const SAMPLE_STATUS_COLORS = {
+  solicitada: "bg-gray-100 text-gray-700", em_elaboracao: "bg-blue-100 text-blue-700",
+  retrabalho: "bg-amber-100 text-amber-700", enviada: "bg-purple-100 text-purple-700",
+  aprovada: "bg-green-100 text-green-700", reprovada: "bg-red-100 text-red-700",
+};
+
+function FileUploadInput({ value, onChange, accept = ".png,.jpg,.jpeg,.svg,.pdf" }) {
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef(null);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const { data } = await api.post("/upload", formData, { headers: { "Content-Type": "multipart/form-data" } });
+      onChange(data.id);
+      toast.success(`"${data.original_filename}" enviado.`);
+    } catch {
+      toast.error("Erro ao enviar arquivo");
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
+  const handleView = async () => {
+    if (!value) return;
+    try {
+      const { data } = await api.get(`/files/${value}`, { responseType: "blob" });
+      const url = URL.createObjectURL(data);
+      window.open(url, "_blank");
+    } catch {
+      toast.error("Erro ao abrir arquivo");
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <input ref={inputRef} type="file" accept={accept} className="hidden" onChange={handleFile} />
+      <Button type="button" variant="outline" size="sm" onClick={() => inputRef.current?.click()} disabled={uploading} className="gap-1.5 h-8">
+        {uploading ? <Loader2Icon className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+        {value ? "Substituir" : "Enviar arquivo"}
+      </Button>
+      {value && (
+        <>
+          <button type="button" onClick={handleView} className="text-xs text-indigo-600 hover:underline flex items-center gap-1">
+            <ExternalLink className="h-3 w-3" /> Ver
+          </button>
+          <span className="text-[10px] text-muted-foreground font-mono truncate max-w-[160px]">{value}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function KickoffPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -78,6 +140,7 @@ export default function KickoffPage() {
   const [approvalNotes, setApprovalNotes] = useState("");
   const [approvalReason, setApprovalReason] = useState("");
   const [activeTab, setActiveTab] = useState("bloco1");
+  const [projSamples, setProjSamples] = useState([]);
 
   const loadKickoff = async () => {
     setLoading(true);
@@ -87,6 +150,11 @@ export default function KickoffPage() {
       setBlock2(data.bloco2 || {});
       setBlock3(normalizeBlock3(data));
       setBlock4(normalizeBlock4(data));
+      if (data.projeto_id) {
+        api.get("/crm/samples", { params: { projeto_id: data.projeto_id } })
+          .then(r => setProjSamples(Array.isArray(r.data) ? r.data : []))
+          .catch(() => {});
+      }
     } catch (error) {
       toast.error(formatApiError(error));
       navigate("/kickoffs");
@@ -114,7 +182,7 @@ export default function KickoffPage() {
       setBlock2(data.bloco2 || {});
       setBlock3(normalizeBlock3(data));
       setBlock4(normalizeBlock4(data));
-      if (nextTab && !data.locks?.[nextTab]) {
+      if (nextTab) {
         setActiveTab(nextTab);
       }
     } catch (error) {
@@ -206,31 +274,82 @@ export default function KickoffPage() {
         </TabsList>
 
         <TabsContent value="bloco1">
-          <Card><CardContent className="p-5 grid gap-4 md:grid-cols-2">
-            {[
-              ["Numero", block1.numero_kickoff],
-              ["Data abertura", formatDate(block1.data_abertura)],
-              ["Cliente", block1.cliente],
-              ["CNPJ", block1.cnpj],
-              ["Projeto", block1.projeto_vinculado],
-              ["Amostra aprovada", block1.amostra_aprovada],
-              ["Formula vinculada", block1.formula_vinculada],
-              ["Formulador responsavel", block1.formulador_responsavel],
-              ["Responsavel comercial", block1.responsavel_comercial],
-              ["Pre-briefing origem", block1.pre_briefing_origem],
-              ["Feedback cliente", block1.feedback_cliente],
-            ].map(([label, value]) => (
-              <div key={label} className={label === "Pre-briefing origem" || label === "Feedback cliente" ? "md:col-span-2" : ""}>
-                <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</p>
-                <p className="mt-1 text-sm whitespace-pre-wrap">{value || "-"}</p>
-              </div>
-            ))}
-          </CardContent></Card>
+          <div className="space-y-4">
+            <Card><CardContent className="p-5 grid gap-4 md:grid-cols-2">
+              {[
+                ["Numero", block1.numero_kickoff],
+                ["Data abertura", formatDate(block1.data_abertura)],
+                ["Cliente", block1.cliente],
+                ["CNPJ", block1.cnpj],
+                ["Projeto", block1.projeto_vinculado],
+                ["Formula vinculada", block1.formula_vinculada],
+                ["Formulador responsavel", block1.formulador_responsavel],
+                ["Responsavel comercial", block1.responsavel_comercial],
+                ["Pre-briefing origem", block1.pre_briefing_origem],
+                ["Feedback cliente", block1.feedback_cliente],
+              ].map(([label, value]) => (
+                <div key={label} className={label === "Pre-briefing origem" || label === "Feedback cliente" ? "md:col-span-2" : ""}>
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</p>
+                  <p className="mt-1 text-sm whitespace-pre-wrap">{value || "-"}</p>
+                </div>
+              ))}
+            </CardContent></Card>
+
+            {projSamples.length > 0 && (
+              <Card>
+                <CardContent className="p-5">
+                  <p className="text-sm font-semibold mb-3 flex items-center gap-2">
+                    <Package className="h-4 w-4 text-primary" />
+                    Amostras do Projeto ({projSamples.length})
+                  </p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b text-left text-muted-foreground">
+                          <th className="py-2 pr-3">Amostra</th>
+                          <th className="py-2 pr-3">Produto</th>
+                          <th className="py-2 pr-3">Variação</th>
+                          <th className="py-2 pr-3">Status</th>
+                          <th className="py-2">SKU</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {projSamples.flatMap(s =>
+                          (s.variacoes || []).length > 0
+                            ? s.variacoes.map(v => ({ s, v }))
+                            : [{ s, v: null }]
+                        ).map(({ s, v }, idx) => (
+                          <tr key={`${s.id}-${v?.id || idx}`} className="border-b last:border-b-0">
+                            <td className="py-2 pr-3 font-mono font-semibold text-primary">{s.numero_amostra || s.id?.slice(-6)}</td>
+                            <td className="py-2 pr-3">{s.nome_produto || s.nome_amostra || "—"}</td>
+                            <td className="py-2 pr-3">{v?.codigo || "—"}</td>
+                            <td className="py-2 pr-3">
+                              {v ? (
+                                <span className={`px-2 py-0.5 rounded-full font-medium ${SAMPLE_STATUS_COLORS[v.status] || "bg-muted text-muted-foreground"}`}>
+                                  {SAMPLE_STATUS_LABELS[v.status] || v.status || "—"}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground">—</span>
+                              )}
+                            </td>
+                            <td className="py-2">
+                              {v?.sku_id ? (
+                                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-mono font-semibold">{v.sku_codigo || v.sku_id}</span>
+                              ) : "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </div>
         </TabsContent>
 
         <TabsContent value="bloco2">
           <Card><CardContent className="p-5 space-y-4">
-            {kickoff.locks?.bloco2 && <p className="text-sm text-muted-foreground">{kickoff.locks.bloco2}</p>}
             <div className="grid gap-4 md:grid-cols-2">
               <div><Label>Volume primeiro pedido</Label><Input value={block2.volume_primeiro_pedido || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, volume_primeiro_pedido: Number(e.target.value) || "" }))} /></div>
               <div><Label>Volume estimado mes</Label><Input value={block2.volume_estimado_mes || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, volume_estimado_mes: Number(e.target.value) || "" }))} /></div>
@@ -244,9 +363,12 @@ export default function KickoffPage() {
               <div><Label>Incoterm</Label><Input value={block2.incoterm || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, incoterm: e.target.value }))} /></div>
               <div className="md:col-span-2"><Label>Endereco entrega</Label><Input value={block2.endereco_entrega || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, endereco_entrega: e.target.value }))} /></div>
               <div><Label>CFOP</Label><Input value={block2.nota_fiscal_cfop || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, nota_fiscal_cfop: e.target.value }))} /></div>
-              <div><Label>Contrato assinado file_id</Label><Input value={block2.contrato_assinado_file_id || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, contrato_assinado_file_id: e.target.value }))} /></div>
-              <div><Label>Data contrato</Label><Input type="date" value={block2.contrato_assinado_data || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, contrato_assinado_data: e.target.value }))} /></div>
+              <div><Label>Data contrato assinado</Label><Input type="date" value={block2.contrato_assinado_data || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, contrato_assinado_data: e.target.value }))} /></div>
               <div><Label>Numero pedido cliente</Label><Input value={block2.numero_pedido_cliente || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, numero_pedido_cliente: e.target.value }))} /></div>
+              <div className="space-y-1.5">
+                <Label>Contrato assinado (PDF)</Label>
+                <FileUploadInput accept=".pdf,.png,.jpg,.jpeg" value={block2.contrato_assinado_file_id || ""} onChange={(fid) => setBlock2((prev) => ({ ...prev, contrato_assinado_file_id: fid }))} />
+              </div>
               <div className="md:col-span-2"><Label>Observacoes comerciais</Label><Textarea value={block2.observacoes_comerciais || ""} onChange={(e) => setBlock2((prev) => ({ ...prev, observacoes_comerciais: e.target.value }))} /></div>
             </div>
             <Button disabled={saving} onClick={() => saveBlock(`/kickoff/${id}/bloco2`, () => block2, "bloco3")}>Salvar Bloco 2</Button>
@@ -255,7 +377,6 @@ export default function KickoffPage() {
 
         <TabsContent value="bloco3">
           <Card><CardContent className="p-5 space-y-4">
-            {kickoff.locks?.bloco3 && <p className="text-sm text-amber-600 flex items-center gap-2"><Lock className="h-4 w-4" />{kickoff.locks.bloco3}</p>}
             <div className="grid gap-4 md:grid-cols-2">
               <div><Label>Nome tecnico produto</Label><Input value={block3.nome_tecnico_produto || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, nome_tecnico_produto: e.target.value }))} /></div>
               <div><Label>Nome comercial cliente</Label><Input value={block3.nome_comercial_cliente || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, nome_comercial_cliente: e.target.value }))} /></div>
@@ -264,13 +385,21 @@ export default function KickoffPage() {
               <div><Label>Forma apresentacao</Label><Input value={block3.forma_apresentacao || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, forma_apresentacao: e.target.value }))} /></div>
               <div><Label>Volume/Peso liquido</Label><Input value={block3.volume_peso_liquido_valor || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, volume_peso_liquido_valor: Number(e.target.value) || "" }))} /></div>
               <div><Label>Unidade</Label><Input value={block3.volume_peso_liquido_unidade || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, volume_peso_liquido_unidade: e.target.value }))} /></div>
-              <div><Label>Foto amostra file_id</Label><Input value={block3.foto_amostra_aprovada_file_id || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, foto_amostra_aprovada_file_id: e.target.value }))} /></div>
               <div><Label>Odor</Label><Input value={block3.odor || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, odor: e.target.value }))} /></div>
               <div><Label>Aspecto visual</Label><Input value={block3.aspecto_visual || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, aspecto_visual: e.target.value }))} /></div>
               <div><Label>pH minimo</Label><Input value={block3.ph_minimo || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, ph_minimo: Number(e.target.value) || "" }))} /></div>
               <div><Label>pH maximo</Label><Input value={block3.ph_maximo || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, ph_maximo: Number(e.target.value) || "" }))} /></div>
               <div><Label>Estabilidade minima (meses)</Label><Input value={block3.estabilidade_minima_comprovada_meses || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, estabilidade_minima_comprovada_meses: Number(e.target.value) || "" }))} /></div>
               <div><Label>Responsavel liberacao lote</Label><Input value={block3.responsavel_liberacao_lote || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, responsavel_liberacao_lote: e.target.value }))} /></div>
+              <div className="space-y-1.5">
+                <Label>Foto da amostra aprovada</Label>
+                <FileUploadInput value={block3.foto_amostra_aprovada_file_id || ""} onChange={(fid) => setBlock3((prev) => ({ ...prev, foto_amostra_aprovada_file_id: fid }))} />
+              </div>
+              <div className="space-y-1.5">
+                <Label>Registro ANVISA (arquivo)</Label>
+                <FileUploadInput value={block3.registro_anvisa_file_id || ""} onChange={(fid) => setBlock3((prev) => ({ ...prev, registro_anvisa_file_id: fid }))} />
+              </div>
+              <div><Label>Registro ANVISA numero</Label><Input value={block3.registro_anvisa_numero || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, registro_anvisa_numero: e.target.value }))} /></div>
               <div className="md:col-span-2"><Label>Plano amostragem</Label><Textarea value={block3.plano_amostragem || ""} onChange={(e) => setBlock3((prev) => ({ ...prev, plano_amostragem: e.target.value }))} /></div>
               <div className="md:col-span-2"><Label>Parametros microbiologicos (JSON)</Label><Textarea value={block3.parametros_microbiologicos || "{}"} onChange={(e) => setBlock3((prev) => ({ ...prev, parametros_microbiologicos: e.target.value }))} rows={5} /></div>
               <div className="md:col-span-2"><Label>Restricoes / claims (JSON array)</Label><Textarea value={block3.restricoes_claims || "[]"} onChange={(e) => setBlock3((prev) => ({ ...prev, restricoes_claims: e.target.value }))} rows={4} /></div>
@@ -297,7 +426,6 @@ export default function KickoffPage() {
         <TabsContent value="bloco4">
           <div className="space-y-4">
             <Card><CardContent className="p-5 space-y-4">
-              {kickoff.locks?.bloco4 && <p className="text-sm text-amber-600 flex items-center gap-2"><Lock className="h-4 w-4" />{kickoff.locks.bloco4}</p>}
               <div className="grid gap-4 md:grid-cols-2">
                 <div><Label>Embalagem primaria tipo</Label><Input value={block4.embalagem_primaria_tipo || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_primaria_tipo: e.target.value }))} /></div>
                 <div><Label>Material</Label><Input value={block4.embalagem_primaria_material || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_primaria_material: e.target.value }))} /></div>
@@ -305,16 +433,26 @@ export default function KickoffPage() {
                 <div><Label>Fornecedor primaria</Label><Input value={block4.embalagem_primaria_fornecedor_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_primaria_fornecedor_id: e.target.value }))} /></div>
                 <div><Label>Codigo primaria</Label><Input value={block4.embalagem_primaria_codigo_interno || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_primaria_codigo_interno: e.target.value }))} /></div>
                 <div><Label>Cor primaria</Label><Input value={block4.embalagem_primaria_cor || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_primaria_cor: e.target.value }))} /></div>
+                <div className="space-y-1.5">
+                  <Label>Laudo embalagem primaria</Label>
+                  <FileUploadInput value={block4.embalagem_primaria_laudo_file_id || ""} onChange={(fid) => setBlock4((prev) => ({ ...prev, embalagem_primaria_laudo_file_id: fid }))} />
+                </div>
                 <div><Label>Fechamento tipo</Label><Input value={block4.fechamento_tipo || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, fechamento_tipo: e.target.value }))} /></div>
                 <div><Label>Fornecedor fechamento</Label><Input value={block4.fechamento_fornecedor_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, fechamento_fornecedor_id: e.target.value }))} /></div>
                 <div><Label>Embalagem secundaria tipo</Label><Input value={block4.embalagem_secundaria_tipo || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_secundaria_tipo: e.target.value }))} /></div>
                 <div><Label>Fornecedor secundaria</Label><Input value={block4.embalagem_secundaria_fornecedor_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_secundaria_fornecedor_id: e.target.value }))} /></div>
-                <div><Label>Arte secundaria file_id</Label><Input value={block4.embalagem_secundaria_arte_file_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, embalagem_secundaria_arte_file_id: e.target.value }))} /></div>
+                <div className="space-y-1.5">
+                  <Label>Arte embalagem secundaria</Label>
+                  <FileUploadInput value={block4.embalagem_secundaria_arte_file_id || ""} onChange={(fid) => setBlock4((prev) => ({ ...prev, embalagem_secundaria_arte_file_id: fid }))} />
+                </div>
                 <div><Label>Caixa master tipo</Label><Input value={block4.caixa_master_tipo || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, caixa_master_tipo: e.target.value }))} /></div>
                 <div><Label>Caixa master unidades</Label><Input value={block4.caixa_master_unidades || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, caixa_master_unidades: Number(e.target.value) || "" }))} /></div>
                 <div><Label>Tipo rotulagem</Label><Input value={block4.tipo_rotulagem || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, tipo_rotulagem: e.target.value }))} /></div>
                 <div><Label>Fornecedor rotulo</Label><Input value={block4.rotulo_fornecedor_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, rotulo_fornecedor_id: e.target.value }))} /></div>
-                <div><Label>Arte rotulo file_id</Label><Input value={block4.rotulo_arte_file_id || ""} onChange={(e) => setBlock4((prev) => ({ ...prev, rotulo_arte_file_id: e.target.value }))} /></div>
+                <div className="space-y-1.5">
+                  <Label>Arte do rotulo</Label>
+                  <FileUploadInput value={block4.rotulo_arte_file_id || ""} onChange={(fid) => setBlock4((prev) => ({ ...prev, rotulo_arte_file_id: fid }))} />
+                </div>
                 <div className="md:col-span-2"><Label>Checklist obrigatorio do rotulo (JSON)</Label><Textarea value={block4.rotulo_informacoes_obrigatorias_checklist || "{}"} onChange={(e) => setBlock4((prev) => ({ ...prev, rotulo_informacoes_obrigatorias_checklist: e.target.value }))} rows={4} /></div>
               </div>
               <Button
@@ -402,9 +540,7 @@ export default function KickoffPage() {
             <Card>
               <CardContent className="p-5 space-y-4">
                 <h3 className="font-medium">Acao atual</h3>
-                {kickoff.locks?.aprovacao ? (
-                  <p className="text-sm text-amber-600 flex items-center gap-2"><Lock className="h-4 w-4" />{kickoff.locks.aprovacao}</p>
-                ) : currentApproval ? (
+                {currentApproval ? (
                   <>
                     <div className="space-y-1">
                       <p className="text-sm text-muted-foreground">Etapa liberada</p>
