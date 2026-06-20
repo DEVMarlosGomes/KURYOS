@@ -15,6 +15,7 @@ import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConic
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import SampleBatchModal from "@/components/SampleBatchModal";
+import PropostaPedidoModal from "@/components/PropostaPedidoModal";
 import ViewSwitcher from "@/components/ViewSwitcher";
 import FilterBar, { applyFilters } from "@/components/FilterBar";
 import ListView from "@/components/ListView";
@@ -120,6 +121,8 @@ export default function CRM2Page() {
     const [batchProjectId, setBatchProjectId] = useState(null);
     const [batchSamples, setBatchSamples] = useState([createEmptySample()]);
     const [batchProjetoData, setBatchProjetoData] = useState(null);
+    const [showPropostaPedido, setShowPropostaPedido] = useState(false);
+    const [propostaProjeto, setPropostaProjeto] = useState(null);
     const [showArchiveDialog, setShowArchiveDialog] = useState(false);
     const [pendingArchiveProject, setPendingArchiveProject] = useState(null);
     const [archiveReason, setArchiveReason] = useState("");
@@ -563,6 +566,18 @@ export default function CRM2Page() {
                                                                     </span>
                                                                 )}
                                                             </div>
+                                                            {project.stage === "em_negociacao" && (
+                                                                <div className="mt-2 pt-2 border-t border-border">
+                                                                    <Button
+                                                                        size="sm"
+                                                                        variant="outline"
+                                                                        className="w-full gap-1.5 text-xs text-amber-700 border-amber-300 hover:bg-amber-50"
+                                                                        onClick={(e) => { e.stopPropagation(); setPropostaProjeto(project); setShowPropostaPedido(true); }}
+                                                                    >
+                                                                        <ShoppingCart className="h-3.5 w-3.5" /> Proposta & Pedido
+                                                                    </Button>
+                                                                </div>
+                                                            )}
                                                             {project.stage === "pedido_aprovado" && project.cliente_id && (
                                                                 <div className="mt-2 pt-2 border-t border-border">
                                                                     <Button
@@ -938,6 +953,19 @@ export default function CRM2Page() {
                         if (proj.responsavel_interno) inherited.responsavel_pd = proj.responsavel_interno;
                     }
                     setBatchSamples([...batchSamples, inherited]);
+                }}
+            />
+
+            <PropostaPedidoModal
+                open={showPropostaPedido}
+                onOpenChange={(open) => {
+                    setShowPropostaPedido(open);
+                    if (!open) setPropostaProjeto(null);
+                }}
+                projeto={propostaProjeto}
+                onSaved={() => {
+                    toast.success("Proposta salva.");
+                    loadProjects();
                 }}
             />
 
