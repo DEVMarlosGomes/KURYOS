@@ -12,6 +12,7 @@ Endpoints:
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
+import math
 import os
 
 propostas_router = APIRouter(prefix="/crm/projects", tags=["propostas"])
@@ -151,6 +152,15 @@ async def upsert_proposta(projeto_id: str, payload: PropostaPayload, request: Re
     updated = await db.propostas_comerciais.find_one(
         {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     )
+
+    # R20: disparar explosão de BOM quando pedido confirmado
+    if payload.status == "confirmado":
+        try:
+            await explode_bom_for_proposta(updated, user["tenant_id"], user)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(f"R20 BOM explosion failed: {exc}")
+
     return updated
 
 
@@ -241,6 +251,183 @@ async def get_amostras_status(projeto_id: str, request: Request):
         "pode_confirmar": total_aprovadas > 0,
         "variacoes": resumo,
     }
+
+
+# ── R20: Explosão de BOM → Necessidade de Material ───────────────────────────
+
+async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -> dict:
+    """
+    R20 — Calcula necessidade de materiais por quantidade negociada.
+
+    Composição 1 (bulk): (percentual/100) × qtd_envase_g × qtd_pedido → converte para kg
+    Composição 2 (embalagem): quantidade_por_unidade × qtd_pedido → ceil(/ fator_conversao)
+
+    Consolida por codigo_material, salva em db.order_material_requirements.
+    """
+    necessidades: dict = {}  # key: codigo_material
+
+    for pedido_item in proposta.get("items_pedido", []):
+        codigo_kuryos = (pedido_item.get("codigo_kuryos") or "").strip()
+        qtd_pedido = float(pedido_item.get("qtd") or 0)
+        if not codigo_kuryos or qtd_pedido <= 0:
+            continue
+
+        sku = await db.skus.find_one(
+            {"codigo": codigo_kuryos, "tenant_id": tenant_id}, {"_id": 0}
+        )
+        if not sku:
+            continue
+
+        sku_id = sku["id"]
+        produto_pai_id = sku.get("produto_pai_id")
+        apresentacao = sku.get("apresentacao") or {}
+        qtd_envase_g = apresentacao.get("qtd_envase")  # granel por unidade (g)
+
+        # ── Composição 2 — Embalagem (por unidade acabada, per SKU) ──────────
+        bom_embal = await db.bom_items.find(
+            {"sku_id": sku_id, "camada": "embalagem", "vigente": True, "tenant_id": tenant_id},
+            {"_id": 0},
+        ).to_list(200)
+
+        for item in bom_embal:
+            cod = item["codigo_material"]
+            qtd_raw = item["quantidade_por_unidade"] * qtd_pedido
+            fator = float(item.get("fator_conversao") or 1.0)
+            # Arredonda para CIMA na unidade de compra (não compra fração de caixa/bobina)
+            qtd_compra = math.ceil(qtd_raw / fator)
+
+            if cod not in necessidades:
+                necessidades[cod] = {
+                    "insumo_id": cod,
+                    "tipo": item.get("tipo", "EP"),
+                    "descricao": item.get("nome_material", cod),
+                    "qtd_necessaria": 0.0,
+                    "qtd_necessaria_compra": 0.0,
+                    "unidade_consumo": item.get("unidade_consumo", "un"),
+                    "unidade_compra": item.get("unidade_compra", "un"),
+                    "fator_conversao": fator,
+                    "responsavel": "compras",
+                    "sku_ids": [],
+                    "pendente_info": False,
+                }
+            necessidades[cod]["qtd_necessaria"] = round(
+                necessidades[cod]["qtd_necessaria"] + qtd_raw, 4
+            )
+            necessidades[cod]["qtd_necessaria_compra"] = round(
+                necessidades[cod]["qtd_necessaria_compra"] + qtd_compra, 4
+            )
+            if sku_id not in necessidades[cod]["sku_ids"]:
+                necessidades[cod]["sku_ids"].append(sku_id)
+
+        # ── Composição 1 — Bulk (percentual × granel por unidade × qtd) ──────
+        if produto_pai_id:
+            bom_bulk = await db.bom_items.find(
+                {
+                    "produto_pai_id": produto_pai_id,
+                    "camada": "bulk",
+                    "vigente": True,
+                    "tenant_id": tenant_id,
+                },
+                {"_id": 0},
+            ).to_list(200)
+
+            for item in bom_bulk:
+                cod = item["codigo_material"]
+
+                if not qtd_envase_g or qtd_envase_g <= 0:
+                    # Sem peso por unidade — item fica como pendente_info
+                    if cod not in necessidades:
+                        necessidades[cod] = {
+                            "insumo_id": cod,
+                            "tipo": item.get("tipo", "MP"),
+                            "descricao": item.get("nome_material", cod),
+                            "qtd_necessaria": None,
+                            "qtd_necessaria_compra": None,
+                            "unidade_consumo": "g",
+                            "unidade_compra": "kg",
+                            "fator_conversao": 1000.0,
+                            "responsavel": "compras",
+                            "sku_ids": [],
+                            "pendente_info": True,
+                        }
+                    else:
+                        necessidades[cod]["pendente_info"] = True
+                    if sku_id not in necessidades[cod]["sku_ids"]:
+                        necessidades[cod]["sku_ids"].append(sku_id)
+                    continue
+
+                qtd_g = (item["percentual"] / 100.0) * float(qtd_envase_g) * qtd_pedido
+                qtd_kg = qtd_g / 1000.0
+
+                if cod not in necessidades:
+                    necessidades[cod] = {
+                        "insumo_id": cod,
+                        "tipo": item.get("tipo", "MP"),
+                        "descricao": item.get("nome_material", cod),
+                        "qtd_necessaria": 0.0,
+                        "qtd_necessaria_compra": 0.0,
+                        "unidade_consumo": "g",
+                        "unidade_compra": "kg",
+                        "fator_conversao": 1000.0,
+                        "responsavel": "compras",
+                        "sku_ids": [],
+                        "pendente_info": False,
+                    }
+
+                necessidades[cod]["qtd_necessaria"] = round(
+                    (necessidades[cod]["qtd_necessaria"] or 0) + qtd_g, 3
+                )
+                # Arredonda para 0.1 kg acima (ninguém pesa fração de grama num pedido)
+                qtd_kg_compra = math.ceil(qtd_kg * 10) / 10
+                necessidades[cod]["qtd_necessaria_compra"] = round(
+                    (necessidades[cod]["qtd_necessaria_compra"] or 0) + qtd_kg_compra, 3
+                )
+                if sku_id not in necessidades[cod]["sku_ids"]:
+                    necessidades[cod]["sku_ids"].append(sku_id)
+
+    materiais_list = [{"id": _new_id(), **v} for v in necessidades.values()]
+
+    now = _now_iso()
+    tem_pendente = any(m.get("pendente_info") for m in materiais_list)
+    doc = {
+        "id": _new_id(),
+        "tenant_id": tenant_id,
+        "proposta_id": proposta.get("id"),
+        "projeto_id": proposta.get("projeto_id"),
+        "cliente_id": proposta.get("cliente_id"),
+        "cliente_nome": proposta.get("cliente_nome", ""),
+        "gerado_em": now,
+        "gerado_por": user["id"],
+        "gerado_por_name": user.get("name", ""),
+        "status": "pendente_info" if tem_pendente else "gerado",
+        "materiais": materiais_list,
+    }
+
+    await db.order_material_requirements.update_one(
+        {"proposta_id": proposta.get("id"), "tenant_id": tenant_id},
+        {"$set": doc},
+        upsert=True,
+    )
+    doc.pop("_id", None)
+    return doc
+
+
+@propostas_router.get("/{projeto_id}/material-requirements")
+async def get_material_requirements(projeto_id: str, request: Request):
+    """R20 — Retorna necessidades de material geradas para a proposta confirmada."""
+    user = await _get_current_user(request)
+    await _get_project(projeto_id, user["tenant_id"])
+
+    proposta = await db.propostas_comerciais.find_one(
+        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not proposta:
+        return {}
+
+    req = await db.order_material_requirements.find_one(
+        {"proposta_id": proposta["id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    return req or {}
 
 
 # ── Upload de arquivo ────────────────────────────────────────────────────────

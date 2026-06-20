@@ -54,6 +54,10 @@ export default function PropostaPedidoModal({ open, onOpenChange, projeto, onSav
     const [amostrasStatus, setAmostrasStatus] = useState(null);
     const [loadingStatus, setLoadingStatus] = useState(false);
 
+    // R20
+    const [materialRequirements, setMaterialRequirements] = useState(null);
+    const [showRequirements, setShowRequirements] = useState(false);
+
     const [saving, setSaving] = useState(false);
 
     const projetoId = projeto?.id;
@@ -173,6 +177,18 @@ export default function PropostaPedidoModal({ open, onOpenChange, projeto, onSav
             const { data } = await api.post(`/crm/projects/${projetoId}/proposta`, payload);
             toast.success(novoStatus === "confirmado" ? "Pedido confirmado!" : "Proposta salva.");
             onSaved?.(data);
+
+            // R20: buscar necessidades geradas e exibir painel
+            if (novoStatus === "confirmado") {
+                try {
+                    const { data: reqs } = await api.get(`/crm/projects/${projetoId}/material-requirements`);
+                    if (reqs && reqs.materiais?.length > 0) {
+                        setMaterialRequirements(reqs);
+                        setShowRequirements(true);
+                        return; // mantém modal aberto para exibir resultado
+                    }
+                } catch { /* ignora */ }
+            }
             onOpenChange(false);
         } catch (e) {
             toast.error(formatApiError(e));
@@ -233,6 +249,57 @@ export default function PropostaPedidoModal({ open, onOpenChange, projeto, onSav
                     </div>
                 )}
 
+                {/* R20 — Painel de Necessidades (exibido após confirmação) */}
+                {showRequirements && materialRequirements ? (
+                <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-4">
+                    <div className="flex items-center gap-2 text-emerald-700">
+                        <CheckCircle2 className="h-5 w-5" />
+                        <h3 className="font-semibold text-base">Pedido confirmado — Necessidades de material geradas</h3>
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                        A lista abaixo foi enviada aos setores de <strong>Compras</strong> e <strong>PCP</strong>.
+                    </p>
+                    <div className="rounded-lg border overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead className="bg-muted/60">
+                                <tr>
+                                    {["Código", "Descrição", "Qtd. Necessária", "Un. Compra", "Setor", ""].map((h) => (
+                                        <th key={h} className="px-3 py-2 text-left font-medium text-muted-foreground text-xs">{h}</th>
+                                    ))}
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y">
+                                {materialRequirements.materiais.map((m, idx) => (
+                                    <tr key={idx} className={m.pendente_info ? "bg-amber-50/60" : ""}>
+                                        <td className="px-3 py-2 font-mono text-xs">{m.codigo_material || "—"}</td>
+                                        <td className="px-3 py-2">{m.descricao}</td>
+                                        <td className="px-3 py-2 text-right font-medium tabular-nums">{m.qtd_necessaria_compra}</td>
+                                        <td className="px-3 py-2 text-muted-foreground">{m.unidade_compra}</td>
+                                        <td className="px-3 py-2">
+                                            <Badge variant={m.responsavel === "compras" ? "default" : "secondary"} className="text-xs">
+                                                {m.responsavel === "compras" ? "Compras" : "PCP"}
+                                            </Badge>
+                                        </td>
+                                        <td className="px-3 py-2">
+                                            {m.pendente_info && (
+                                                <span className="text-xs text-amber-600 flex items-center gap-1">
+                                                    <AlertCircle className="h-3 w-3" /> Dados incompletos
+                                                </span>
+                                            )}
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    {materialRequirements.materiais.some((m) => m.pendente_info) && (
+                        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+                            Itens com "Dados incompletos" precisam de <strong>qtd_envase</strong> configurada no produto-pai para o cálculo correto da quantidade de granel.
+                        </p>
+                    )}
+                </div>
+                ) : (
+                <>
                 {/* Tabs */}
                 <div className="flex gap-1 px-6 pt-4 pb-0 border-b">
                     {[
@@ -453,20 +520,28 @@ export default function PropostaPedidoModal({ open, onOpenChange, projeto, onSav
                         </div>
                     )}
                 </div>
+                </>
+                )}
 
                 <DialogFooter className="p-6 pt-3 border-t flex gap-2 justify-end">
-                    <Button variant="outline" onClick={() => onOpenChange(false)}>Cancelar</Button>
-                    <Button variant="secondary" disabled={saving} onClick={() => handleSave("rascunho")}>
-                        Salvar rascunho
-                    </Button>
-                    <Button
-                        disabled={saving || !podeConfirmar}
-                        title={!podeConfirmar ? "Nenhuma amostra aprovada pelo cliente" : ""}
-                        onClick={() => handleSave("confirmado")}
-                    >
-                        {!podeConfirmar && <AlertCircle className="h-4 w-4 mr-1.5" />}
-                        Confirmar pedido
-                    </Button>
+                    {showRequirements ? (
+                        <Button onClick={() => onOpenChange(false)}>Fechar</Button>
+                    ) : (
+                        <>
+                            <Button variant="outline" onClick={() => onOpenChange(false)}>Cancelar</Button>
+                            <Button variant="secondary" disabled={saving} onClick={() => handleSave("rascunho")}>
+                                Salvar rascunho
+                            </Button>
+                            <Button
+                                disabled={saving || !podeConfirmar}
+                                title={!podeConfirmar ? "Nenhuma amostra aprovada pelo cliente" : ""}
+                                onClick={() => handleSave("confirmado")}
+                            >
+                                {!podeConfirmar && <AlertCircle className="h-4 w-4 mr-1.5" />}
+                                Confirmar pedido
+                            </Button>
+                        </>
+                    )}
                 </DialogFooter>
             </DialogContent>
         </Dialog>
