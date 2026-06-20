@@ -176,6 +176,7 @@ class FormulaItemCreate(BaseModel):
     ingredient_name: str
     percentage: float
     price_per_kg: float = 0.0
+    price_usd: Optional[float] = None   # R04: preço em US$ (fragrâncias cotadas em dólar)
     fornecedor: Optional[str] = ""
     phase: Optional[str] = None
     function: Optional[str] = None
@@ -185,6 +186,7 @@ class FormulaItemUpdate(BaseModel):
     ingredient_name: Optional[str] = None
     percentage: Optional[float] = None
     price_per_kg: Optional[float] = None
+    price_usd: Optional[float] = None   # R04: preço em US$
     fornecedor: Optional[str] = None
     phase: Optional[str] = None
     function: Optional[str] = None
@@ -575,11 +577,16 @@ async def run_stability_scheduler():
 
 # ============ HELPER: Calculate formula item costs ============
 
-def calc_item_costs(percentage: float, price_per_kg: float, cotacao_usd: float):
-    """Calculate derived cost fields for a formula item"""
+def calc_item_costs(percentage: float, price_per_kg: float, cotacao_usd: float, price_usd: Optional[float] = None):
+    """Calculate derived cost fields for a formula item.
+    R04: price_usd é preço em US$/kg; cost_brl_via_cambio = (pct/100) × price_usd × cotacao_usd.
+    """
     cost_brl = (percentage / 100.0) * price_per_kg if percentage and price_per_kg else 0.0
     cost_kg_usd = price_per_kg / cotacao_usd if cotacao_usd and cotacao_usd > 0 else 0.0
-    return round(cost_brl, 4), round(cost_kg_usd, 4)
+    cost_brl_via_cambio: Optional[float] = None
+    if price_usd is not None and cotacao_usd and cotacao_usd > 0 and percentage:
+        cost_brl_via_cambio = round((percentage / 100.0) * price_usd * cotacao_usd, 4)
+    return round(cost_brl, 4), round(cost_kg_usd, 4), cost_brl_via_cambio
 
 
 def _document_label(doc_type: str) -> str:
@@ -1589,14 +1596,18 @@ async def update_formula(formula_id: str, data: FormulaUpdate, request: Request)
         cotacao = formula.get("cotacao_usd", 6.00)
         items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
         for item in items:
-            cost_brl, cost_kg_usd = calc_item_costs(
+            cost_brl, cost_kg_usd, cost_brl_via_cambio = calc_item_costs(
                 item.get("percentage", 0),
                 item.get("price_per_kg", 0),
-                cotacao
+                cotacao,
+                item.get("price_usd")
             )
+            set_fields = {"cost_brl": cost_brl, "cost_kg_usd": cost_kg_usd}
+            if cost_brl_via_cambio is not None:
+                set_fields["cost_brl_via_cambio"] = cost_brl_via_cambio
             await db.pd_formula_items.update_one(
                 {"id": item["id"]},
-                {"$set": {"cost_brl": cost_brl, "cost_kg_usd": cost_kg_usd}}
+                {"$set": set_fields}
             )
     
     formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
@@ -1822,8 +1833,10 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
         raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
     
     cotacao = formula.get("cotacao_usd", 6.00) or 6.00
-    cost_brl, cost_kg_usd = calc_item_costs(data.percentage, data.price_per_kg, cotacao)
-    
+    cost_brl, cost_kg_usd, cost_brl_via_cambio = calc_item_costs(
+        data.percentage, data.price_per_kg, cotacao, data.price_usd
+    )
+
     item_id = new_id()
     item = {
         "id": item_id,
@@ -1831,8 +1844,10 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
         "ingredient_name": data.ingredient_name,
         "percentage": data.percentage,
         "price_per_kg": data.price_per_kg,
+        "price_usd": data.price_usd,          # R04
         "cost_brl": cost_brl,
         "cost_kg_usd": cost_kg_usd,
+        "cost_brl_via_cambio": cost_brl_via_cambio,   # R04
         "fornecedor": data.fornecedor or "",
         "phase": data.phase or "",
         "function": data.function or "",
@@ -1873,15 +1888,18 @@ async def update_formula_item(item_id: str, data: FormulaItemUpdate, request: Re
     # Recalculate costs if percentage or price changed
     pct = update_fields.get("percentage", existing.get("percentage", 0))
     ppk = update_fields.get("price_per_kg", existing.get("price_per_kg", 0))
-    
+    p_usd = update_fields.get("price_usd", existing.get("price_usd"))  # R04
+
     formula = await db.pd_formulas.find_one({"id": existing["formula_id"]}, {"_id": 0})
     if formula and formula.get("locked"):
         raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
     cotacao = formula.get("cotacao_usd", 6.00) if formula else 6.00
-    
-    cost_brl, cost_kg_usd = calc_item_costs(pct, ppk, cotacao)
+
+    cost_brl, cost_kg_usd, cost_brl_via_cambio = calc_item_costs(pct, ppk, cotacao, p_usd)
     update_fields["cost_brl"] = cost_brl
     update_fields["cost_kg_usd"] = cost_kg_usd
+    if cost_brl_via_cambio is not None:
+        update_fields["cost_brl_via_cambio"] = cost_brl_via_cambio
 
     source_changes = _build_source_changes(
         existing,

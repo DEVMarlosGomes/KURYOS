@@ -1361,11 +1361,11 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
   const [formulaCotacao, setFormulaCotacao] = useState("6.00");
   const [saving, setSaving] = useState(false);
   const [expandedFormula, setExpandedFormula] = useState(formulas[0]?.id || null);
-  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
+  const [newItem, setNewItem] = useState({ ingredient_name: "", percentage: "", price_per_kg: "", price_usd: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
   const [editingConfig, setEditingConfig] = useState(null);
   const [configForm, setConfigForm] = useState({});
   const [editingItemId, setEditingItemId] = useState(null);
-  const [editItemForm, setEditItemForm] = useState({ ingredient_name: "", fornecedor: "", percentage: "", price_per_kg: "", price_currency: "BRL" });
+  const [editItemForm, setEditItemForm] = useState({ ingredient_name: "", fornecedor: "", percentage: "", price_per_kg: "", price_usd: "", price_currency: "BRL" });
   const [pendingCatalogItem, setPendingCatalogItem] = useState(null);
   const [catalog, setCatalog] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -1467,13 +1467,14 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
         ingredient_name: newItem.ingredient_name,
         percentage: parseFloat(newItem.percentage),
         price_per_kg: priceInBRL,
+        price_usd: newItem.price_usd !== "" ? parseFloat(newItem.price_usd) : null,
         fornecedor: newItem.fornecedor || "",
         phase: newItem.phase,
         function: newItem.function,
         catalog_id: newItem.catalog_id || null,
       });
       toast.success("Ingrediente adicionado!");
-      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
+      setNewItem({ ingredient_name: "", percentage: "", price_per_kg: "", price_usd: "", price_currency: "BRL", fornecedor: "", phase: "", function: "", catalog_id: "" });
       setShowSuggestions(false);
       onRefresh();
     } catch (err) { toast.error("Erro ao adicionar"); }
@@ -1491,6 +1492,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
       fornecedor: item.fornecedor || "",
       percentage: String(item.percentage || ""),
       price_per_kg: String(item.price_per_kg || ""),
+      price_usd: String(item.price_usd ?? ""),
       price_currency: "BRL",
     });
   };
@@ -1508,6 +1510,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
         fornecedor: editItemForm.fornecedor || "",
         percentage: parseFloat(editItemForm.percentage) || 0,
         price_per_kg: priceInBRL,
+        price_usd: editItemForm.price_usd !== "" ? parseFloat(editItemForm.price_usd) : null,
       });
       toast.success("Item atualizado!");
       cancelEditItem();
@@ -1649,7 +1652,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
         const totalPct = items.reduce((s, it) => s + (it.percentage || 0), 0);
         const totalCostBrl = items.reduce((s, it) => s + (it.cost_brl || 0), 0);
         const totalPriceSum = items.reduce((s, it) => s + (it.price_per_kg || 0), 0);
-        const isOk = Math.abs(totalPct - 100) < 0.5;
+        const isOk = Math.abs(totalPct - 100) < 0.01;
         const open = expandedFormula === f.id;
         
         const volume = f.volume || 0;
@@ -1774,6 +1777,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         <th className="text-right p-2 font-medium w-24">%Fórmula</th>
                         <th className="text-right p-2 font-medium w-24">Qtd/Lote</th>
                         <th className="text-right p-2 font-medium w-28">Preço R$ (Kg)</th>
+                        <th className="text-right p-2 font-medium w-28 text-yellow-300">Preço US$ (Kg)</th>
                         <th className="text-right p-2 font-medium w-24">Custo R$</th>
                         <th className="text-right p-2 font-medium w-28">Custo Kg/U$</th>
                         <th className="text-right p-2 font-medium w-24">% de Custo</th>
@@ -1809,6 +1813,9 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                                   </button>
                                 </div>
                               </td>
+                              <td className="p-1.5">
+                                <Input type="number" step="0.01" value={editItemForm.price_usd} onChange={e => setEditItemForm(p => ({ ...p, price_usd: e.target.value }))} className="h-7 text-xs w-24 text-right font-mono border-yellow-300 focus:border-yellow-500" placeholder="US$" />
+                              </td>
                               <td className="p-2 text-xs text-muted-foreground text-right">—</td>
                               <td className="p-2 text-xs text-muted-foreground text-right">—</td>
                               <td className="p-2 text-xs text-muted-foreground text-right">—</td>
@@ -1829,9 +1836,19 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                             <td className="p-2 text-right font-mono text-xs">{(item.percentage || 0).toFixed(3)}</td>
                             <td className="p-2 text-right font-mono text-xs text-blue-600">{qtyLabel}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.price_per_kg || 0).toFixed(2)}</td>
+                            <td className="p-2 text-right font-mono text-xs">
+                              {item.price_usd != null ? (
+                                <div>
+                                  <div className="text-yellow-700 font-semibold">{item.price_usd.toFixed(2)}</div>
+                                  {item.cost_brl_via_cambio != null && (
+                                    <div className="text-[10px] text-muted-foreground">= R$ {item.cost_brl_via_cambio.toFixed(2)}</div>
+                                  )}
+                                </div>
+                              ) : "—"}
+                            </td>
                             <td className="p-2 text-right font-mono text-xs">{(item.cost_brl || 0).toFixed(2)}</td>
                             <td className="p-2 text-right font-mono text-xs">{(item.cost_kg_usd || 0).toFixed(2)}</td>
-                            <td className="p-2 text-right font-mono text-xs">{costPct.toFixed(1)}%</td>
+                            <td className="p-2 text-right font-mono text-xs">{costPct.toFixed(2)}%</td>
                             <td className="p-2 text-center">
                               {canEdit && (
                                 <div className="flex gap-1.5 justify-center">
@@ -1844,16 +1861,17 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                         );
                       })}
                       {items.length === 0 && (
-                        <tr><td colSpan={9} className="p-4 text-center text-xs text-muted-foreground">Nenhum ingrediente. Adicione abaixo.</td></tr>
+                        <tr><td colSpan={10} className="p-4 text-center text-xs text-muted-foreground">Nenhum ingrediente. Adicione abaixo.</td></tr>
                       )}
                     </tbody>
                     <tfoot>
                       <tr className="border-t-2 bg-muted/30 font-bold">
                         <td className="p-2 text-xs">Custo Unit.</td>
                         <td className="p-2"></td>
-                        <td className={`p-2 text-right font-mono text-xs ${isOk ? "text-green-600" : "text-amber-600"}`}>{totalPct.toFixed(2)}</td>
+                        <td className={`p-2 text-right font-mono text-xs ${isOk ? "text-green-600" : "text-amber-600"}`}>{totalPct.toFixed(3)}</td>
                         <td className="p-2 text-right font-mono text-xs text-blue-600">{volume > 0 ? `${volume} ${volumeUnit}` : "—"}</td>
                         <td className="p-2 text-right font-mono text-xs">{totalPriceSum.toFixed(2)}</td>
+                        <td className="p-2"></td>
                         <td className="p-2 text-right font-mono text-xs bg-muted">
                           <span className="text-green-700 font-bold">R$ {custoUnit.toFixed(2)}</span>
                         </td>
@@ -1864,6 +1882,7 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                       {indicePerdas > 0 && (
                         <tr className="bg-muted/20">
                           <td colSpan={4} className="p-2 text-xs text-muted-foreground">Com índice de perdas ({indicePerdas}%)</td>
+                          <td className="p-2"></td>
                           <td className="p-2 text-right font-mono text-xs font-bold text-orange-600">R$ {custoComPerdas.toFixed(2)}</td>
                           <td colSpan={4}></td>
                         </tr>
@@ -1985,6 +2004,12 @@ function FormulaTab({ devId, formulas, onRefresh, canEdit, clientInfo, req }) {
                           = R$ {((parseFloat(newItem.price_per_kg) || 0) * (formulas.find(f2 => f2.id === f.id)?.cotacao_usd || 6)).toFixed(2)}/Kg
                         </div>
                       )}
+                    </div>
+                    <div className="w-28">
+                      <Label className="text-[11px] text-muted-foreground text-yellow-700">Preço US$/Kg</Label>
+                      <Input type="number" step="0.01" value={newItem.price_usd}
+                        onChange={e => setNewItem(p => ({ ...p, price_usd: e.target.value }))}
+                        placeholder="opcional" className="h-8 text-sm font-mono border-yellow-300" />
                     </div>
                     <Button size="sm" className="h-8 gap-1" onClick={() => addItem(f.id)}>
                       <Plus className="h-3 w-3" /> Adicionar

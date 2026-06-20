@@ -179,7 +179,7 @@ export default function PDFormulaBank() {
                     </td>
                     <td className="p-3 text-right font-mono">
                       {item.item_count}
-                      <div className="text-[10px] text-muted-foreground">{(item.total_percentage || 0).toFixed(2)}%</div>
+                      <div className="text-[10px] text-muted-foreground">{(item.total_percentage || 0).toFixed(3)}%</div>
                     </td>
                     <td className="p-3 text-right font-mono">
                       {item.fragrance_percentage != null ? (
@@ -233,7 +233,7 @@ export default function PDFormulaBank() {
                   <MetaCard label="Formulador" value={selected.created_by_name || "—"} />
                   <MetaCard label="Data" value={selected.created_at ? new Date(selected.created_at).toLocaleString("pt-BR") : "—"} />
                   <MetaCard label="Custo total / kg" value={`R$ ${(selected.total_cost_per_kg || 0).toFixed(2)}`} />
-                  <MetaCard label="Itens / % total" value={`${selected.item_count} / ${(selected.total_percentage || 0).toFixed(2)}%`} />
+                  <MetaCard label="Itens / % total" value={`${selected.item_count} / ${(selected.total_percentage || 0).toFixed(3)}%`} />
                   <MetaCard label="% Fragrância (real)" value={selected.fragrance_percentage != null ? `${selected.fragrance_percentage.toFixed(2)}%` : "—"} />
                   <MetaCard label="% Fragrância (target)" value={selected.fragrance_target != null ? `${selected.fragrance_target.toFixed(2)}%` : "Sem target"} />
                 </div>
