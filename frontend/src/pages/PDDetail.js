@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
@@ -119,6 +120,9 @@ export default function PDDetail() {
   const [linkingCRM, setLinkingCRM] = useState(false);
   const [selectedCRMProject, setSelectedCRMProject] = useState(null);
 
+  // R13: condições sem D0 registrado (bloqueia "Liberar para aprovação")
+  const [d0Missing, setD0Missing] = useState([]);
+
   const fetchData = useCallback(async () => {
     try {
       const res = await api.get(`/pd/requests/${id}/full`);
@@ -132,6 +136,23 @@ export default function PDDetail() {
   }, [id, navigate]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  // R13: carrega quais condições têm D0 registrado; roda sempre que status é IN_TESTS
+  const loadD0Check = useCallback(async () => {
+    try {
+      const { data: sd } = await api.get(`/pd/requests/${id}/stability-study`);
+      const readings = sd.readings || [];
+      const conditions = sd.constants?.conditions || [];
+      const missing = conditions.filter(
+        c => !readings.some(r => r.condition_code === c.code && r.day_offset === 0)
+      );
+      setD0Missing(missing);
+    } catch { /* silencioso */ }
+  }, [id]);
+
+  useEffect(() => {
+    if (data?.request?.status === "IN_TESTS") loadD0Check();
+  }, [data?.request?.status, loadD0Check]);
 
   const searchCRMProjects = useCallback(async (q) => {
     if (!q || q.length < 2) { setCrmProjects([]); return; }
@@ -319,11 +340,30 @@ export default function PDDetail() {
                 const isEntrega = req.status === "IN_TESTS" && ns === "WAITING_APPROVAL";
                 const label = isEntrega ? "Entregar ao Comercial" : STATUS_CONFIG[ns]?.label;
                 const Icon = ns === "REJECTED" ? XCircle : isEntrega ? Send : ArrowRight;
-                return (
-                  <Button key={ns} size="sm" variant={ns === "REJECTED" ? "destructive" : "default"}
-                    onClick={() => handleStatusChange(ns)} className="gap-1.5">
+                // R13: bloqueia "Entregar ao Comercial" se houver condições sem D0
+                const isBlocked = isEntrega && d0Missing.length > 0;
+                const btn = (
+                  <Button key={ns} size="sm"
+                    variant={ns === "REJECTED" ? "destructive" : "default"}
+                    onClick={() => !isBlocked && handleStatusChange(ns)}
+                    disabled={isBlocked}
+                    className="gap-1.5">
                     <Icon className="h-3.5 w-3.5" />{label}
                   </Button>
+                );
+                if (!isBlocked) return btn;
+                return (
+                  <TooltipProvider key={ns}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>{btn}</TooltipTrigger>
+                      <TooltipContent side="bottom" className="max-w-xs text-xs">
+                        <p className="font-semibold mb-1">D0 pendente em:</p>
+                        <ul className="list-disc pl-3 space-y-0.5">
+                          {d0Missing.map(c => <li key={c.code}>{c.label}</li>)}
+                        </ul>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 );
               })
             }
@@ -510,7 +550,7 @@ export default function PDDetail() {
 
           <TabsContent value="tests">
             {hasDev ? (
-              <TestsTab devId={dev.id} labResults={lab_results} onRefresh={fetchData} canEdit={canEdit} />
+              <TestsTab devId={dev.id} labResults={lab_results} onRefresh={fetchData} canEdit={canEdit} reqId={req.id} />
             ) : (
               <NeedsDev onAction={() => handleStatusChange("IN_PROGRESS")} status={req.status} canEdit={canEdit} />
             )}
@@ -2645,7 +2685,7 @@ function SampleBatchSection({ devId, formulas, onRefresh, canEdit }) {
   );
 }
 
-/* ============ ESTABILIDADES TAB ============ */
+/* ============ STABILITY GRID PANEL (shared between Estabilidades + Testes) ============ */
 
 const CONDITION_ICONS = {
   ambient: Sparkles,
@@ -2671,12 +2711,13 @@ const CONDITION_COLORS = {
   freeze_thaw: "text-cyan-500",
 };
 
-function EstabilidadesTab({ reqId, req, canEdit }) {
+// R12: painel compartilhado — mesma fonte de dados para Testes e Estabilidades
+function StabilityGridPanel({ reqId, canEdit, onReadingsLoaded, showStudyHeader = true }) {
   const [study, setStudy] = useState(null);
   const [readings, setReadings] = useState([]);
   const [constants, setConstants] = useState({ conditions: [], parameters: [], checkpoints: [] });
   const [loading, setLoading] = useState(true);
-  const [readingDialog, setReadingDialog] = useState(null); // { conditionCode, conditionLabel }
+  const [readingDialog, setReadingDialog] = useState(null);
   const [readingForm, setReadingForm] = useState({ day_offset: 0, parameters: {}, notes: "" });
   const [savingReading, setSavingReading] = useState(false);
 
@@ -2685,8 +2726,12 @@ function EstabilidadesTab({ reqId, req, canEdit }) {
     try {
       const { data } = await api.get(`/pd/requests/${reqId}/stability-study`);
       setStudy(data.study);
-      setReadings(data.readings || []);
-      setConstants(data.constants || { conditions: [], parameters: [], checkpoints: [] });
+      const rs = data.readings || [];
+      const cs = data.constants || { conditions: [], parameters: [], checkpoints: [] };
+      setReadings(rs);
+      setConstants(cs);
+      // Notifica o parent sobre leituras (R13)
+      onReadingsLoaded?.(rs, cs.conditions || []);
     } catch (err) {
       toast.error("Erro ao carregar estabilidades");
     } finally { setLoading(false); }
@@ -2746,9 +2791,9 @@ function EstabilidadesTab({ reqId, req, canEdit }) {
   if (loading) return <div className="flex items-center justify-center py-16"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
 
   return (
-    <div className="space-y-5" data-testid="estabilidades-tab">
-      {/* Study Header */}
-      {study && (
+    <div className="space-y-5" data-testid="stability-grid-panel">
+      {/* Study Header — opcional */}
+      {showStudyHeader && study && (
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-base font-semibold flex items-center gap-2">
@@ -2901,6 +2946,11 @@ function EstabilidadesTab({ reqId, req, canEdit }) {
       )}
     </div>
   );
+}
+
+// R12: wrapper fino — mantém aba "Estabilidades" inalterada externamente
+function EstabilidadesTab({ reqId, req, canEdit }) {
+  return <StabilityGridPanel reqId={reqId} canEdit={canEdit} showStudyHeader />;
 }
 
 /* ============ FICHA TÉCNICA TAB ============ */
@@ -3489,7 +3539,7 @@ function FichaTecnicaTab({ reqId, formulas, req, dev, canEdit }) {
 }
 
 /* ============ TESTS TAB (Unified form - all types at once) ============ */
-function TestsTab({ devId, labResults, onRefresh, canEdit }) {
+function TestsTab({ devId, labResults, onRefresh, canEdit, reqId }) {
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({
     estabilidade: {},
@@ -3541,8 +3591,21 @@ function TestsTab({ devId, labResults, onRefresh, canEdit }) {
 
   return (
     <div className="space-y-6">
+
+      {/* R12: painel de estabilidade clonado — mesma fonte de dados da aba Estabilidades */}
+      {reqId && (
+        <>
+          <div className="flex items-center gap-2">
+            <TestTube className="h-4 w-4 text-primary" />
+            <h3 className="text-base font-semibold">Estudo de Estabilidade</h3>
+          </div>
+          <StabilityGridPanel reqId={reqId} canEdit={canEdit} showStudyHeader={false} />
+          <Separator />
+        </>
+      )}
+
       <div className="flex items-center justify-between">
-        <h3 className="text-base font-semibold">Testes de Laboratório</h3>
+        <h3 className="text-base font-semibold">Registros Complementares</h3>
         {hasData && labResults?.updated_by_name && (
           <span className="text-[11px] text-muted-foreground">
             Última atualização: {labResults.updated_by_name} • {new Date(labResults.updated_at).toLocaleString("pt-BR")}
