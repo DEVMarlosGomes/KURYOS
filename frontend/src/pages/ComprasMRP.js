@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { BarChart3, Loader2, RefreshCw, ChevronRight, AlertTriangle, Plus } from "lucide-react";
+import { BarChart3, Loader2, RefreshCw, ChevronRight, AlertTriangle, Plus, Package, AlertCircle, ChevronDown, ChevronUp } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 const STATUS_CFG = {
@@ -27,6 +28,11 @@ export default function ComprasMRP() {
     const [statusFiltro, setStatusFiltro] = useState("all");
     const [calculando, setCalculando] = useState(false);
 
+    // R20 — Necessidades de material
+    const [necessidades, setNecessidades] = useState([]);
+    const [loadingNec, setLoadingNec] = useState(false);
+    const [showNec, setShowNec] = useState(true);
+
     const carregar = useCallback(async () => {
         setLoading(true);
         try {
@@ -39,7 +45,17 @@ export default function ComprasMRP() {
         finally { setLoading(false); }
     }, [statusFiltro]);
 
+    const loadNecessidades = useCallback(async () => {
+        setLoadingNec(true);
+        try {
+            const { data } = await api.get("/api/compras/necessidades");
+            setNecessidades(data || []);
+        } catch { /* silencioso */ }
+        finally { setLoadingNec(false); }
+    }, []);
+
     useEffect(() => { carregar(); }, [carregar]);
+    useEffect(() => { loadNecessidades(); }, [loadNecessidades]);
 
     const calcular = async () => {
         setCalculando(true);
@@ -52,6 +68,11 @@ export default function ComprasMRP() {
         } finally { setCalculando(false); }
     };
 
+    // Achata todos os materiais de todos os documentos de necessidades
+    const todosItens = necessidades.flatMap(doc =>
+        (doc.materiais || []).map(m => ({ ...m, proposta_id: doc.proposta_id, gerado_em: doc.gerado_em }))
+    );
+
     return (
         <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-4">
             <div className="flex items-center justify-between">
@@ -60,12 +81,69 @@ export default function ComprasMRP() {
                     <span className="text-muted-foreground text-sm font-normal">({total} rodadas)</span>
                 </h1>
                 <div className="flex gap-2">
-                    <Button size="sm" variant="outline" onClick={carregar}><RefreshCw className="h-4 w-4" /></Button>
+                    <Button size="sm" variant="outline" onClick={() => { carregar(); loadNecessidades(); }}><RefreshCw className="h-4 w-4" /></Button>
                     <Button size="sm" onClick={calcular} disabled={calculando}>
                         {calculando ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
                         Calcular MRP
                     </Button>
                 </div>
+            </div>
+
+            {/* ── Painel R20: Necessidades de Material ── */}
+            <div className="rounded-lg border overflow-hidden">
+                <button
+                    className="w-full flex items-center justify-between px-4 py-3 bg-blue-50 hover:bg-blue-100/70 transition-colors text-left"
+                    onClick={() => setShowNec(v => !v)}
+                >
+                    <div className="flex items-center gap-2 text-blue-800">
+                        <Package className="h-4 w-4" />
+                        <span className="font-semibold text-sm">Necessidades de Material</span>
+                        {!loadingNec && (
+                            <Badge variant="secondary" className="text-xs">
+                                {todosItens.length} {todosItens.length === 1 ? "item" : "itens"}
+                            </Badge>
+                        )}
+                    </div>
+                    {showNec ? <ChevronUp className="h-4 w-4 text-blue-600" /> : <ChevronDown className="h-4 w-4 text-blue-600" />}
+                </button>
+                {showNec && (
+                    <div className="overflow-x-auto">
+                        {loadingNec ? (
+                            <div className="py-8 flex justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+                        ) : todosItens.length === 0 ? (
+                            <p className="text-center py-8 text-sm text-muted-foreground">Nenhuma necessidade de material pendente.</p>
+                        ) : (
+                            <table className="w-full text-xs">
+                                <thead className="bg-muted/50 border-b">
+                                    <tr>
+                                        {["Código Material", "Descrição", "Qtd. Necessária", "Un. Compra", "Pedido", "Gerado em", ""].map(h => (
+                                            <th key={h} className="px-3 py-2 text-left font-medium text-muted-foreground">{h}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y">
+                                    {todosItens.map((m, idx) => (
+                                        <tr key={idx} className={m.pendente_info ? "bg-amber-50/60" : "hover:bg-muted/20"}>
+                                            <td className="px-3 py-2 font-mono">{m.codigo_material || "—"}</td>
+                                            <td className="px-3 py-2">{m.descricao}</td>
+                                            <td className="px-3 py-2 text-right tabular-nums font-medium">{m.qtd_necessaria_compra}</td>
+                                            <td className="px-3 py-2 text-muted-foreground">{m.unidade_compra}</td>
+                                            <td className="px-3 py-2 font-mono text-muted-foreground">{m.proposta_id?.slice(-8) || "—"}</td>
+                                            <td className="px-3 py-2 text-muted-foreground">{m.gerado_em?.slice(0, 10) || "—"}</td>
+                                            <td className="px-3 py-2">
+                                                {m.pendente_info && (
+                                                    <span className="flex items-center gap-1 text-amber-600">
+                                                        <AlertCircle className="h-3 w-3" /> Incompleto
+                                                    </span>
+                                                )}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        )}
+                    </div>
+                )}
             </div>
 
             <Select value={statusFiltro} onValueChange={setStatusFiltro}>

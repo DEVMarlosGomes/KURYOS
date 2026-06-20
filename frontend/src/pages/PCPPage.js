@@ -116,7 +116,7 @@ function LoteBadge({ status }) {
 }
 
 // ─── main component ───────────────────────────────────────────────────────────
-const TABS = ["Programação","OPs Pendentes","Lotes","Calendário","Linhas"];
+const TABS = ["Programação","OPs Pendentes","Lotes","Calendário","Linhas","Necessidades"];
 
 export default function PCPPage() {
     const [tab, setTab] = useState("Programação");
@@ -130,6 +130,10 @@ export default function PCPPage() {
     const [calendarios, setCalendarios] = useState([]);
     const [opsPendentes, setOpsPendentes] = useState([]);
     const [dashboard, setDashboard] = useState(null);
+
+    // R20 — Necessidades de material (PCP)
+    const [necessidades, setNecessidades] = useState([]);
+    const [loadingNec, setLoadingNec] = useState(false);
 
     // Loading
     const [loadingSlots, setLoadingSlots] = useState(true);
@@ -252,6 +256,15 @@ export default function PCPPage() {
     useEffect(() => { loadSlots(); loadCalendarios(); }, [loadSlots, loadCalendarios]);
     useEffect(() => { if (tab === "OPs Pendentes") loadOpsPendentes(); }, [tab, loadOpsPendentes]);
     useEffect(() => { if (tab === "Lotes") loadLotes(); }, [tab, loadLotes]);
+
+    useEffect(() => {
+        if (tab !== "Necessidades") return;
+        setLoadingNec(true);
+        api.get("/api/pcp/necessidades")
+            .then(({ data }) => setNecessidades(data || []))
+            .catch(() => {})
+            .finally(() => setLoadingNec(false));
+    }, [tab]);
 
     // Init calForms from loaded calendarios + active linhas
     useEffect(() => {
@@ -910,6 +923,87 @@ export default function PCPPage() {
                                 })}
                             </div>
                         )}
+                    </div>
+                )}
+
+                {/* ══════════ Tab: Necessidades ══════════ */}
+                {tab === "Necessidades" && (
+                    <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                            <h2 className="font-semibold flex items-center gap-2 text-sm">
+                                <Package className="h-4 w-4 text-blue-600" /> Necessidades de Material — PCP
+                            </h2>
+                            <Button size="sm" variant="outline" onClick={() => {
+                                setLoadingNec(true);
+                                api.get("/api/pcp/necessidades")
+                                    .then(({ data }) => setNecessidades(data || []))
+                                    .catch(() => {})
+                                    .finally(() => setLoadingNec(false));
+                            }}>
+                                <Layers className="h-3.5 w-3.5 mr-1" /> Atualizar
+                            </Button>
+                        </div>
+
+                        {loadingNec ? (
+                            <div className="py-12 flex justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+                        ) : necessidades.length === 0 ? (
+                            <Card className="border-dashed">
+                                <CardContent className="py-12 text-center">
+                                    <Package className="h-10 w-10 mx-auto mb-3 text-muted-foreground/30" />
+                                    <p className="font-semibold text-muted-foreground">Nenhuma necessidade de material para PCP</p>
+                                    <p className="text-xs text-muted-foreground mt-1">As necessidades aparecem aqui após a confirmação de pedidos no CRM.</p>
+                                </CardContent>
+                            </Card>
+                        ) : necessidades.map((doc) => {
+                            const itens = doc.materiais || [];
+                            return (
+                                <Card key={doc.proposta_id || doc._id} className="overflow-hidden">
+                                    <CardHeader className="py-3 px-4 bg-muted/40 border-b">
+                                        <div className="flex items-center justify-between">
+                                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+                                                <span className="font-mono text-muted-foreground text-xs">
+                                                    Pedido {doc.proposta_id?.slice(-8) || "—"}
+                                                </span>
+                                                {doc.projeto_id && (
+                                                    <Badge variant="outline" className="text-xs">{doc.projeto_id.slice(-8)}</Badge>
+                                                )}
+                                            </CardTitle>
+                                            <span className="text-xs text-muted-foreground">
+                                                Gerado em {doc.gerado_em?.slice(0, 10) || "—"}
+                                            </span>
+                                        </div>
+                                    </CardHeader>
+                                    <CardContent className="p-0">
+                                        <table className="w-full text-xs">
+                                            <thead className="bg-muted/20 border-b">
+                                                <tr>
+                                                    {["Código", "Descrição", "Qtd. Necessária", "Un. Compra", ""].map(h => (
+                                                        <th key={h} className="px-3 py-2 text-left font-medium text-muted-foreground">{h}</th>
+                                                    ))}
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y">
+                                                {itens.map((m, idx) => (
+                                                    <tr key={idx} className={m.pendente_info ? "bg-amber-50/60" : "hover:bg-muted/20"}>
+                                                        <td className="px-3 py-2 font-mono">{m.codigo_material || "—"}</td>
+                                                        <td className="px-3 py-2">{m.descricao}</td>
+                                                        <td className="px-3 py-2 text-right tabular-nums font-medium">{m.qtd_necessaria_compra}</td>
+                                                        <td className="px-3 py-2 text-muted-foreground">{m.unidade_compra}</td>
+                                                        <td className="px-3 py-2">
+                                                            {m.pendente_info && (
+                                                                <span className="flex items-center gap-1 text-amber-600">
+                                                                    <AlertTriangle className="h-3 w-3" /> Incompleto
+                                                                </span>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </CardContent>
+                                </Card>
+                            );
+                        })}
                     </div>
                 )}
 
