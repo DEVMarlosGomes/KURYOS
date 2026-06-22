@@ -410,6 +410,11 @@ class ClientCreate(BaseModel):
     # SKU identifiers
     cli3: str = ""
     cli4: str = ""  # R23: 4-letter code — auto-suggested from nome_empresa if empty
+    # Qualificação — opcionais na criação, permitem auto-completar blocking task
+    decisores: List[Decisor] = []
+    tem_anvisa: str = ""
+    volume_estimado_mensal: str = ""
+    fornecedor_atual: Optional[FornecedorAtual] = None
 
 
 class ClientUpdate(BaseModel):
@@ -970,7 +975,42 @@ async def _advance_project_stage_if_needed(
             "tasks_generated": [task["id"] for task in new_tasks],
         },
     )
+    if new_stage == "em_negociacao" and updated:
+        await _mirror_client_stage_to_negociacao(updated, user)
+
     return updated
+
+
+async def _mirror_client_stage_to_negociacao(project: dict, user: dict):
+    """Quando CRM2 vai para em_negociacao, espelha o cliente no CRM1 para 'negociacao'."""
+    cliente_id = project.get("cliente_id")
+    if not cliente_id:
+        return
+    client = await db.crm_clients.find_one(
+        {"id": cliente_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    )
+    if not client:
+        return
+    old_stage = client.get("stage", "")
+    if old_stage in ("negociacao", "cliente_fechado", "cliente_perdido"):
+        return
+    now = _now_iso()
+    movement = {
+        "de": old_stage,
+        "para": "negociacao",
+        "data": now,
+        "usuario": user["name"],
+        "usuario_id": user["id"],
+        "origem": "espelho_crm2_em_negociacao",
+    }
+    await db.crm_clients.update_one(
+        {"id": cliente_id, "tenant_id": user["tenant_id"]},
+        {
+            "$set": {"stage": "negociacao", "updated_at": now},
+            "$push": {"historico_movimentacoes": movement},
+        },
+    )
+
 
 def _normalize_contact_payload(contact: Optional[dict]) -> dict:
     payload = contact or {}
@@ -1032,8 +1072,6 @@ async def _validate_client_payload(
     payload["cnpj"] = clean_text(payload.get("cnpj", ""))
     payload["cnpj_normalized"] = cnpj_normalized
     if cnpj_normalized:
-        if not is_valid_cnpj(cnpj_normalized):
-            raise HTTPException(status_code=400, detail="CNPJ inválido")
         query = {"tenant_id": tenant_id, "cnpj_normalized": cnpj_normalized}
         if exclude_id:
             query["id"] = {"$ne": exclude_id}
@@ -1099,8 +1137,6 @@ async def _validate_client_payload(
     if require_required_fields:
         missing = []
         contact = payload["contato_principal"]
-        if not payload["cnpj"]:
-            missing.append("cnpj")
         if not clean_text(contact.get("nome", "")):
             missing.append("contato_principal.nome")
         if not clean_text(contact.get("whatsapp", "")):
@@ -1254,12 +1290,12 @@ async def create_client(data: ClientCreate, request: Request):
         "cli4_congelado": False,
         "has_grau2_anvisa": create_payload.get("has_grau2_anvisa", False),
         "ultima_atualizacao_temperatura": now,
-        # Qualificado fields (empty initially)
-        "decisores": [],
+        # Qualificado fields — pre-filled if provided at creation
+        "decisores": [d.model_dump() for d in data.decisores] if data.decisores else [],
         "tem_marca_propria": None,
-        "tem_anvisa": "",
-        "volume_estimado_mensal": "",
-        "fornecedor_atual": {"tem": False, "motivo_troca": ""},
+        "tem_anvisa": data.tem_anvisa or "",
+        "volume_estimado_mensal": data.volume_estimado_mensal or "",
+        "fornecedor_atual": data.fornecedor_atual.model_dump() if data.fornecedor_atual else {"tem": False, "motivo_troca": ""},
         "prazo_urgencia": None,
         # Negociação fields (empty initially)
         "amostras_aprovadas": [],
@@ -1962,6 +1998,9 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
         after={"stage": new_stage, "motivo_arquivamento": update_fields.get("motivo_arquivamento")},
         metadata={"tasks_generated": [t["id"] for t in new_tasks]},
     )
+
+    if new_stage == "em_negociacao" and updated:
+        await _mirror_client_stage_to_negociacao(updated, user)
 
     trigger_batch_samples = (new_stage == "amostra_solicitada")
 

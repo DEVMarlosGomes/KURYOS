@@ -15,7 +15,7 @@ from typing import List, Optional
 import math
 import os
 
-propostas_router = APIRouter(prefix="/crm/projects", tags=["propostas"])
+propostas_router = APIRouter(prefix="/api/crm/projects", tags=["propostas"])
 
 db = None
 _get_current_user = None
@@ -219,31 +219,59 @@ async def get_amostras_status(projeto_id: str, request: Request):
 
     resumo = []
     total_aprovadas = 0
+    sku_ids_needed = []
+
+    _STATUS_PD_APROVADO = {"aprovado", "concluido", "APPROVED", "COMPLETED"}
+    _STATUS_PD_REPROVADO = {"reprovado", "REJECTED"}
 
     for s in samples:
         for v in s.get("variacoes", []):
-            aprovada = bool(v.get("aprovacao_externa"))
             status_raw = v.get("status", "solicitada")
+            resultado = v.get("resultado", "")
+            status_pd_raw = v.get("status_pd_raw", "")
+            aprovada = (
+                bool(v.get("aprovacao_externa"))
+                or status_raw == "aprovada"
+                or resultado == "aprovada"
+                or status_pd_raw in _STATUS_PD_APROVADO
+            )
             if aprovada:
                 label = "aprovada"
                 total_aprovadas += 1
-            elif status_raw in ("reprovada", "cancelada"):
+            elif status_raw in ("reprovada", "cancelada") or resultado == "reprovada" or status_pd_raw in _STATUS_PD_REPROVADO:
                 label = "reprovada"
             elif status_raw in ("plano_futuro",):
                 label = "plano_futuro"
             else:
                 label = "em_andamento"
 
+            sku_id = v.get("sku_id")
+            if sku_id:
+                sku_ids_needed.append(sku_id)
+
             resumo.append({
                 "amostra_id": s["id"],
                 "numero_amostra": s.get("numero_amostra", ""),
-                "nome_produto": s.get("nome_produto", ""),
+                "nome_produto": s.get("nome_produto", "") or v.get("nome_produto", ""),
                 "variacao_id": v["id"],
                 "codigo": v.get("codigo", ""),
                 "descricao": v.get("descricao_aplicacao", ""),
                 "status": label,
                 "aprovada": aprovada,
+                "sku_id": sku_id,
+                "sku_codigo": "",
             })
+
+    # Fetch SKU codes in one query
+    if sku_ids_needed:
+        skus = await db.skus.find(
+            {"id": {"$in": sku_ids_needed}},
+            {"_id": 0, "id": 1, "codigo_interno": 1},
+        ).to_list(200)
+        sku_map = {s["id"]: s.get("codigo_interno", "") for s in skus}
+        for item in resumo:
+            if item["sku_id"]:
+                item["sku_codigo"] = sku_map.get(item["sku_id"], "")
 
     return {
         "total": len(resumo),

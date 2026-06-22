@@ -269,15 +269,30 @@ export default function CRM3Page() {
 
         setResultadoForm(prev => ({ ...prev, [variacaoId]: { ...prev[variacaoId], loading: true } }));
         try {
-            await api.post(`/crm/samples/${sampleId}/variacoes/${variacaoId}/resultado-cliente`, {
+            const { data: res } = await api.post(`/crm/samples/${sampleId}/variacoes/${variacaoId}/resultado-cliente`, {
                 resultado: form.resultado,
                 feedback_cliente: form.feedback || "",
             });
-            toast.success("Resultado do cliente registrado!");
+
+            if (form.resultado === "aprovada") {
+                const skuInfo = res.sku_created;
+                if (skuInfo?.blocked) {
+                    // SKU não foi gerado — mostrar motivo ao usuário
+                    const motivo = skuInfo.reason || "Pré-requisito não atendido";
+                    toast.warning(`Variação aprovada, mas SKU não foi gerado: ${motivo}`, { duration: 8000 });
+                } else if (skuInfo?.codigo_interno) {
+                    toast.success(`Variação aprovada! SKU gerado: ${skuInfo.codigo_interno}`);
+                } else {
+                    toast.success("Resultado do cliente registrado!");
+                }
+            } else {
+                toast.success("Resultado do cliente registrado!");
+            }
+
             setResultadoForm(prev => { const n = { ...prev }; delete n[variacaoId]; return n; });
             loadSamples();
-            const { data } = await api.get(`/crm/samples/${sampleId}`);
-            setSelectedSample(data);
+            const { data: updated } = await api.get(`/crm/samples/${sampleId}`);
+            setSelectedSample(updated);
         } catch (e) {
             toast.error(formatApiError(e));
         } finally {
@@ -546,6 +561,14 @@ export default function CRM3Page() {
                                                         </span>
                                                         <Lock className="h-2.5 w-2.5 text-muted-foreground/60 shrink-0" title="Status controlado pelo P&D" />
                                                     </div>
+                                                    {/* Alerta: aprovada mas sem SKU */}
+                                                    {variacao.status === "aprovada" && !variacao.sku_id && (
+                                                        <div className="mt-1.5 flex items-center gap-1 rounded px-1.5 py-0.5 bg-amber-100 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 w-fit"
+                                                             title="SKU não foi gerado na aprovação — verifique CLI4 do cliente, categoria ativa, CGI assinado e stage do projeto">
+                                                            <AlertTriangle className="h-2.5 w-2.5 text-amber-600 shrink-0" />
+                                                            <span className="text-[10px] text-amber-700 dark:text-amber-400 font-medium">SKU pendente</span>
+                                                        </div>
+                                                    )}
                                                     {canPrintLabel && (
                                                         <button
                                                             className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"

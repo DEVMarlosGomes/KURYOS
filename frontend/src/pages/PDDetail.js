@@ -340,30 +340,24 @@ export default function PDDetail() {
                 const isEntrega = req.status === "IN_TESTS" && ns === "WAITING_APPROVAL";
                 const label = isEntrega ? "Entregar ao Comercial" : STATUS_CONFIG[ns]?.label;
                 const Icon = ns === "REJECTED" ? XCircle : isEntrega ? Send : ArrowRight;
-                // R13: bloqueia "Entregar ao Comercial" se houver condições sem D0
-                const isBlocked = isEntrega && d0Missing.length > 0;
-                const btn = (
+                const hasD0Missing = isEntrega && d0Missing.length > 0;
+                const handleClick = () => {
+                  if (hasD0Missing) {
+                    const lista = d0Missing.map(c => `• ${c.label}`).join("\n");
+                    const ok = window.confirm(
+                      `As seguintes condições de estabilidade ainda não têm leitura D0 registrada:\n${lista}\n\nDeseja entregar ao Comercial mesmo assim?`
+                    );
+                    if (!ok) return;
+                  }
+                  handleStatusChange(ns);
+                };
+                return (
                   <Button key={ns} size="sm"
                     variant={ns === "REJECTED" ? "destructive" : "default"}
-                    onClick={() => !isBlocked && handleStatusChange(ns)}
-                    disabled={isBlocked}
+                    onClick={handleClick}
                     className="gap-1.5">
                     <Icon className="h-3.5 w-3.5" />{label}
                   </Button>
-                );
-                if (!isBlocked) return btn;
-                return (
-                  <TooltipProvider key={ns}>
-                    <Tooltip>
-                      <TooltipTrigger asChild>{btn}</TooltipTrigger>
-                      <TooltipContent side="bottom" className="max-w-xs text-xs">
-                        <p className="font-semibold mb-1">D0 pendente em:</p>
-                        <ul className="list-disc pl-3 space-y-0.5">
-                          {d0Missing.map(c => <li key={c.code}>{c.label}</li>)}
-                        </ul>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
                 );
               })
             }
@@ -537,7 +531,7 @@ export default function PDDetail() {
           </TabsList>
 
           <TabsContent value="overview">
-            <OverviewTab req={req} dev={dev} formulas={formulas} tests={tests} samples={samples} approval={approval} costs={costs} history={history} onRefresh={fetchData} hasDev={hasDev} clientInfo={client_info} canEdit={canEdit} formulaCostData={formula_cost_data} setActiveTab={setActiveTab} documents={documents} updates={updates} pending={pending} canViewCommercial={canViewCommercial} />
+            <OverviewTab req={req} dev={dev} formulas={formulas} tests={tests} samples={samples} approval={approval} costs={costs} history={history} onRefresh={fetchData} hasDev={hasDev} clientInfo={client_info} canEdit={canEdit} formulaCostData={formula_cost_data} setActiveTab={setActiveTab} documents={documents} updates={updates} pending={pending} canViewCommercial={canViewCommercial} labResults={lab_results} />
           </TabsContent>
 
           <TabsContent value="formula">
@@ -631,7 +625,7 @@ function NeedsDev({ onAction, status, canEdit }) {
 }
 
 /* ============ OVERVIEW TAB ============ */
-function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, history, onRefresh, hasDev, clientInfo, canEdit, formulaCostData, setActiveTab, documents, updates, pending, canViewCommercial }) {
+function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, history, onRefresh, hasDev, clientInfo, canEdit, formulaCostData, setActiveTab, documents, updates, pending, canViewCommercial, labResults }) {
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({});
@@ -1120,25 +1114,45 @@ function OverviewTab({ req, dev, formulas, tests, samples, approval, costs, hist
         <div className="border rounded-xl overflow-hidden">
           <SectionHead accentColor="bg-blue-500" Icon={FlaskConical} title="Testes Laboratoriais" action={<GoBtn tab="tests" />} />
           <div className="px-6 py-4">
-            {tests.length === 0 ? (
+            {tests.length === 0 && !labResults?.updated_at ? (
               <p className="text-sm text-muted-foreground">Nenhum teste registrado ainda.</p>
             ) : (
-              <div className="flex items-center gap-4 flex-wrap">
-                {[
-                  { label: "Total", value: testStats.total, color: "text-foreground" },
-                  { label: "Aprovados", value: testStats.approved, color: "text-green-600" },
-                  { label: "Falhas", value: testStats.failed, color: "text-red-500" },
-                  { label: "Pendentes", value: testStats.pending, color: "text-amber-500" },
-                ].map(({ label, value, color }) => (
-                  <div key={label} className="flex flex-col items-center gap-0.5 min-w-[48px]">
-                    <span className={`text-xl font-bold font-mono ${color}`}>{value}</span>
-                    <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</span>
+              <div className="space-y-3">
+                {tests.length > 0 && (
+                  <div className="flex items-center gap-4 flex-wrap">
+                    {[
+                      { label: "Total", value: testStats.total, color: "text-foreground" },
+                      { label: "Aprovados", value: testStats.approved, color: "text-green-600" },
+                      { label: "Falhas", value: testStats.failed, color: "text-red-500" },
+                      { label: "Pendentes", value: testStats.pending, color: "text-amber-500" },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} className="flex flex-col items-center gap-0.5 min-w-[48px]">
+                        <span className={`text-xl font-bold font-mono ${color}`}>{value}</span>
+                        <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</span>
+                      </div>
+                    ))}
+                    <div className="ml-auto">
+                      {testStats.failed > 0 && <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 text-[10px]">{testStats.failed} falha(s)</Badge>}
+                      {testStats.failed === 0 && testStats.total > 0 && testStats.pending === 0 && <Badge className="bg-green-100 text-green-700 text-[10px]">Todos aprovados</Badge>}
+                    </div>
                   </div>
-                ))}
-                <div className="ml-auto">
-                  {testStats.failed > 0 && <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 text-[10px]">{testStats.failed} falha(s)</Badge>}
-                  {testStats.failed === 0 && testStats.total > 0 && testStats.pending === 0 && <Badge className="bg-green-100 text-green-700 text-[10px]">Todos aprovados</Badge>}
-                </div>
+                )}
+                {labResults?.updated_at && (
+                  <div className="flex flex-wrap gap-2">
+                    {[
+                      { label: "pH", val: labResults.ph?.valor },
+                      { label: "Viscosidade", val: labResults.viscosidade?.valor ? `${labResults.viscosidade.valor} ${labResults.viscosidade.unidade || ""}`.trim() : null },
+                      { label: "Estabilidade", val: labResults.estabilidade?.resultado },
+                      { label: "Sensorial", val: labResults.sensorial?.aparencia },
+                    ].filter(f => f.val).map(f => (
+                      <span key={f.label} className="text-[11px] rounded-md border px-2 py-0.5 bg-muted/40">
+                        <span className="text-muted-foreground">{f.label}: </span>
+                        <span className="font-medium">{f.val}</span>
+                      </span>
+                    ))}
+                    <Badge className="bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300 text-[10px]">Registros preenchidos</Badge>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -3834,7 +3848,10 @@ function SamplesTab({ devId, samples, formulas, onRefresh, canEdit, productName 
       toast.success("Amostra atualizada!");
       setEditingId(null);
       onRefresh();
-    } catch (err) { toast.error("Erro"); }
+    } catch (err) {
+      const msg = err?.response?.data?.detail || "Erro ao atualizar amostra";
+      toast.error(msg);
+    }
   };
 
   const getSampleStatus = (s) => {

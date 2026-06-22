@@ -11,7 +11,7 @@ import { Separator } from "@/components/ui/separator";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConical, ExternalLink, ShoppingCart } from "lucide-react";
+import { GripVertical, Building2, PackagePlus, Archive, ChevronRight, FlaskConical, ExternalLink, ShoppingCart, CheckCircle, XCircle } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import SampleBatchModal from "@/components/SampleBatchModal";
@@ -351,6 +351,17 @@ export default function CRM2Page() {
         }
     };
 
+    const handleResultadoCliente = async (sampleId, variacaoId, resultado) => {
+        try {
+            await api.post(`/crm/samples/${sampleId}/variacoes/${variacaoId}/resultado-cliente`, { resultado });
+            toast.success(resultado === "aprovada" ? "Amostra aprovada pelo cliente!" : "Reprovação registrada.");
+            await loadProjects();
+            if (selectedProjectId) await loadProjectDetail(selectedProjectId);
+        } catch (error) {
+            toast.error(formatApiError(error));
+        }
+    };
+
     const handleDragEnd = async (result) => {
         if (!result.destination) return;
         const { draggableId, source, destination } = result;
@@ -566,6 +577,16 @@ export default function CRM2Page() {
                                                                     </span>
                                                                 )}
                                                             </div>
+                                                            {project.stage === "amostra_enviada" && (
+                                                                <div className="mt-2 pt-2 border-t border-border">
+                                                                    <button
+                                                                        className="w-full flex items-center justify-center gap-1.5 text-xs text-cyan-700 font-medium py-1 rounded hover:bg-cyan-50 transition-colors"
+                                                                        onClick={(e) => { e.stopPropagation(); setSelectedProjectId(project.id); }}
+                                                                    >
+                                                                        <CheckCircle className="h-3.5 w-3.5" /> Registrar aprovação do cliente
+                                                                    </button>
+                                                                </div>
+                                                            )}
                                                             {project.stage === "em_negociacao" && (
                                                                 <div className="mt-2 pt-2 border-t border-border">
                                                                     <Button
@@ -840,38 +861,70 @@ export default function CRM2Page() {
                                             </div>
                                             <div className="space-y-2">
                                                 {(sample.variacoes || []).map((variacao) => (
-                                                    <div key={variacao.id} className="flex items-start justify-between gap-3 rounded-md bg-muted/40 px-3 py-2">
-                                                        <div className="flex-1 min-w-0">
-                                                            <p className="text-sm font-medium">{variacao.codigo}</p>
-                                                            <p className="text-xs text-muted-foreground">{variacao.descricao_aplicacao || "Sem descrição"}</p>
-                                                            {variacao.feedback_cliente && (
-                                                                <p className="text-xs text-muted-foreground mt-1">Feedback: {variacao.feedback_cliente}</p>
-                                                            )}
-                                                            {variacao.pd_status && (
-                                                                <div className="flex items-center gap-1.5 mt-1.5">
-                                                                    <FlaskConical className="h-3 w-3 text-muted-foreground shrink-0" />
-                                                                    <span className={`inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border ${pdStatusColor[variacao.pd_status] || "bg-muted text-muted-foreground"}`}>
-                                                                        P&D: {pdStatusLabel[variacao.pd_status] || variacao.pd_status}
-                                                                    </span>
-                                                                    {variacao.pd_request_id && (
-                                                                        <button
-                                                                            className="text-[10px] text-primary underline underline-offset-2 flex items-center gap-0.5 hover:opacity-70"
-                                                                            onClick={() => navigate(`/pd/requests/${variacao.pd_request_id}`)}
-                                                                        >
-                                                                            ver <ExternalLink className="h-2.5 w-2.5" />
-                                                                        </button>
-                                                                    )}
-                                                                </div>
-                                                            )}
+                                                    <div key={variacao.id} className="rounded-md bg-muted/40 px-3 py-2">
+                                                        <div className="flex items-start justify-between gap-3">
+                                                            <div className="flex-1 min-w-0">
+                                                                <p className="text-sm font-medium">{variacao.codigo}</p>
+                                                                <p className="text-xs text-muted-foreground">{variacao.descricao_aplicacao || "Sem descrição"}</p>
+                                                                {variacao.feedback_cliente && (
+                                                                    <p className="text-xs text-muted-foreground mt-1">Feedback: {variacao.feedback_cliente}</p>
+                                                                )}
+                                                                {variacao.pd_status && (
+                                                                    <div className="flex items-center gap-1.5 mt-1.5">
+                                                                        <FlaskConical className="h-3 w-3 text-muted-foreground shrink-0" />
+                                                                        <span className={`inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border ${pdStatusColor[variacao.pd_status] || "bg-muted text-muted-foreground"}`}>
+                                                                            P&D: {pdStatusLabel[variacao.pd_status] || variacao.pd_status}
+                                                                        </span>
+                                                                        {variacao.pd_request_id && (
+                                                                            <button
+                                                                                className="text-[10px] text-primary underline underline-offset-2 flex items-center gap-0.5 hover:opacity-70"
+                                                                                onClick={() => navigate(`/pd/requests/${variacao.pd_request_id}`)}
+                                                                            >
+                                                                                ver <ExternalLink className="h-2.5 w-2.5" />
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                            <div className="text-right shrink-0">
+                                                                <Badge variant="secondary" className="text-[10px]">{stageLabelMap[variacao.status] || variacao.status}</Badge>
+                                                                {(variacao.resultado || sample.resultado) && (
+                                                                    <p className="text-[10px] text-muted-foreground mt-1">
+                                                                        Resultado: {formatSlugLabel(variacao.resultado || sample.resultado)}
+                                                                    </p>
+                                                                )}
+                                                            </div>
                                                         </div>
-                                                        <div className="text-right shrink-0">
-                                                            <Badge variant="secondary" className="text-[10px]">{stageLabelMap[variacao.status] || variacao.status}</Badge>
-                                                            {(variacao.resultado || sample.resultado) && (
-                                                                <p className="text-[10px] text-muted-foreground mt-1">
-                                                                    Resultado: {formatSlugLabel(variacao.resultado || sample.resultado)}
-                                                                </p>
-                                                            )}
-                                                        </div>
+                                                        {selectedProject?.stage === "amostra_enviada" && !variacao.aprovacao_externa && variacao.resultado !== "aprovada" && variacao.resultado !== "reprovada" && (
+                                                            <div className="mt-2 flex gap-2">
+                                                                <Button
+                                                                    size="sm"
+                                                                    variant="outline"
+                                                                    className="flex-1 gap-1.5 text-xs text-emerald-700 border-emerald-300 hover:bg-emerald-50"
+                                                                    onClick={() => handleResultadoCliente(sample.id, variacao.id, "aprovada")}
+                                                                >
+                                                                    <CheckCircle className="h-3.5 w-3.5" /> Cliente aprovou
+                                                                </Button>
+                                                                <Button
+                                                                    size="sm"
+                                                                    variant="outline"
+                                                                    className="flex-1 gap-1.5 text-xs text-red-700 border-red-300 hover:bg-red-50"
+                                                                    onClick={() => handleResultadoCliente(sample.id, variacao.id, "reprovada")}
+                                                                >
+                                                                    <XCircle className="h-3.5 w-3.5" /> Cliente reprovou
+                                                                </Button>
+                                                            </div>
+                                                        )}
+                                                        {(variacao.aprovacao_externa || variacao.resultado === "aprovada") && (
+                                                            <div className="mt-1.5 flex items-center gap-1 text-[10px] text-emerald-700 font-medium">
+                                                                <CheckCircle className="h-3 w-3" /> Aprovado pelo cliente
+                                                            </div>
+                                                        )}
+                                                        {variacao.resultado === "reprovada" && (
+                                                            <div className="mt-1.5 flex items-center gap-1 text-[10px] text-red-700 font-medium">
+                                                                <XCircle className="h-3 w-3" /> Reprovado pelo cliente
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 ))}
                                             </div>

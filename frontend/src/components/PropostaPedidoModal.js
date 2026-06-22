@@ -62,54 +62,75 @@ export default function PropostaPedidoModal({ open, onOpenChange, projeto, onSav
 
     const projetoId = projeto?.id;
 
-    const loadExisting = useCallback(async () => {
-        if (!projetoId) return;
-        try {
-            const { data } = await api.get(`/crm/projects/${projetoId}/proposta`);
-            if (data && data.projeto_id) {
-                setTipoProduto(data.tipo_produto || "");
-                setVariacaoProduto(data.variacao_produto || "");
-                setPrecoUnitario(data.preco_unitario ?? "");
-                setInsumosInclusos(data.insumos_inclusos || []);
-                setObservacoesProposta(data.observacoes_proposta || "");
-                setItemsPedido(
-                    (data.items_pedido || []).length > 0
-                        ? data.items_pedido.map((i) => ({ ...i, qtd: i.qtd ?? "", valor_unitario: i.valor_unitario ?? "", valor_total: i.valor_total ?? "" }))
-                        : [emptyItem()]
-                );
-                setCondicoesPagamento(data.condicoes_pagamento || "");
-                setInsumosFabricacao(
-                    (data.insumos_fabricacao || []).length > 0
-                        ? data.insumos_fabricacao.map((i) => ({ ...i, qtd: i.qtd ?? "" }))
-                        : [emptyInsumo()]
-                );
-                setRodapeObservacoes(data.rodape_observacoes || "");
-                setStatus(data.status || "rascunho");
-            }
-        } catch {
-            /* proposta ainda não existe — mantém campos em branco */
-        }
-    }, [projetoId]);
-
-    const loadAmostrasStatus = useCallback(async () => {
-        if (!projetoId) return;
-        setLoadingStatus(true);
-        try {
-            const { data } = await api.get(`/crm/projects/${projetoId}/amostras-status`);
-            setAmostrasStatus(data);
-        } catch {
-            setAmostrasStatus(null);
-        } finally {
-            setLoadingStatus(false);
-        }
-    }, [projetoId]);
-
     useEffect(() => {
-        if (open && projetoId) {
-            loadExisting();
-            loadAmostrasStatus();
-        }
-    }, [open, projetoId, loadExisting, loadAmostrasStatus]);
+        if (!open || !projetoId) return;
+
+        const init = async () => {
+            setLoadingStatus(true);
+
+            // 1. Tentar carregar proposta existente
+            let hasExisting = false;
+            try {
+                const { data } = await api.get(`/crm/projects/${projetoId}/proposta`);
+                if (data && data.projeto_id) {
+                    hasExisting = true;
+                    setTipoProduto(data.tipo_produto || "");
+                    setVariacaoProduto(data.variacao_produto || "");
+                    setPrecoUnitario(data.preco_unitario ?? "");
+                    setInsumosInclusos(data.insumos_inclusos || []);
+                    setObservacoesProposta(data.observacoes_proposta || "");
+                    setItemsPedido(
+                        (data.items_pedido || []).length > 0
+                            ? data.items_pedido.map((i) => ({ ...i, qtd: i.qtd ?? "", valor_unitario: i.valor_unitario ?? "", valor_total: i.valor_total ?? "" }))
+                            : [emptyItem()]
+                    );
+                    setCondicoesPagamento(data.condicoes_pagamento || "");
+                    setInsumosFabricacao(
+                        (data.insumos_fabricacao || []).length > 0
+                            ? data.insumos_fabricacao.map((i) => ({ ...i, qtd: i.qtd ?? "" }))
+                            : [emptyInsumo()]
+                    );
+                    setRodapeObservacoes(data.rodape_observacoes || "");
+                    setStatus(data.status || "rascunho");
+                }
+            } catch { /* proposta ainda não existe */ }
+
+            // 2. Carregar status das amostras
+            try {
+                const { data: sd } = await api.get(`/crm/projects/${projetoId}/amostras-status`);
+                setAmostrasStatus(sd);
+
+                // Auto-popular apenas se não há proposta salva ainda
+                if (!hasExisting && sd) {
+                    const aprovadas = (sd.variacoes || []).filter((v) => v.aprovada);
+
+                    if (aprovadas.length > 0) {
+                        // Bloco A: nome do produto e variações aprovadas
+                        setTipoProduto(aprovadas[0].nome_produto || "");
+                        setVariacaoProduto(
+                            aprovadas.map((v) => v.descricao).filter(Boolean).join(", ")
+                        );
+
+                        // Bloco B: uma linha por variação aprovada
+                        setItemsPedido(
+                            aprovadas.map((v) => ({
+                                ...emptyItem(),
+                                codigo_kuryos: v.sku_codigo || "",
+                                codigo_cliente: v.codigo || "",
+                                item: [v.nome_produto, v.descricao].filter(Boolean).join(" — "),
+                            }))
+                        );
+                    }
+                }
+            } catch {
+                setAmostrasStatus(null);
+            } finally {
+                setLoadingStatus(false);
+            }
+        };
+
+        init();
+    }, [open, projetoId]);
 
     // ── Bloco A helpers ───────────────────────────────────────────────────────
 

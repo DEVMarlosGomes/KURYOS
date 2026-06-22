@@ -2410,18 +2410,12 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
         update_fields.setdefault("internal_approved", True)
     
     sent_to_client = bool(update_fields.get("sent_to_client", existing.get("sent_to_client")))
-    internal_approved = bool(update_fields.get("internal_approved", existing.get("internal_approved")))
 
     if "client_approved" in update_fields:
         if not sent_to_client:
             raise HTTPException(
                 status_code=409,
                 detail="Amostra precisa ser enviada ao cliente antes de registrar aprovação externa.",
-            )
-        if not internal_approved:
-            raise HTTPException(
-                status_code=409,
-                detail="Aprovação interna pendente antes da aprovação do cliente.",
             )
     
     result = await db.pd_samples.update_one({"id": sample_id}, {"$set": update_fields})

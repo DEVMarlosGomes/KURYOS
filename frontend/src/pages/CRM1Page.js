@@ -120,6 +120,11 @@ function createEmptyClient(defaultOwner = "") {
         instagram: "",
         observacoes: "",
         cli3: "",
+        // Qualificação — pré-preencher para desbloquear avanço automático
+        tem_anvisa: "",
+        volume_estimado_mensal: "",
+        fornecedor_atual: { tem: false, motivo_troca: "" },
+        decisores: [{ nome: "", cargo: "", contato: "" }],
     };
 }
 
@@ -439,7 +444,12 @@ export default function CRM1Page() {
     const handleCreateClient = async () => {
         if (!isNewClientValid) return;
         try {
-            await api.post("/crm/clients", newClient);
+            // Filtrar decisores com nome vazio antes de enviar
+            const decisoresValidos = (newClient.decisores || []).filter(d => d.nome.trim());
+            await api.post("/crm/clients", {
+                ...newClient,
+                decisores: decisoresValidos,
+            });
             toast.success("Cliente criado!");
             setShowNewClient(false);
             setNewClient(createEmptyClient(user?.id || ""));
@@ -941,6 +951,118 @@ export default function CRM1Page() {
                                     placeholder="Contexto geral sobre o cliente"
                                     rows={4}
                                 />
+                            </div>
+
+                            {/* ── Qualificação ──────────────────────────── */}
+                            <div className="rounded-lg border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4 space-y-4">
+                                <div className="flex items-start gap-2">
+                                    <div className="mt-0.5 h-4 w-4 shrink-0 text-amber-600">
+                                        <svg viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" /></svg>
+                                    </div>
+                                    <div>
+                                        <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">Qualificação (preencha para avançar diretamente para Projeto em Discussão)</p>
+                                        <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-0.5">Sem estes campos, o sistema bloqueará o avanço até que sejam preenchidos.</p>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Tem ANVISA? *</Label>
+                                        <Select value={newClient.tem_anvisa} onValueChange={(v) => setNewClient({ ...newClient, tem_anvisa: v })}>
+                                            <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecionar" /></SelectTrigger>
+                                            <SelectContent>
+                                                <SelectItem value="sim">Sim</SelectItem>
+                                                <SelectItem value="nao">Não</SelectItem>
+                                                <SelectItem value="depende_de_nos">Depende de Nós</SelectItem>
+                                            </SelectContent>
+                                        </Select>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <Label className="text-xs">Volume Estimado Mensal *</Label>
+                                        <Select value={newClient.volume_estimado_mensal} onValueChange={(v) => setNewClient({ ...newClient, volume_estimado_mensal: v })}>
+                                            <SelectTrigger className="h-8 text-xs"><SelectValue placeholder="Selecionar" /></SelectTrigger>
+                                            <SelectContent>
+                                                {VOLUME_OPTIONS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                                            </SelectContent>
+                                        </Select>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="flex items-center justify-between">
+                                        <Label className="text-xs">Decisores *</Label>
+                                        <button
+                                            type="button"
+                                            className="text-[10px] text-primary hover:underline"
+                                            onClick={() => setNewClient(c => ({ ...c, decisores: [...(c.decisores || []), { nome: "", cargo: "", contato: "" }] }))}
+                                        >+ Adicionar</button>
+                                    </div>
+                                    {(newClient.decisores || []).map((dec, idx) => (
+                                        <div key={idx} className="flex gap-2 items-center">
+                                            <input
+                                                className="flex-1 h-7 rounded border border-input bg-background px-2 text-xs"
+                                                placeholder="Nome do decisor *"
+                                                value={dec.nome}
+                                                onChange={e => {
+                                                    const d = [...newClient.decisores];
+                                                    d[idx] = { ...d[idx], nome: e.target.value };
+                                                    setNewClient(c => ({ ...c, decisores: d }));
+                                                }}
+                                            />
+                                            <select
+                                                className="h-7 rounded border border-input bg-background px-2 text-xs"
+                                                value={dec.cargo}
+                                                onChange={e => {
+                                                    const d = [...newClient.decisores];
+                                                    d[idx] = { ...d[idx], cargo: e.target.value };
+                                                    setNewClient(c => ({ ...c, decisores: d }));
+                                                }}
+                                            >
+                                                <option value="">Cargo</option>
+                                                {["ceo", "comprador", "desenvolvimento", "diretor_comercial", "gerente_produto", "outro"].map(c => (
+                                                    <option key={c} value={c}>{formatSlugLabel(c)}</option>
+                                                ))}
+                                            </select>
+                                            <input
+                                                className="w-28 h-7 rounded border border-input bg-background px-2 text-xs"
+                                                placeholder="WhatsApp"
+                                                value={dec.contato}
+                                                onChange={e => {
+                                                    const d = [...newClient.decisores];
+                                                    d[idx] = { ...d[idx], contato: e.target.value };
+                                                    setNewClient(c => ({ ...c, decisores: d }));
+                                                }}
+                                            />
+                                            {(newClient.decisores || []).length > 1 && (
+                                                <button type="button" className="text-muted-foreground hover:text-red-500" onClick={() => {
+                                                    setNewClient(c => ({ ...c, decisores: c.decisores.filter((_, i) => i !== idx) }));
+                                                }}>×</button>
+                                            )}
+                                        </div>
+                                    ))}
+                                    <p className="text-[10px] text-amber-700 dark:text-amber-400">Preencha ao menos o nome de um decisor.</p>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="flex items-center gap-2">
+                                        <input
+                                            type="checkbox"
+                                            id="new-client-tem-fornecedor"
+                                            checked={newClient.fornecedor_atual?.tem || false}
+                                            onChange={e => setNewClient(c => ({ ...c, fornecedor_atual: { ...c.fornecedor_atual, tem: e.target.checked } }))}
+                                            className="h-3.5 w-3.5 accent-primary"
+                                        />
+                                        <Label htmlFor="new-client-tem-fornecedor" className="text-xs cursor-pointer">Possui fornecedor atual?</Label>
+                                    </div>
+                                    {newClient.fornecedor_atual?.tem && (
+                                        <input
+                                            className="w-full h-7 rounded border border-input bg-background px-2 text-xs"
+                                            placeholder="Motivo da troca de fornecedor"
+                                            value={newClient.fornecedor_atual?.motivo_troca || ""}
+                                            onChange={e => setNewClient(c => ({ ...c, fornecedor_atual: { ...c.fornecedor_atual, motivo_troca: e.target.value } }))}
+                                        />
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>
