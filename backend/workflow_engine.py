@@ -15,11 +15,12 @@ Routes (crm_routes.py, pd_routes.py) MUST call helpers here on every transition.
 """
 
 import asyncio
+import json
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from fastapi import HTTPException
-from pymongo import ReturnDocument
 import logging
+import database as pg_db
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,20 @@ def init_workflow(database, new_id_fn, now_iso_fn):
     _new_id = new_id_fn
     _now_iso = now_iso_fn
     logger.info("Workflow engine initialized")
+
+
+def _row(row) -> dict | None:
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+    return d
+
+
+def _rows(rows) -> list:
+    return [_row(r) for r in rows]
 
 
 # ======================================================================
@@ -77,21 +92,24 @@ async def audit_log(
     metadata: Optional[dict] = None,
 ):
     """Append-only audit log entry. Never updated, never deleted."""
-    entry = {
-        "id": _new_id(),
-        "tenant_id": tenant_id,
-        "user_id": user_id,
-        "user_name": user_name,
-        "action": action,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "before": _safe_diff(before),
-        "after": _safe_diff(after),
-        "metadata": metadata or {},
-        "timestamp": _now_iso(),
+    entry_id = _new_id()
+    now = _now_iso()
+    before_data = _safe_diff(before)
+    after_data = _safe_diff(after)
+    await pg_db.execute(
+        """INSERT INTO audit_logs
+           (id, tenant_id, user_id, user_name, action, entity_type, entity_id,
+            before_data, after_data, metadata, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+        entry_id, tenant_id, user_id, user_name, action, entity_type, entity_id,
+        before_data, after_data, metadata or {}, now,
+    )
+    return {
+        "id": entry_id, "tenant_id": tenant_id, "user_id": user_id, "user_name": user_name,
+        "action": action, "entity_type": entity_type, "entity_id": entity_id,
+        "before_data": before_data, "after_data": after_data, "metadata": metadata or {},
+        "created_at": now,
     }
-    await db.audit_logs.insert_one(entry)
-    return entry
 
 
 def _safe_diff(doc: Optional[dict]) -> Optional[dict]:
@@ -118,17 +136,20 @@ async def list_audit_logs(
     action: Optional[str] = None,
     limit: int = 200,
 ):
-    query: Dict[str, Any] = {"tenant_id": tenant_id}
+    conditions = ["tenant_id=$1"]
+    params: list = [tenant_id]
+    idx = 2
     if entity_type:
-        query["entity_type"] = entity_type
+        conditions.append(f"entity_type=${idx}"); params.append(entity_type); idx += 1
     if entity_id:
-        query["entity_id"] = entity_id
+        conditions.append(f"entity_id=${idx}"); params.append(entity_id); idx += 1
     if user_id:
-        query["user_id"] = user_id
+        conditions.append(f"user_id=${idx}"); params.append(user_id); idx += 1
     if action:
-        query["action"] = action
-    cursor = db.audit_logs.find(query, {"_id": 0}).sort("timestamp", -1).limit(limit)
-    return await cursor.to_list(limit)
+        conditions.append(f"action=${idx}"); params.append(action); idx += 1
+    params.append(limit)
+    sql = f"SELECT * FROM audit_logs WHERE {' AND '.join(conditions)} ORDER BY created_at DESC LIMIT ${idx}"
+    return _rows(await pg_db.fetch_all(sql, *params))
 
 
 # ======================================================================
@@ -136,24 +157,33 @@ async def list_audit_logs(
 # ======================================================================
 
 async def next_sequence(tenant_id: str, name: str, start: int = 100) -> int:
-    """Atomically increment and return a tenant-scoped global counter."""
+    """Atomically increment and return a tenant-scoped global counter (PostgreSQL)."""
+    return await next_sequence_pg(tenant_id, name, start)
+
+
+async def next_sequence_pg(tenant_id: str, name: str, start: int = 0) -> int:
+    """PostgreSQL-backed atomic counter."""
     key = f"{name}:{tenant_id}"
-    res = await db.counters.find_one_and_update(
-        {"_id": key},
-        {"$inc": {"seq": 1}, "$setOnInsert": {"start": start}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
+    seq = await pg_db.fetch_val(
+        """
+        INSERT INTO counters(id, tenant_id, seq, updated_at)
+        VALUES($1, $2, 1, NOW())
+        ON CONFLICT(id) DO UPDATE SET
+            seq = counters.seq + 1,
+            updated_at = NOW()
+        RETURNING seq
+        """,
+        key, tenant_id,
     )
-    seq = (res or {}).get("seq", 1)
-    return seq + start
+    return int(seq) + start
 
 
 async def peek_sequence(tenant_id: str, name: str, start: int = 100) -> int:
     key = f"{name}:{tenant_id}"
-    doc = await db.counters.find_one({"_id": key})
-    if not doc:
+    seq = await pg_db.fetch_val("SELECT seq FROM counters WHERE id=$1", key)
+    if seq is None:
         return start
-    return doc.get("seq", 0) + start
+    return int(seq) + start
 
 
 async def next_sample_number(tenant_id: str) -> int:
@@ -338,10 +368,14 @@ def format_lote_numero(data_iso: str, seq: int) -> str:
 
 async def recalc_sku_averages(tenant_id: str, sku_id: str) -> None:
     """Recalculate all automatic production averages for a SKU from its historico_producao."""
-    sku = await db.skus.find_one({"id": sku_id, "tenant_id": tenant_id})
-    if not sku:
+    row = await pg_db.fetch_one(
+        "SELECT medias_producao FROM skus WHERE id=$1 AND tenant_id=$2",
+        sku_id, tenant_id
+    )
+    if not row:
         return
-    historico = (sku.get("medias_producao") or {}).get("historico_producao", [])
+    medias = dict(row).get("medias_producao") or {}
+    historico = medias.get("historico_producao", [])
     if not historico:
         return
 
@@ -355,14 +389,15 @@ async def recalc_sku_averages(tenant_id: str, sku_id: str) -> None:
         cutoff = (now - timedelta(days=days)).isoformat()
         return [r for r in historico if (r.get("data") or "") >= cutoff]
 
-    await db.skus.update_one(
-        {"id": sku_id, "tenant_id": tenant_id},
-        {"$set": {
-            "medias_producao.media_geral_unh": avg_unh(historico),
-            "medias_producao.media_12m_unh": avg_unh(within_days(365)),
-            "medias_producao.media_3m_unh": avg_unh(within_days(90)),
-            "medias_producao.media_1m_unh": avg_unh(within_days(30)),
-        }}
+    patch = {
+        "media_geral_unh": avg_unh(historico),
+        "media_12m_unh": avg_unh(within_days(365)),
+        "media_3m_unh": avg_unh(within_days(90)),
+        "media_1m_unh": avg_unh(within_days(30)),
+    }
+    await pg_db.execute(
+        "UPDATE skus SET medias_producao = medias_producao || $1::jsonb, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        json.dumps(patch), sku_id, tenant_id
     )
 
 
@@ -373,34 +408,37 @@ async def recalc_sku_averages(tenant_id: str, sku_id: str) -> None:
 async def assert_client_exists(tenant_id: str, client_id: str) -> dict:
     if not client_id:
         raise HTTPException(status_code=400, detail="cliente_id obrigatório")
-    doc = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": tenant_id}, {"_id": 0}
+    row = await pg_db.fetch_one(
+        "SELECT id, nome_empresa, stage, cli4, responsavel_comercial FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, tenant_id
     )
-    if not doc:
+    if not row:
         raise HTTPException(status_code=404, detail="Cliente pai não encontrado — bloqueado pela hierarquia")
-    return doc
+    return dict(row)
 
 
 async def assert_project_exists(tenant_id: str, project_id: str) -> dict:
     if not project_id:
         raise HTTPException(status_code=400, detail="projeto_id obrigatório")
-    doc = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": tenant_id}, {"_id": 0}
+    row = await pg_db.fetch_one(
+        "SELECT id, nome_projeto, stage, cliente_id, cliente_nome FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, tenant_id
     )
-    if not doc:
+    if not row:
         raise HTTPException(status_code=404, detail="Projeto pai não encontrado — bloqueado pela hierarquia")
-    return doc
+    return dict(row)
 
 
 async def assert_sample_exists(tenant_id: str, sample_id: str) -> dict:
     if not sample_id:
         raise HTTPException(status_code=400, detail="amostra_id obrigatório")
-    doc = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": tenant_id}, {"_id": 0}
+    row = await pg_db.fetch_one(
+        "SELECT id, nome_amostra, stage, projeto_id, cliente_id FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, tenant_id
     )
-    if not doc:
+    if not row:
         raise HTTPException(status_code=404, detail="Amostra pai não encontrada — bloqueado pela hierarquia")
-    return doc
+    return dict(row)
 
 
 # ======================================================================
@@ -546,9 +584,10 @@ async def create_workflow_task(
     """Create a workflow task. If responsible_id is None, auto-assign by category role."""
     # Auto-assign
     if not responsible_id:
-        users = await db.users.find(
-            {"tenant_id": tenant_id}, {"_id": 0, "password_hash": 0}
-        ).to_list(200)
+        users = _rows(await pg_db.fetch_all(
+            "SELECT id, name, role FROM users WHERE tenant_id=$1 AND active=TRUE",
+            tenant_id,
+        ))
         chosen = _get_default_responsible_sync(users, category, created_by.get("id"))
         if chosen:
             responsible_id = chosen["id"]
@@ -556,9 +595,10 @@ async def create_workflow_task(
         else:
             responsible_name = ""
     else:
-        u = await db.users.find_one(
-            {"id": responsible_id, "tenant_id": tenant_id}, {"_id": 0, "password_hash": 0}
-        )
+        u = _row(await pg_db.fetch_one(
+            "SELECT id, name FROM users WHERE id=$1 AND tenant_id=$2",
+            responsible_id, tenant_id,
+        ))
         responsible_name = u.get("name", "") if u else ""
 
     now = _now_iso()
@@ -618,8 +658,26 @@ async def create_workflow_task(
             "assigned_at": now,
             "reason": "initial_assignment",
         })
-    await db.workflow_tasks.insert_one(task)
-    task.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO workflow_tasks
+           (id, tenant_id, display_code, entity_type, entity_id, module_origin,
+            title, description, category, task_type, priority, blocking, blocks_stages,
+            responsible_id, responsible_name, assignment_history, due_date, status,
+            decision, decision_comment, decision_at, decision_by, decision_by_name,
+            completed_at, completed_by, completed_by_name, completion_comment,
+            d1_notified, escalated, notification_flags, metadata,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                   $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)""",
+        task["id"], tenant_id, display_code, entity_type, entity_id, module_origin,
+        title, description, category, task_type, priority, blocking,
+        task["blocks_stages"], responsible_id or "", responsible_name,
+        task["assignment_history"], due_date, "pendente",
+        None, "", None, None, "",
+        None, None, "", "",
+        False, False, task["notification_flags"], task_metadata,
+        created_by.get("id", ""), created_by.get("name", ""), now, now,
+    )
 
     if responsible_id:
         await create_user_notification(
@@ -637,9 +695,11 @@ async def create_workflow_task(
                 "priority": priority,
             },
         )
-        await db.workflow_tasks.update_one(
-            {"id": task["id"], "tenant_id": tenant_id},
-            {"$set": {"notification_flags.assigned_at": now}},
+        await pg_db.execute(
+            """UPDATE workflow_tasks
+               SET notification_flags = notification_flags || jsonb_build_object('assigned_at', $1)
+               WHERE id=$2 AND tenant_id=$3""",
+            now, task["id"], tenant_id,
         )
         task["notification_flags"]["assigned_at"] = now
 
@@ -671,17 +731,15 @@ async def get_blocking_tasks(
     target_stage: Optional[str] = None,
 ) -> List[dict]:
     """Return open blocking tasks that prevent the entity from advancing."""
-    query = {
-        "tenant_id": tenant_id,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "blocking": True,
-        "status": {"$in": list(TASK_OPEN_STATUSES)},
-    }
-    tasks = await db.workflow_tasks.find(query, {"_id": 0}).to_list(500)
+    placeholders = ",".join(f"${i+4}" for i in range(len(TASK_OPEN_STATUSES)))
+    tasks = _rows(await pg_db.fetch_all(
+        f"""SELECT * FROM workflow_tasks
+            WHERE tenant_id=$1 AND entity_type=$2 AND entity_id=$3
+              AND blocking=TRUE AND status IN ({placeholders})""",
+        tenant_id, entity_type, entity_id, *TASK_OPEN_STATUSES,
+    ))
     if target_stage is None:
         return tasks
-    # If a task lists blocks_stages, check it; if it lists none, treat as blocks-all-advances.
     return [
         t for t in tasks
         if not t.get("blocks_stages") or target_stage in t["blocks_stages"]
@@ -710,9 +768,10 @@ async def assert_no_blocking_tasks(
 
 
 async def complete_task(*, tenant_id: str, task_id: str, user: dict, comment: str = "") -> dict:
-    task = await db.workflow_tasks.find_one(
-        {"id": task_id, "tenant_id": tenant_id}, {"_id": 0}
-    )
+    task = _row(await pg_db.fetch_one(
+        "SELECT * FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, tenant_id,
+    ))
     if task and task.get("task_type") == "approval":
         raise HTTPException(status_code=400, detail="Tarefas de aprovacao exigem decisao formal. Use aprovar ou reprovar.")
     if task and not _can_act_on_task(task, user):
@@ -725,26 +784,19 @@ async def complete_task(*, tenant_id: str, task_id: str, user: dict, comment: st
         return task
 
     now = _now_iso()
-    await db.workflow_tasks.update_one(
-        {"id": task_id, "tenant_id": tenant_id},
-        {
-            "$set": {
-                "status": "concluida",
-                "decision": task.get("decision"),
-                "decision_comment": task.get("decision_comment", ""),
-                "decision_at": task.get("decision_at"),
-                "decision_by": task.get("decision_by"),
-                "decision_by_name": task.get("decision_by_name"),
-                "completed_at": now,
-                "completed_by": user["id"],
-                "completed_by_name": user.get("name", ""),
-                "updated_at": now,
-                "completion_comment": comment,
-                "notification_flags.completed_at": now,
-            }
-        },
+    await pg_db.execute(
+        """UPDATE workflow_tasks SET
+           status='concluida',
+           decision=$1, decision_comment=$2, decision_at=$3, decision_by=$4, decision_by_name=$5,
+           completed_at=$6, completed_by=$7, completed_by_name=$8, updated_at=$6, completion_comment=$9,
+           notification_flags = notification_flags || jsonb_build_object('completed_at', $6)
+           WHERE id=$10 AND tenant_id=$11""",
+        task.get("decision"), task.get("decision_comment", ""), task.get("decision_at"),
+        task.get("decision_by"), task.get("decision_by_name"),
+        now, user["id"], user.get("name", ""), comment,
+        task_id, tenant_id,
     )
-    updated = await db.workflow_tasks.find_one({"id": task_id}, {"_id": 0})
+    updated = _row(await pg_db.fetch_one("SELECT * FROM workflow_tasks WHERE id=$1", task_id))
 
     await audit_log(
         tenant_id=tenant_id,
@@ -774,9 +826,10 @@ async def decide_task(
     if decision == "rejected" and not comment.strip():
         raise HTTPException(status_code=400, detail="Justificativa obrigatória para reprovação.")
 
-    task = await db.workflow_tasks.find_one(
-        {"id": task_id, "tenant_id": tenant_id}, {"_id": 0}
-    )
+    task = _row(await pg_db.fetch_one(
+        "SELECT * FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, tenant_id,
+    ))
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     if task.get("task_type") != "approval":
@@ -789,26 +842,20 @@ async def decide_task(
         raise HTTPException(status_code=400, detail="Tarefa cancelada nao pode receber decisao.")
 
     now = _now_iso()
-    await db.workflow_tasks.update_one(
-        {"id": task_id, "tenant_id": tenant_id},
-        {
-            "$set": {
-                "status": "concluida",
-                "decision": decision,
-                "decision_comment": comment,
-                "decision_at": now,
-                "decision_by": user["id"],
-                "decision_by_name": user.get("name", ""),
-                "completed_at": now,
-                "completed_by": user["id"],
-                "completed_by_name": user.get("name", ""),
-                "completion_comment": comment,
-                "updated_at": now,
-                "notification_flags.completed_at": now,
-            }
-        },
+    await pg_db.execute(
+        """UPDATE workflow_tasks SET
+           status='concluida',
+           decision=$1, decision_comment=$2, decision_at=$3,
+           decision_by=$4, decision_by_name=$5,
+           completed_at=$3, completed_by=$4, completed_by_name=$5,
+           completion_comment=$2, updated_at=$3,
+           notification_flags = notification_flags || jsonb_build_object('completed_at', $3)
+           WHERE id=$6 AND tenant_id=$7""",
+        decision, comment, now,
+        user["id"], user.get("name", ""),
+        task_id, tenant_id,
     )
-    updated = await db.workflow_tasks.find_one({"id": task_id}, {"_id": 0})
+    updated = _row(await pg_db.fetch_one("SELECT * FROM workflow_tasks WHERE id=$1", task_id))
     await _sync_pd_document_version_status(updated)
 
     await audit_log(
@@ -1112,20 +1159,18 @@ async def trigger_tasks_for_transition(
         )
         created.append(task)
 
-    # ERP v3.0 mirror: when a pd_card enters aguardando_aprovacao, also create
-    # a CQ task on the linked CRM variação so the variação cannot be approved
-    # (and SKU generated) until CQ signs off.
     if entity_type == "pd_card" and new_stage == "aguardando_aprovacao":
-        card = await db.pd_cards.find_one(
-            {"id": entity_id, "tenant_id": tenant_id}, {"_id": 0}
-        )
+        card = _row(await pg_db.fetch_one(
+            "SELECT id, amostra_variacao_id, amostra_id, extra FROM pd_cards WHERE id=$1 AND tenant_id=$2",
+            entity_id, tenant_id,
+        ))
         if card and card.get("amostra_variacao_id"):
             mirror = await create_workflow_task(
                 tenant_id=tenant_id,
                 entity_type="variacao",
                 entity_id=card["amostra_variacao_id"],
                 title="Aprovação CQ pendente (vinculada ao Card P&D)",
-                description=f"Card P&D {card.get('numero_completo', '')} aguarda aprovação do CQ.",
+                description=f"Card P&D {(card.get('extra') or {}).get('numero_completo', '')} aguarda aprovação do CQ.",
                 category="qa",
                 blocking=True,
                 blocks_stages=["aprovada"],
@@ -1149,10 +1194,12 @@ async def trigger_tasks_for_transition(
 # ======================================================================
 
 async def list_tasks_for_entity(tenant_id: str, entity_type: str, entity_id: str) -> List[dict]:
-    return await db.workflow_tasks.find(
-        {"tenant_id": tenant_id, "entity_type": entity_type, "entity_id": entity_id},
-        {"_id": 0},
-    ).sort("created_at", -1).to_list(500)
+    return _rows(await pg_db.fetch_all(
+        """SELECT * FROM workflow_tasks
+           WHERE tenant_id=$1 AND entity_type=$2 AND entity_id=$3
+           ORDER BY created_at DESC LIMIT 500""",
+        tenant_id, entity_type, entity_id,
+    ))
 
 
 async def list_tasks_filtered(
@@ -1166,28 +1213,39 @@ async def list_tasks_filtered(
     due_within_days: Optional[int] = None,
     task_type: Optional[str] = None,
 ) -> List[dict]:
-    query: Dict[str, Any] = {"tenant_id": tenant_id}
-    if status:
-        query["status"] = status
-    if responsible_id:
-        query["responsible_id"] = responsible_id
-    if entity_type:
-        query["entity_type"] = entity_type
-    if blocking is not None:
-        query["blocking"] = blocking
-    if task_type:
-        query["task_type"] = task_type
+    conditions = ["tenant_id=$1"]
+    params: list = [tenant_id]
+    idx = 2
+
+    open_ph = ",".join(f"${idx+j}" for j in range(len(TASK_OPEN_STATUSES)))
+
     if overdue:
-        query["status"] = {"$in": list(TASK_OPEN_STATUSES)}
-        query["due_date"] = {"$lt": datetime.now(timezone.utc).isoformat()}
+        conditions.append(f"status IN ({open_ph})")
+        params.extend(TASK_OPEN_STATUSES); idx += len(TASK_OPEN_STATUSES)
+        conditions.append(f"due_date < ${idx}")
+        params.append(datetime.now(timezone.utc).isoformat()); idx += 1
     elif due_within_days is not None:
         now = datetime.now(timezone.utc)
-        query["status"] = {"$in": list(TASK_OPEN_STATUSES)}
-        query["due_date"] = {
-            "$gte": now.isoformat(),
-            "$lte": (now + timedelta(days=due_within_days)).isoformat(),
-        }
-    return await db.workflow_tasks.find(query, {"_id": 0}).sort("due_date", 1).to_list(2000)
+        conditions.append(f"status IN ({open_ph})")
+        params.extend(TASK_OPEN_STATUSES); idx += len(TASK_OPEN_STATUSES)
+        conditions.append(f"due_date >= ${idx} AND due_date <= ${idx+1}")
+        params.append(now.isoformat())
+        params.append((now + timedelta(days=due_within_days)).isoformat())
+        idx += 2
+    elif status:
+        conditions.append(f"status=${idx}"); params.append(status); idx += 1
+
+    if responsible_id:
+        conditions.append(f"responsible_id=${idx}"); params.append(responsible_id); idx += 1
+    if entity_type:
+        conditions.append(f"entity_type=${idx}"); params.append(entity_type); idx += 1
+    if blocking is not None:
+        conditions.append(f"blocking=${idx}"); params.append(blocking); idx += 1
+    if task_type:
+        conditions.append(f"task_type=${idx}"); params.append(task_type); idx += 1
+
+    sql = f"SELECT * FROM workflow_tasks WHERE {' AND '.join(conditions)} ORDER BY due_date ASC NULLS LAST LIMIT 2000"
+    return _rows(await pg_db.fetch_all(sql, *params))
 
 
 async def create_user_notification(
@@ -1197,23 +1255,28 @@ async def create_user_notification(
     title: str,
     message: str,
     notif_type: str = "workflow_task",
+    entity_type: str = "",
+    entity_id: str = "",
     metadata: Optional[dict] = None,
 ):
     if not user_id:
         return None
-    notification = {
-        "id": _new_id(),
-        "tenant_id": tenant_id,
-        "user_id": user_id,
-        "type": notif_type,
-        "title": title,
-        "message": message,
-        "metadata": metadata or {},
-        "read": False,
-        "created_at": _now_iso(),
+    notif_id = _new_id()
+    now = _now_iso()
+    await pg_db.execute(
+        """INSERT INTO notifications
+           (id, tenant_id, user_id, type, title, body, entity_type, entity_id,
+            metadata, read, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,$10)""",
+        notif_id, tenant_id, user_id, notif_type, title, message,
+        entity_type or None, entity_id or None, metadata or {}, now,
+    )
+    return {
+        "id": notif_id, "tenant_id": tenant_id, "user_id": user_id,
+        "type": notif_type, "title": title, "body": message,
+        "entity_type": entity_type, "entity_id": entity_id,
+        "metadata": metadata or {}, "read": False, "created_at": now,
     }
-    await db.notifications.insert_one(notification)
-    return notification
 
 
 async def _notify_task_closure(task: dict, *, actor: dict, action_label: str):
@@ -1237,87 +1300,71 @@ async def _sync_pd_document_version_status(task: dict):
     if not version_id:
         return
 
-    doc_version = await db.pd_document_versions.find_one({"id": version_id}, {"_id": 0})
+    doc_version = _row(await pg_db.fetch_one(
+        "SELECT id, tenant_id, pd_request_id, doc_type FROM pd_document_versions WHERE id=$1",
+        version_id,
+    ))
     if not doc_version:
         return
 
-    approval_tasks = await db.workflow_tasks.find(
-        {
-            "tenant_id": task["tenant_id"],
-            "entity_type": "pd_document",
-            "entity_id": version_id,
-            "task_type": "approval",
-        },
-        {"_id": 0},
-    ).to_list(100)
+    approval_tasks = _rows(await pg_db.fetch_all(
+        """SELECT * FROM workflow_tasks
+           WHERE tenant_id=$1 AND entity_type='pd_document' AND entity_id=$2 AND task_type='approval'""",
+        task["tenant_id"], version_id,
+    ))
     if not approval_tasks:
         return
 
     now = _now_iso()
+    summary = _approval_summary(approval_tasks)
     rejected = [t for t in approval_tasks if t.get("status") == "concluida" and t.get("decision") == "rejected"]
     if rejected:
-        await db.pd_document_versions.update_one(
-            {"id": version_id},
-            {"$set": {
-                "status": "reprovado",
-                "active_for_operation": False,
-                "approved_at": None,
-                "updated_at": now,
-                "approval_summary": _approval_summary(approval_tasks),
-            }}
+        await pg_db.execute(
+            """UPDATE pd_document_versions
+               SET status='reprovado', active_for_operation=FALSE, approved_at=NULL,
+                   updated_at=$1, approval_summary=$2
+               WHERE id=$3""",
+            now, summary, version_id,
         )
         return
 
     pending = [t for t in approval_tasks if t.get("status") != "concluida"]
     if pending:
-        await db.pd_document_versions.update_one(
-            {"id": version_id},
-            {"$set": {
-                "status": "em_revisao",
-                "updated_at": now,
-                "approval_summary": _approval_summary(approval_tasks),
-            }}
+        await pg_db.execute(
+            """UPDATE pd_document_versions
+               SET status='em_revisao', updated_at=$1, approval_summary=$2
+               WHERE id=$3""",
+            now, summary, version_id,
         )
         return
 
     if not all(t.get("decision") == "approved" for t in approval_tasks):
         return
 
-    await db.pd_document_versions.update_many(
-        {
-            "tenant_id": doc_version["tenant_id"],
-            "pd_request_id": doc_version["pd_request_id"],
-            "doc_type": doc_version["doc_type"],
-            "id": {"$ne": version_id},
-            "status": "aprovado",
-        },
-        {"$set": {"status": "substituido", "active_for_operation": False, "updated_at": now}}
+    await pg_db.execute(
+        """UPDATE pd_document_versions
+           SET status='substituido', active_for_operation=FALSE, updated_at=$1
+           WHERE tenant_id=$2 AND pd_request_id=$3 AND doc_type=$4 AND id<>$5 AND status='aprovado'""",
+        now, doc_version["tenant_id"], doc_version["pd_request_id"], doc_version["doc_type"], version_id,
     )
-    await db.pd_document_versions.update_one(
-        {"id": version_id},
-        {
-            "$set": {
-                "status": "aprovado",
-                "active_for_operation": True,
-                "approved_at": now,
-                "updated_at": now,
-                "approval_summary": _approval_summary(approval_tasks),
-            }
-        }
+    await pg_db.execute(
+        """UPDATE pd_document_versions
+           SET status='aprovado', active_for_operation=TRUE, approved_at=$1, updated_at=$1, approval_summary=$2
+           WHERE id=$3""",
+        now, summary, version_id,
     )
 
 
 async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
     now = datetime.now(timezone.utc)
     created = 0
-    tasks = await db.workflow_tasks.find(
-        {
-            "tenant_id": tenant_id,
-            "status": {"$in": list(TASK_OPEN_STATUSES)},
-            "responsible_id": {"$ne": ""},
-        },
-        {"_id": 0},
-    ).to_list(5000)
+    open_ph = ",".join(f"${i+2}" for i in range(len(TASK_OPEN_STATUSES)))
+    tasks = _rows(await pg_db.fetch_all(
+        f"""SELECT * FROM workflow_tasks
+            WHERE tenant_id=$1 AND status IN ({open_ph})
+              AND responsible_id <> '' AND responsible_id IS NOT NULL""",
+        tenant_id, *TASK_OPEN_STATUSES,
+    ))
 
     for task in tasks:
         due_date = task.get("due_date")
@@ -1337,11 +1384,16 @@ async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
                 user_id=task.get("responsible_id", ""),
                 title=f"Tarefa em atraso: {task.get('display_code', task.get('title', ''))}",
                 message=f"Prazo vencido em {due_dt.date().isoformat()}",
+                entity_type=task.get("entity_type", ""),
+                entity_id=task.get("entity_id", ""),
                 metadata={"task_id": task["id"], "entity_type": task["entity_type"], "entity_id": task["entity_id"]},
             )
-            await db.workflow_tasks.update_one(
-                {"id": task["id"], "tenant_id": tenant_id},
-                {"$set": {"notification_flags.overdue_at": _now_iso(), "status": "em_atraso", "updated_at": _now_iso()}},
+            await pg_db.execute(
+                """UPDATE workflow_tasks
+                   SET notification_flags = notification_flags || jsonb_build_object('overdue_at', $1),
+                       status='em_atraso', updated_at=NOW()
+                   WHERE id=$2 AND tenant_id=$3""",
+                _now_iso(), task["id"], tenant_id,
             )
             created += 1
             continue
@@ -1353,21 +1405,24 @@ async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
                 user_id=task.get("responsible_id", ""),
                 title=f"Tarefa vence em ate 1 dia: {task.get('title', '')}",
                 message=f"Prazo: {due_dt.date().isoformat()}",
+                entity_type=task.get("entity_type", ""),
+                entity_id=task.get("entity_id", ""),
                 metadata={"task_id": task["id"], "entity_type": task["entity_type"], "entity_id": task["entity_id"]},
             )
-            await db.workflow_tasks.update_one(
-                {"id": task["id"], "tenant_id": tenant_id},
-                {"$set": {"notification_flags.due_1d_at": _now_iso()}},
+            await pg_db.execute(
+                """UPDATE workflow_tasks
+                   SET notification_flags = notification_flags || jsonb_build_object('due_1d_at', $1)
+                   WHERE id=$2 AND tenant_id=$3""",
+                _now_iso(), task["id"], tenant_id,
             )
             created += 1
 
-        # Auto-escalate blocking tasks overdue > 3 days
         if due_dt < now and task.get("blocking") and not task.get("escalated"):
             delta_days = (now - due_dt).days
             if delta_days >= 3:
-                await db.workflow_tasks.update_one(
-                    {"id": task["id"], "tenant_id": tenant_id},
-                    {"$set": {"escalated": True, "escalated_at": _now_iso(), "updated_at": _now_iso()}},
+                await pg_db.execute(
+                    "UPDATE workflow_tasks SET escalated=TRUE, escalated_at=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+                    _now_iso(), task["id"], tenant_id,
                 )
 
     return created
@@ -1376,20 +1431,21 @@ async def check_workflow_due_notifications_for_tenant(tenant_id: str) -> int:
 async def check_followup_notifications_for_tenant(tenant_id: str):
     """R19: Notify commercial users when order follow-up marcos (1m/3m/6m) are reached."""
     now = datetime.now(timezone.utc).isoformat()
-    orders = await db.orders.find(
-        {
-            "tenant_id": tenant_id,
-            "status": "concluido",
-            "followups": {"$elemMatch": {"notificado": False, "vence_em": {"$lte": now}}},
-        },
-        {"_id": 0, "id": 1, "numero_pedido": 1, "followups": 1, "cliente": 1, "created_by": 1},
-    ).to_list(500)
+    orders = _rows(await pg_db.fetch_all(
+        """SELECT id, numero_pedido, followups, cliente_nome, created_by
+           FROM orders
+           WHERE tenant_id=$1 AND status='concluido'
+             AND followups IS NOT NULL AND jsonb_array_length(followups) > 0""",
+        tenant_id,
+    ))
 
     for order in orders:
-        for i, fu in enumerate(order.get("followups", [])):
+        followups = list(order.get("followups") or [])
+        updated = False
+        for i, fu in enumerate(followups):
             if fu.get("notificado") or fu.get("vence_em", "9999") > now:
                 continue
-            cliente_nome = (order.get("cliente") or {}).get("nome") or (order.get("cliente") or {}).get("razao_social", "")
+            cliente_nome = order.get("cliente_nome") or ""
             await create_user_notification(
                 tenant_id=tenant_id,
                 user_id=order.get("created_by", ""),
@@ -1398,9 +1454,12 @@ async def check_followup_notifications_for_tenant(tenant_id: str):
                 message=f"Marco de {fu['marco']} atingido para o pedido #{order.get('numero_pedido', '')} — {cliente_nome}",
                 metadata={"order_id": order["id"], "marco": fu["marco"]},
             )
-            await db.orders.update_one(
-                {"id": order["id"]},
-                {"$set": {f"followups.{i}.notificado": True}},
+            followups[i] = {**fu, "notificado": True}
+            updated = True
+        if updated:
+            await pg_db.execute(
+                "UPDATE orders SET followups=$1, updated_at=NOW() WHERE id=$2",
+                followups, order["id"],
             )
 
 
@@ -1408,7 +1467,7 @@ async def run_workflow_notification_scheduler():
     await asyncio.sleep(45)
     while True:
         try:
-            tenants = await db.tenants.find({}, {"_id": 0, "id": 1}).to_list(500)
+            tenants = _rows(await pg_db.fetch_all("SELECT id FROM tenants WHERE active=TRUE"))
             for tenant in tenants:
                 await check_workflow_due_notifications_for_tenant(tenant["id"])
                 await check_followup_notifications_for_tenant(tenant["id"])

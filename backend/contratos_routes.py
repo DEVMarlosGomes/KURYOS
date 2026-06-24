@@ -40,20 +40,19 @@ from reportlab.platypus import (
 )
 
 from rbac import require_roles
-from workflow_engine import audit_log, next_sequence
+from workflow_engine import audit_log, next_sequence_pg
+import database as pg_db
 
 
 contratos_router = APIRouter(prefix="/api/contratos")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_contratos(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -98,8 +97,22 @@ class ContratoGerarInput(BaseModel):
 
 
 # ============ HELPERS ============
+def _row(row) -> dict | None:
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+    return d
+
+
 async def _get_kickoff_aprovado(kickoff_id: str, tenant_id: str) -> dict:
-    kickoff = await db.kickoffs.find_one({"id": kickoff_id, "tenant_id": tenant_id}, {"_id": 0})
+    row = await pg_db.fetch_one(
+        "SELECT * FROM kickoffs WHERE id=$1 AND tenant_id=$2",
+        kickoff_id, tenant_id,
+    )
+    kickoff = _row(row)
     if not kickoff:
         raise HTTPException(status_code=404, detail="Kickoff nao encontrado.")
     if kickoff.get("status") != "aprovado":
@@ -113,11 +126,14 @@ async def _get_kickoff_aprovado(kickoff_id: str, tenant_id: str) -> dict:
 async def _get_client(client_id: Optional[str], tenant_id: str) -> Optional[dict]:
     if not client_id:
         return None
-    return await db.crm_clients.find_one({"id": client_id, "tenant_id": tenant_id}, {"_id": 0})
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, tenant_id,
+    ))
 
 
 async def _generate_contrato_number(tenant_id: str) -> str:
-    seq = await next_sequence(tenant_id, "contrato_cgi", start=0)
+    seq = await next_sequence_pg(tenant_id, "contrato_cgi", start=0)
     return f"CGI-{datetime.now(timezone.utc).year}-{seq:04d}"
 
 
@@ -551,12 +567,12 @@ async def gerar_contrato(data: ContratoGerarInput, request: Request):
 
     client = await _get_client(kickoff.get("projeto_id_client_id") or kickoff.get("client_id"), user["tenant_id"])
     if not client and kickoff.get("projeto_id"):
-        # Try via project
-        project = await db.crm_projects.find_one(
-            {"id": kickoff["projeto_id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
-        )
+        project = _row(await pg_db.fetch_one(
+            "SELECT cliente_id FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+            kickoff["projeto_id"], user["tenant_id"],
+        ))
         if project:
-            client = await _get_client(project.get("client_id"), user["tenant_id"])
+            client = await _get_client(project.get("cliente_id"), user["tenant_id"])
 
     bloco1 = kickoff.get("bloco1") or {}
     overrides = (data.contratante.dict() if data.contratante else {}) or {}
@@ -575,26 +591,40 @@ async def gerar_contrato(data: ContratoGerarInput, request: Request):
     numero_contrato = await _generate_contrato_number(user["tenant_id"])
     pdf_bytes = _build_pdf(kickoff, contratante, numero_contrato, data.observacoes or "")
 
+    clausulas = _build_clauses(kickoff, contratante)
+    contrato_id = new_id()
     contrato_doc = {
-        "id": new_id(),
+        "id": contrato_id,
         "tenant_id": user["tenant_id"],
         "numero_contrato": numero_contrato,
         "kickoff_id": kickoff["id"],
-        "numero_kickoff": kickoff.get("numero_kickoff"),
-        "kickoff_versao": kickoff.get("versao"),
-        "client_id": (client or {}).get("id"),
+        "numero_kickoff": kickoff.get("numero_kickoff") or "",
+        "kickoff_versao": kickoff.get("versao") or "",
+        "client_id": (client or {}).get("id") or "",
         "contratante": contratante,
         "fabricante": KURYOS_FABRICANTE,
+        "clausulas": clausulas,
         "observacoes": data.observacoes or "",
         "pdf_size_bytes": len(pdf_bytes),
-        "pdf_data": pdf_bytes,  # stored inline; switch to GridFS/object storage if needed
+        "pdf_data": pdf_bytes,
         "created_at": now_iso(),
         "created_by": user["id"],
         "created_by_name": user.get("name", ""),
         "status": "gerado",
         "version": 1,
     }
-    await db.contratos.insert_one(contrato_doc)
+    await pg_db.execute(
+        """INSERT INTO contratos
+           (id, tenant_id, numero_contrato, kickoff_id, numero_kickoff, kickoff_versao,
+            client_id, contratante, fabricante, clausulas, observacoes,
+            pdf_size_bytes, pdf_data, status, version, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)""",
+        contrato_id, user["tenant_id"], numero_contrato,
+        kickoff["id"], contrato_doc["numero_kickoff"], contrato_doc["kickoff_versao"],
+        contrato_doc["client_id"], contratante, KURYOS_FABRICANTE, clausulas,
+        data.observacoes or "", len(pdf_bytes), pdf_bytes,
+        "gerado", 1, user["id"], user.get("name", ""), now_iso(),
+    )
 
     await audit_log(
         tenant_id=user["tenant_id"],
@@ -623,13 +653,27 @@ async def list_contratos(
 ):
     user = await get_current_user(request)
     require_roles(user, READ_ROLES)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
-    if kickoff_id:
-        query["kickoff_id"] = kickoff_id
-    if client_id:
-        query["client_id"] = client_id
-    cursor = db.contratos.find(query, {"_id": 0, "pdf_data": 0}).sort("created_at", -1)
-    docs = await cursor.to_list(500)
+    if kickoff_id and client_id:
+        rows = await pg_db.fetch_all(
+            "SELECT id,tenant_id,numero_contrato,kickoff_id,numero_kickoff,kickoff_versao,client_id,contratante,fabricante,clausulas,observacoes,pdf_size_bytes,status,version,tipo,created_by,created_by_name,created_at,updated_at FROM contratos WHERE tenant_id=$1 AND kickoff_id=$2 AND client_id=$3 ORDER BY created_at DESC LIMIT 500",
+            user["tenant_id"], kickoff_id, client_id,
+        )
+    elif kickoff_id:
+        rows = await pg_db.fetch_all(
+            "SELECT id,tenant_id,numero_contrato,kickoff_id,numero_kickoff,kickoff_versao,client_id,contratante,fabricante,clausulas,observacoes,pdf_size_bytes,status,version,tipo,created_by,created_by_name,created_at,updated_at FROM contratos WHERE tenant_id=$1 AND kickoff_id=$2 ORDER BY created_at DESC LIMIT 500",
+            user["tenant_id"], kickoff_id,
+        )
+    elif client_id:
+        rows = await pg_db.fetch_all(
+            "SELECT id,tenant_id,numero_contrato,kickoff_id,numero_kickoff,kickoff_versao,client_id,contratante,fabricante,clausulas,observacoes,pdf_size_bytes,status,version,tipo,created_by,created_by_name,created_at,updated_at FROM contratos WHERE tenant_id=$1 AND client_id=$2 ORDER BY created_at DESC LIMIT 500",
+            user["tenant_id"], client_id,
+        )
+    else:
+        rows = await pg_db.fetch_all(
+            "SELECT id,tenant_id,numero_contrato,kickoff_id,numero_kickoff,kickoff_versao,client_id,contratante,fabricante,clausulas,observacoes,pdf_size_bytes,status,version,tipo,created_by,created_by_name,created_at,updated_at FROM contratos WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500",
+            user["tenant_id"],
+        )
+    docs = [_row(r) for r in rows]
     return {"contratos": docs, "count": len(docs)}
 
 
@@ -637,23 +681,26 @@ async def list_contratos(
 async def get_contrato(contrato_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, READ_ROLES)
-    doc = await db.contratos.find_one(
-        {"id": contrato_id, "tenant_id": user["tenant_id"]}, {"_id": 0, "pdf_data": 0}
+    row = await pg_db.fetch_one(
+        "SELECT id,tenant_id,numero_contrato,kickoff_id,numero_kickoff,kickoff_versao,client_id,contratante,fabricante,clausulas,observacoes,pdf_size_bytes,status,version,tipo,created_by,created_by_name,created_at,updated_at FROM contratos WHERE id=$1 AND tenant_id=$2",
+        contrato_id, user["tenant_id"],
     )
-    if not doc:
+    if not row:
         raise HTTPException(status_code=404, detail="Contrato nao encontrado.")
-    return doc
+    return _row(row)
 
 
 @contratos_router.get("/{contrato_id}/pdf")
 async def download_contrato_pdf(contrato_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, READ_ROLES)
-    doc = await db.contratos.find_one(
-        {"id": contrato_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
+    row = await pg_db.fetch_one(
+        "SELECT numero_contrato, pdf_data FROM contratos WHERE id=$1 AND tenant_id=$2",
+        contrato_id, user["tenant_id"],
     )
-    if not doc:
+    if not row:
         raise HTTPException(status_code=404, detail="Contrato nao encontrado.")
+    doc = dict(row)
     pdf_bytes = doc.get("pdf_data")
     if not pdf_bytes:
         raise HTTPException(status_code=404, detail="PDF do contrato indisponivel.")

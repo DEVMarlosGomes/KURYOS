@@ -19,22 +19,21 @@ Regras de Negócio:
 """
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional
 import logging
+import database as pg_db
 
 logger = logging.getLogger(__name__)
 
 retrabalho_router = APIRouter(prefix="/api/retrabalho")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_retrabalho(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -46,6 +45,16 @@ def new_id():
 
 def now_iso():
     return now_iso_func()
+
+
+def _row(r):
+    if r is None:
+        return None
+    d = dict(r)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
+    return d
 
 
 RT_STATUSES = ["pendente", "em_retrabalho", "concluido", "reprovado", "cancelado"]
@@ -62,9 +71,9 @@ STATUS_TRANSITIONS = {
 
 # ===== MODELS =====
 class RTCreate(BaseModel):
-    categoria: str = "RT-1"              # "RT-1" | "RT-2" | "RT-3"
-    rnc_id: str                          # Obrigatório — RN-RT-01
-    op_id: Optional[str] = None          # OP original vinculada (PCP)
+    categoria: str = "RT-1"
+    rnc_id: str
+    op_id: Optional[str] = None
     lote_id: Optional[str] = None
     lote_numero: Optional[str] = None
     produto_nome: str
@@ -72,9 +81,9 @@ class RTCreate(BaseModel):
     instrucoes_retrabalho: str = ""
     responsavel_id: Optional[str] = None
     responsavel_nome: Optional[str] = None
-    data_limite: Optional[str] = None    # YYYY-MM-DD
+    data_limite: Optional[str] = None
     custo_estimado: float = 0.0
-    devolucao_id: Optional[str] = None   # RT-3: comprovante de devolução física
+    devolucao_id: Optional[str] = None
     observacoes: str = ""
 
 
@@ -95,7 +104,9 @@ class RTConcluir(BaseModel):
 
 # ===== HELPERS =====
 async def _next_rt_numero(tenant_id: str) -> str:
-    count = await db.retrabalho_ordens.count_documents({"tenant_id": tenant_id})
+    count = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM retrabalho_ordens WHERE tenant_id=$1", tenant_id
+    )
     return f"RT-{str(count + 1).zfill(5)}"
 
 
@@ -108,26 +119,40 @@ async def list_ordens(
     q: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    tid = user["tenant_id"]
+
+    clauses = ["tenant_id=$1"]
+    vals: list = [tid]
+    i = 2
+
     if status:
-        query["status"] = status
+        clauses.append(f"status=${i}")
+        vals.append(status)
+        i += 1
     if categoria:
-        query["categoria"] = categoria
+        clauses.append(f"categoria=${i}")
+        vals.append(categoria)
+        i += 1
     if q:
-        query["$or"] = [
-            {"numero_rt": {"$regex": q, "$options": "i"}},
-            {"produto_nome": {"$regex": q, "$options": "i"}},
-            {"lote_numero": {"$regex": q, "$options": "i"}},
-            {"rnc_numero": {"$regex": q, "$options": "i"}},
-        ]
-    ordens = await db.retrabalho_ordens.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return ordens
+        pat = f"%{q}%"
+        clauses.append(
+            f"(numero_rt ILIKE ${i} OR produto_nome ILIKE ${i+1}"
+            f" OR lote_numero ILIKE ${i+2} OR rnc_numero ILIKE ${i+3})"
+        )
+        vals.extend([pat, pat, pat, pat])
+
+    sql = f"SELECT * FROM retrabalho_ordens WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 500"
+    rows = await pg_db.fetch_all(sql, *vals)
+    return [_row(r) for r in rows]
 
 
 @retrabalho_router.get("/ordens/{rt_id}")
 async def get_ordem(rt_id: str, request: Request):
     user = await get_current_user(request)
-    rt = await db.retrabalho_ordens.find_one({"id": rt_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    rt = _row(await pg_db.fetch_one(
+        "SELECT * FROM retrabalho_ordens WHERE id=$1 AND tenant_id=$2",
+        rt_id, user["tenant_id"],
+    ))
     if not rt:
         raise HTTPException(status_code=404, detail="Ordem de Retrabalho não encontrada")
     return rt
@@ -146,87 +171,86 @@ async def create_ordem(data: RTCreate, request: Request):
         raise HTTPException(status_code=400, detail="Descreva o problema identificado")
 
     # RN-RT-01: RNC is mandatory for every RT
-    rnc = await db.cq_rncs.find_one({"id": data.rnc_id, "tenant_id": tid}, {"_id": 0})
+    rnc = _row(await pg_db.fetch_one(
+        "SELECT * FROM cq_rncs WHERE id=$1 AND tenant_id=$2", data.rnc_id, tid
+    ))
     if not rnc:
         raise HTTPException(
             status_code=400,
-            detail="RNC não encontrada. Toda Ordem de Retrabalho exige RNC vinculada (RN-RT-01)"
+            detail="RNC não encontrada. Toda Ordem de Retrabalho exige RNC vinculada (RN-RT-01)",
         )
 
-    # RN-RT-04: RT-3 requires physical return proof before creating the RT
+    # RN-RT-04: RT-3 requires physical return proof
     if data.categoria == "RT-3" and not data.devolucao_id:
         raise HTTPException(
             status_code=400,
-            detail="RT-3 (Devolução ao Fornecedor) exige comprovante de devolução física antes de criar a RT (RN-RT-04)"
+            detail="RT-3 (Devolução ao Fornecedor) exige comprovante de devolução física antes de criar a RT (RN-RT-04)",
         )
 
-    # Lote numbering: RT-1 keeps original lote + 'R' suffix
     lote_numero = data.lote_numero
     if data.categoria == "RT-1" and lote_numero and not lote_numero.endswith("R"):
         lote_numero = f"{lote_numero}R"
 
     # Resolve OP context for saldo tracking (RN-RT-03)
-    op_ref = {}
+    op_numero = ""
+    pedido_id = ""
+    pedido_numero = ""
     if data.op_id:
-        op = await db.ops.find_one({"id": data.op_id, "tenant_id": tid}, {"_id": 0})
+        op = _row(await pg_db.fetch_one(
+            "SELECT * FROM ops WHERE id=$1 AND tenant_id=$2", data.op_id, tid
+        ))
         if op:
-            op_ref = {
-                "op_numero": op.get("numero_op", ""),
-                "pedido_id": op.get("pedido_id", ""),
-                "pedido_numero": op.get("pedido_numero", ""),
-            }
+            op_numero = op.get("numero_op", "") or ""
+            pedido_id = op.get("pedido_id", "") or ""
+            pedido_numero = op.get("pedido_numero", "") or ""
 
     numero_rt = await _next_rt_numero(tid)
     now = now_iso()
     rt_id = new_id()
+    historico = [{"de": None, "para": "pendente", "por": user["name"], "em": now}]
 
-    rt = {
-        "id": rt_id,
-        "tenant_id": tid,
-        "numero_rt": numero_rt,
-        "categoria": data.categoria,
-        "rnc_id": data.rnc_id,
-        "rnc_numero": rnc.get("numero_rnc", ""),
-        "op_id": data.op_id,
-        **op_ref,
-        "lote_id": data.lote_id,
-        "lote_numero": lote_numero,
-        "produto_nome": data.produto_nome.strip(),
-        "problema_descrito": data.problema_descrito.strip(),
-        "instrucoes_retrabalho": data.instrucoes_retrabalho,
-        "responsavel_id": data.responsavel_id or user["id"],
-        "responsavel_nome": data.responsavel_nome or user["name"],
-        "data_limite": data.data_limite,
-        "custo_estimado": data.custo_estimado,
-        "devolucao_id": data.devolucao_id,
-        "status": "pendente",
-        "nova_ra_id": None,
-        "nova_ra_numero": None,
-        "observacoes": data.observacoes,
-        "historico": [{"de": None, "para": "pendente", "por": user["name"], "em": now}],
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.retrabalho_ordens.insert_one(rt)
-    rt.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO retrabalho_ordens
+           (id, tenant_id, numero_rt, categoria, rnc_id, rnc_numero,
+            op_id, op_numero, pedido_id, pedido_numero,
+            lote_id, lote_numero, produto_nome, problema_descrito, instrucoes_retrabalho,
+            responsavel_id, responsavel_nome, data_limite, custo_estimado, devolucao_id,
+            status, nova_ra_id, nova_ra_numero, observacoes, historico,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                   $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                   $21,$22,$23,$24,$25,$26,$27,$28,$29)""",
+        rt_id, tid, numero_rt, data.categoria, data.rnc_id, rnc.get("numero_rnc", ""),
+        data.op_id, op_numero, pedido_id, pedido_numero,
+        data.lote_id, lote_numero, data.produto_nome.strip(), data.problema_descrito.strip(),
+        data.instrucoes_retrabalho,
+        data.responsavel_id or user["id"], data.responsavel_nome or user["name"],
+        data.data_limite, data.custo_estimado, data.devolucao_id,
+        "pendente", None, None, data.observacoes, historico,
+        user["id"], user["name"], now, now,
+    )
+
     logger.info(f"RT {numero_rt} ({data.categoria}) criada por {user['name']} — RNC: {rnc.get('numero_rnc', '')}")
-    return rt
+    return _row(await pg_db.fetch_one("SELECT * FROM retrabalho_ordens WHERE id=$1", rt_id))
 
 
 @retrabalho_router.put("/ordens/{rt_id}")
 async def update_ordem(rt_id: str, data: RTUpdate, request: Request):
     user = await get_current_user(request)
-    rt = await db.retrabalho_ordens.find_one({"id": rt_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    rt = _row(await pg_db.fetch_one(
+        "SELECT * FROM retrabalho_ordens WHERE id=$1 AND tenant_id=$2",
+        rt_id, user["tenant_id"],
+    ))
     if not rt:
         raise HTTPException(status_code=404, detail="RT não encontrada")
 
     now = now_iso()
-    updates: Dict[str, Any] = {"updated_at": now}
-    historico = list(rt.get("historico", []))
+    set_parts = ["updated_at=$1"]
+    vals: list = [now]
+    i = 2
 
     payload = data.model_dump(exclude_unset=True)
+    historico = list(rt.get("historico") or [])
 
     if "status" in payload:
         novo_status = payload["status"]
@@ -236,19 +260,28 @@ async def update_ordem(rt_id: str, data: RTUpdate, request: Request):
         if novo_status not in allowed:
             raise HTTPException(
                 status_code=422,
-                detail=f"Transição {rt['status']} → {novo_status} não permitida"
+                detail=f"Transição {rt['status']} → {novo_status} não permitida",
             )
         historico.append({"de": rt["status"], "para": novo_status, "por": user["name"], "em": now})
-        updates["status"] = novo_status
-        updates["historico"] = historico
+        set_parts.append(f"status=${i}")
+        vals.append(novo_status)
+        i += 1
+        set_parts.append(f"historico=${i}")
+        vals.append(historico)
+        i += 1
 
     for field in ("instrucoes_retrabalho", "responsavel_id", "responsavel_nome",
                   "data_limite", "custo_estimado", "observacoes"):
         if field in payload and payload[field] is not None:
-            updates[field] = payload[field]
+            set_parts.append(f"{field}=${i}")
+            vals.append(payload[field])
+            i += 1
 
-    await db.retrabalho_ordens.update_one({"id": rt_id}, {"$set": updates})
-    return await db.retrabalho_ordens.find_one({"id": rt_id}, {"_id": 0})
+    await pg_db.execute(
+        f"UPDATE retrabalho_ordens SET {', '.join(set_parts)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, rt_id, user["tenant_id"],
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM retrabalho_ordens WHERE id=$1", rt_id))
 
 
 @retrabalho_router.post("/ordens/{rt_id}/concluir")
@@ -256,54 +289,49 @@ async def concluir_ordem(rt_id: str, data: RTConcluir, request: Request):
     """Marca RT como concluída e cria nova RA para re-inspeção CQ."""
     user = await get_current_user(request)
     tid = user["tenant_id"]
-    rt = await db.retrabalho_ordens.find_one({"id": rt_id, "tenant_id": tid}, {"_id": 0})
+    rt = _row(await pg_db.fetch_one(
+        "SELECT * FROM retrabalho_ordens WHERE id=$1 AND tenant_id=$2", rt_id, tid
+    ))
     if not rt:
         raise HTTPException(status_code=404, detail="RT não encontrada")
     if rt["status"] not in ("pendente", "em_retrabalho"):
         raise HTTPException(status_code=422, detail=f"RT já está em status '{rt['status']}'")
 
     now = now_iso()
-    historico = list(rt.get("historico", []))
+    historico = list(rt.get("historico") or [])
     historico.append({"de": rt["status"], "para": "concluido", "por": user["name"], "em": now})
 
     nova_ra_id = None
     nova_ra_numero = None
 
     if data.criar_ra:
-        count = await db.cq_registros_analise.count_documents({"tenant_id": tid})
+        count = await pg_db.fetch_val(
+            "SELECT COUNT(*) FROM cq_registros_analise WHERE tenant_id=$1", tid
+        )
         nova_ra_numero = f"RA-{str(count + 1).zfill(5)}"
         nova_ra_id = new_id()
-        nova_ra = {
-            "id": nova_ra_id,
-            "tenant_id": tid,
-            "numero_ra": nova_ra_numero,
-            "lote_id": rt.get("lote_id") or new_id(),
-            "lote_numero": rt.get("lote_numero", ""),
-            "tipo": "reinspecao_retrabalho",
-            "status": "rascunho",
-            "origem_rt_id": rt_id,
-            "origem_rt_numero": rt.get("numero_rt", ""),
-            "categoria_rt": rt.get("categoria", ""),
-            "produto_nome": rt.get("produto_nome", ""),
-            "parametros": [],
-            "created_by": user["id"],
-            "created_by_name": user["name"],
-            "created_at": now,
-            "updated_at": now,
-        }
-        await db.cq_registros_analise.insert_one(nova_ra)
+        await pg_db.execute(
+            """INSERT INTO cq_registros_analise
+               (id, tenant_id, numero_ra, lote_id, lote_numero, tipo, status,
+                origem_rt_id, origem_rt_numero, categoria_rt, produto_nome,
+                parametros, created_by, created_by_name, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+            nova_ra_id, tid, nova_ra_numero,
+            rt.get("lote_id") or new_id(), rt.get("lote_numero", ""),
+            "reinspecao_retrabalho", "rascunho",
+            rt_id, rt.get("numero_rt", ""), rt.get("categoria", ""), rt.get("produto_nome", ""),
+            [], user["id"], user["name"], now, now,
+        )
         logger.info(f"Nova RA {nova_ra_numero} criada para re-inspeção RT {rt['numero_rt']}")
 
-    updates = {
-        "status": "concluido",
-        "historico": historico,
-        "nova_ra_id": nova_ra_id,
-        "nova_ra_numero": nova_ra_numero,
-        "observacoes_conclusao": data.observacoes_conclusao,
-        "updated_at": now,
-    }
-    await db.retrabalho_ordens.update_one({"id": rt_id}, {"$set": updates})
-    return await db.retrabalho_ordens.find_one({"id": rt_id}, {"_id": 0})
+    await pg_db.execute(
+        """UPDATE retrabalho_ordens SET
+               status='concluido', historico=$1, nova_ra_id=$2, nova_ra_numero=$3,
+               observacoes_conclusao=$4, updated_at=$5
+           WHERE id=$6""",
+        historico, nova_ra_id, nova_ra_numero, data.observacoes_conclusao, now, rt_id,
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM retrabalho_ordens WHERE id=$1", rt_id))
 
 
 @retrabalho_router.delete("/ordens/{rt_id}")
@@ -319,19 +347,16 @@ async def retrabalho_metricas(request: Request):
 
     result = {}
     for cat in RT_CATEGORIAS:
-        agg = await db.retrabalho_ordens.aggregate([
-            {"$match": {"tenant_id": tid, "categoria": cat}},
-            {"$group": {
-                "_id": "$status",
-                "count": {"$sum": 1},
-                "custo": {"$sum": "$custo_estimado"},
-            }},
-        ]).to_list(20)
-
-        status_counts = {a["_id"]: a["count"] for a in agg}
-        custo_total = sum(a["custo"] for a in agg)
+        rows = await pg_db.fetch_all(
+            """SELECT status, COUNT(*) AS count, COALESCE(SUM(custo_estimado), 0) AS custo
+               FROM retrabalho_ordens WHERE tenant_id=$1 AND categoria=$2
+               GROUP BY status""",
+            tid, cat,
+        )
+        status_counts = {r["status"]: int(r["count"]) for r in rows}
+        custo_total = sum(float(r["custo"]) for r in rows)
         result[cat] = {
-            "total": sum(a["count"] for a in agg),
+            "total": sum(int(r["count"]) for r in rows),
             "em_aberto": status_counts.get("pendente", 0) + status_counts.get("em_retrabalho", 0),
             "pendente": status_counts.get("pendente", 0),
             "em_retrabalho": status_counts.get("em_retrabalho", 0),
@@ -347,22 +372,25 @@ async def retrabalho_dashboard(request: Request):
     """Summary counts for CQ Dashboard integration."""
     user = await get_current_user(request)
     tid = user["tenant_id"]
-    pendente = await db.retrabalho_ordens.count_documents({"tenant_id": tid, "status": "pendente"})
-    em_retrabalho = await db.retrabalho_ordens.count_documents({"tenant_id": tid, "status": "em_retrabalho"})
-    concluido = await db.retrabalho_ordens.count_documents({"tenant_id": tid, "status": "concluido"})
-    reprovado = await db.retrabalho_ordens.count_documents({"tenant_id": tid, "status": "reprovado"})
-
-    agg = await db.retrabalho_ordens.aggregate([
-        {"$match": {"tenant_id": tid}},
-        {"$group": {"_id": None, "custo_total": {"$sum": "$custo_estimado"}}},
-    ]).to_list(1)
-    custo_total = round(agg[0]["custo_total"] if agg else 0.0, 2)
-
+    row = await pg_db.fetch_one(
+        """SELECT
+               COUNT(*) FILTER (WHERE status='pendente')      AS pendente,
+               COUNT(*) FILTER (WHERE status='em_retrabalho') AS em_retrabalho,
+               COUNT(*) FILTER (WHERE status='concluido')     AS concluido,
+               COUNT(*) FILTER (WHERE status='reprovado')     AS reprovado,
+               COALESCE(SUM(custo_estimado), 0)               AS custo_total
+           FROM retrabalho_ordens WHERE tenant_id=$1""",
+        tid,
+    )
+    pendente = int(row["pendente"] or 0)
+    em_retrabalho = int(row["em_retrabalho"] or 0)
+    concluido = int(row["concluido"] or 0)
+    reprovado = int(row["reprovado"] or 0)
     return {
         "pendente": pendente,
         "em_retrabalho": em_retrabalho,
         "aguardando_cq": concluido,
         "reprovado": reprovado,
         "total_ativos": pendente + em_retrabalho,
-        "custo_total": custo_total,
+        "custo_total": round(float(row["custo_total"] or 0), 2),
     }

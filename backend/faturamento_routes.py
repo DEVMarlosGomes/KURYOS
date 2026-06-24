@@ -13,19 +13,19 @@ import logging
 import re
 from datetime import datetime, timedelta, date
 
+import database as pg_db
+
 logger = logging.getLogger(__name__)
 
 faturamento_router = APIRouter(prefix="/api/faturamento")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_faturamento(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -37,6 +37,10 @@ def _new_id():
 
 def _now():
     return now_iso_func()
+
+
+def _row(r):
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} if r else None
 
 
 NF_STATUSES = ["rascunho", "emitida", "cancelada"]
@@ -53,10 +57,6 @@ NF_TRANSITIONS = {
 # ===== HELPERS =====
 
 def _parse_parcelas(condicao: str, valor_total: float, data_emissao: Optional[str]) -> list:
-    """
-    Parse a payment condition string and return list of (due_date_str, valor) tuples.
-    Examples: "à vista" → 1x; "30/60/90" → 3x; "30 dias" → 1x in 30d; "2x 30/60" → 2x
-    """
     cond = (condicao or "").strip().lower()
     try:
         base = datetime.fromisoformat(data_emissao) if data_emissao else datetime.now()
@@ -82,9 +82,9 @@ def _parse_parcelas(condicao: str, valor_total: float, data_emissao: Optional[st
 
 async def _auto_mark_vencidas(tid: str):
     today = date.today().isoformat()
-    await db.faturamento_duplicatas.update_many(
-        {"tenant_id": tid, "status": "aberta", "data_vencimento": {"$lt": today}},
-        {"$set": {"status": "vencida", "updated_at": _now()}}
+    await pg_db.execute(
+        "UPDATE faturamento_duplicatas SET status='vencida', updated_at=$1 WHERE tenant_id=$2 AND status='aberta' AND data_vencimento < $3",
+        _now(), tid, today,
     )
 
 
@@ -151,7 +151,7 @@ class DuplicataUpdate(BaseModel):
 
 # ===== NF SEQUENCE =====
 async def _next_nf_interno(tenant_id: str) -> str:
-    count = await db.faturamento_notas.count_documents({"tenant_id": tenant_id})
+    count = await pg_db.fetch_val("SELECT COUNT(*) FROM faturamento_notas WHERE tenant_id=$1", tenant_id)
     return f"NF-{str(count + 1).zfill(6)}"
 
 
@@ -164,26 +164,32 @@ async def list_notas(
     q: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    tid = user["tenant_id"]
+    clauses = ["tenant_id=$1"]
+    vals = [tid]
+    i = 2
     if status:
-        query["status"] = status
+        clauses.append(f"status=${i}"); vals.append(status); i += 1
     if status_pagamento:
-        query["status_pagamento"] = status_pagamento
+        clauses.append(f"status_pagamento=${i}"); vals.append(status_pagamento); i += 1
     if q:
-        query["$or"] = [
-            {"numero_interno": {"$regex": q, "$options": "i"}},
-            {"numero_nfe": {"$regex": q, "$options": "i"}},
-            {"cliente_nome": {"$regex": q, "$options": "i"}},
-            {"order_numero": {"$regex": q, "$options": "i"}},
-        ]
-    notas = await db.faturamento_notas.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return notas
+        clauses.append(
+            f"(numero_interno ILIKE ${i} OR numero_nfe ILIKE ${i} OR cliente_nome ILIKE ${i} OR order_numero ILIKE ${i})"
+        )
+        vals.append(f"%{q}%"); i += 1
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM faturamento_notas WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 @faturamento_router.get("/notas/{nf_id}")
 async def get_nota(nf_id: str, request: Request):
     user = await get_current_user(request)
-    nf = await db.faturamento_notas.find_one({"id": nf_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    nf = _row(await pg_db.fetch_one(
+        "SELECT * FROM faturamento_notas WHERE id=$1 AND tenant_id=$2", nf_id, user["tenant_id"]
+    ))
     if not nf:
         raise HTTPException(status_code=404, detail="Nota Fiscal não encontrada")
     return nf
@@ -201,74 +207,66 @@ async def create_nota(data: NFCreate, request: Request):
     now = _now()
     nf_id = _new_id()
 
-    pi_ref = {}
+    order_numero = data.order_numero
+    valor_total = data.valor_total
+    valor_produtos = data.valor_produtos
+
     if data.order_id:
-        pi = await db.orders.find_one({"id": data.order_id, "tenant_id": tid}, {"_id": 0})
+        pi = _row(await pg_db.fetch_one(
+            "SELECT numero_pedido, total_pedido FROM orders WHERE id=$1 AND tenant_id=$2",
+            data.order_id, tid,
+        ))
         if pi:
-            pi_ref["order_numero"] = pi.get("numero_pedido", data.order_numero or "")
-            if not data.valor_total and pi.get("total_pedido"):
-                data.valor_total = float(pi["total_pedido"])
-                data.valor_produtos = data.valor_total
+            order_numero = pi.get("numero_pedido") or order_numero
+            if not valor_total and pi.get("total_pedido"):
+                valor_total = float(pi["total_pedido"])
+                valor_produtos = valor_total
 
-    valor_total = data.valor_total or (data.valor_produtos + data.valor_frete + data.valor_impostos)
+    valor_total = valor_total or (valor_produtos + data.valor_frete + data.valor_impostos)
+    historico = [{"de": None, "para": "rascunho", "por": user["name"], "em": now}]
 
-    nf = {
-        "id": nf_id,
-        "tenant_id": tid,
-        "numero_interno": numero_interno,
-        "numero_nfe": None,
-        "chave_acesso": None,
-        "order_id": data.order_id,
-        "order_numero": pi_ref.get("order_numero") or data.order_numero,
-        "exp_id": data.exp_id,
-        "exp_numero": data.exp_numero,
-        "cliente_nome": data.cliente_nome.strip(),
-        "cliente_id": data.cliente_id,
-        "cliente_cnpj": data.cliente_cnpj,
-        "valor_produtos": data.valor_produtos,
-        "valor_frete": data.valor_frete,
-        "valor_impostos": data.valor_impostos,
-        "valor_total": valor_total,
-        "forma_pagamento": data.forma_pagamento,
-        "condicao_pagamento": data.condicao_pagamento,
-        "data_emissao": data.data_emissao or now[:10],
-        "data_vencimento": data.data_vencimento,
-        "status": "rascunho",
-        "status_pagamento": "aguardando",
-        "valor_pago": 0.0,
-        "data_pagamento": None,
-        "duplicatas_geradas": False,
-        "total_parcelas": 0,
-        "observacoes": data.observacoes,
-        "historico": [{"de": None, "para": "rascunho", "por": user["name"], "em": now}],
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.faturamento_notas.insert_one(nf)
-    nf.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO faturamento_notas
+           (id, tenant_id, numero_interno, numero_nfe, chave_acesso, order_id, order_numero,
+            exp_id, exp_numero, cliente_nome, cliente_id, cliente_cnpj,
+            valor_produtos, valor_frete, valor_impostos, valor_total,
+            forma_pagamento, condicao_pagamento, data_emissao, data_vencimento,
+            status, status_pagamento, valor_pago, data_pagamento,
+            duplicatas_geradas, total_parcelas, observacoes, historico,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                   $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)""",
+        nf_id, tid, numero_interno, None, None, data.order_id, order_numero,
+        data.exp_id, data.exp_numero, data.cliente_nome.strip(), data.cliente_id, data.cliente_cnpj,
+        valor_produtos, data.valor_frete, data.valor_impostos, valor_total,
+        data.forma_pagamento, data.condicao_pagamento, data.data_emissao or now[:10], data.data_vencimento,
+        "rascunho", "aguardando", 0.0, None,
+        False, 0, data.observacoes, historico,
+        user["id"], user.get("name", ""), now, now,
+    )
 
     if data.order_id:
-        await db.orders.update_one(
-            {"id": data.order_id, "tenant_id": tid},
-            {"$set": {"nf_id": nf_id, "nf_numero": numero_interno, "updated_at": now}}
+        await pg_db.execute(
+            "UPDATE orders SET nf_id=$1, nf_numero=$2, updated_at=$3 WHERE id=$4 AND tenant_id=$5",
+            nf_id, numero_interno, now, data.order_id, tid,
         )
 
     logger.info(f"NF {numero_interno} criada por {user['name']}")
-    return nf
+    return _row(await pg_db.fetch_one("SELECT * FROM faturamento_notas WHERE id=$1", nf_id))
 
 
 @faturamento_router.put("/notas/{nf_id}")
 async def update_nota(nf_id: str, data: NFUpdate, request: Request):
     user = await get_current_user(request)
-    nf = await db.faturamento_notas.find_one({"id": nf_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    nf = _row(await pg_db.fetch_one(
+        "SELECT * FROM faturamento_notas WHERE id=$1 AND tenant_id=$2", nf_id, user["tenant_id"]
+    ))
     if not nf:
         raise HTTPException(status_code=404, detail="NF não encontrada")
 
     now = _now()
     updates: Dict[str, Any] = {"updated_at": now}
-    historico = list(nf.get("historico", []))
+    historico = list(nf.get("historico") or [])
     payload = data.model_dump(exclude_unset=True)
 
     if "status" in payload:
@@ -279,7 +277,7 @@ async def update_nota(nf_id: str, data: NFUpdate, request: Request):
         if novo_status not in allowed:
             raise HTTPException(
                 status_code=422,
-                detail=f"Transição {nf['status']} → {novo_status} não permitida"
+                detail=f"Transição {nf['status']} → {novo_status} não permitida",
             )
         historico.append({"de": nf["status"], "para": novo_status, "por": user["name"], "em": now})
         updates["status"] = novo_status
@@ -297,8 +295,17 @@ async def update_nota(nf_id: str, data: NFUpdate, request: Request):
         if field in payload and payload[field] is not None:
             updates[field] = payload[field]
 
-    await db.faturamento_notas.update_one({"id": nf_id}, {"$set": updates})
-    return await db.faturamento_notas.find_one({"id": nf_id}, {"_id": 0})
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE faturamento_notas SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, nf_id, user["tenant_id"],
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM faturamento_notas WHERE id=$1", nf_id))
 
 
 @faturamento_router.delete("/notas/{nf_id}")
@@ -311,20 +318,22 @@ async def gerar_duplicatas(nf_id: str, request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    nf = await db.faturamento_notas.find_one({"id": nf_id, "tenant_id": tid}, {"_id": 0})
+    nf = _row(await pg_db.fetch_one(
+        "SELECT * FROM faturamento_notas WHERE id=$1 AND tenant_id=$2", nf_id, tid
+    ))
     if not nf:
         raise HTTPException(status_code=404, detail="NF não encontrada")
     if nf["status"] != "emitida":
         raise HTTPException(status_code=422, detail="Duplicatas só podem ser geradas para NFs emitidas")
 
-    # Remove existing open/vencida duplicatas (allow re-generation)
-    await db.faturamento_duplicatas.delete_many(
-        {"nf_id": nf_id, "tenant_id": tid, "status": {"$in": ["aberta", "vencida"]}}
+    await pg_db.execute(
+        "DELETE FROM faturamento_duplicatas WHERE nf_id=$1 AND tenant_id=$2 AND status IN ('aberta','vencida')",
+        nf_id, tid,
     )
 
     parcelas = _parse_parcelas(
         nf.get("condicao_pagamento", ""),
-        nf.get("valor_total", 0),
+        float(nf.get("valor_total") or 0),
         nf.get("data_emissao"),
     )
 
@@ -334,47 +343,42 @@ async def gerar_duplicatas(nf_id: str, request: Request):
     dups = []
 
     for i, (due_date, valor) in enumerate(parcelas):
-        dup = {
-            "id": _new_id(),
-            "tenant_id": tid,
-            "nf_id": nf_id,
-            "nf_numero": nf_num,
-            "order_id": nf.get("order_id"),
-            "order_numero": nf.get("order_numero"),
-            "cliente_nome": nf["cliente_nome"],
-            "cliente_cnpj": nf.get("cliente_cnpj", ""),
-            "cliente_id": nf.get("cliente_id"),
-            "numero_parcela": i + 1,
-            "total_parcelas": total_p,
-            "label": f"{i + 1}/{total_p}",
-            "valor": valor,
-            "valor_pago": 0.0,
-            "data_emissao": nf.get("data_emissao"),
-            "data_vencimento": due_date,
-            "status": "aberta",
-            "forma_pagamento": nf.get("forma_pagamento", ""),
-            "data_pagamento": None,
-            "data_protesto": None,
-            "observacoes": "",
-            "created_by": user["id"],
-            "created_by_name": user["name"],
-            "created_at": now,
-            "updated_at": now,
-        }
-        dups.append(dup)
+        dups.append((
+            _new_id(), tid, nf_id, nf_num,
+            nf.get("order_id"), nf.get("order_numero"),
+            nf["cliente_nome"], nf.get("cliente_cnpj", ""), nf.get("cliente_id"),
+            i + 1, total_p, f"{i + 1}/{total_p}",
+            valor, 0.0,
+            nf.get("data_emissao"), due_date,
+            "aberta", nf.get("forma_pagamento", ""),
+            None, None, "",
+            user["id"], user.get("name", ""), now, now,
+        ))
 
-    if dups:
-        await db.faturamento_duplicatas.insert_many([{**d} for d in dups])
-        for d in dups:
-            d.pop("_id", None)
+    await pg_db.execute_many(
+        """INSERT INTO faturamento_duplicatas
+           (id, tenant_id, nf_id, nf_numero, order_id, order_numero,
+            cliente_nome, cliente_cnpj, cliente_id,
+            numero_parcela, total_parcelas, label,
+            valor, valor_pago, data_emissao, data_vencimento,
+            status, forma_pagamento, data_pagamento, data_protesto, observacoes,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                   $17,$18,$19,$20,$21,$22,$23,$24,$25)""",
+        dups,
+    )
 
-    await db.faturamento_notas.update_one(
-        {"id": nf_id, "tenant_id": tid},
-        {"$set": {"duplicatas_geradas": True, "total_parcelas": total_p, "updated_at": now}}
+    await pg_db.execute(
+        "UPDATE faturamento_notas SET duplicatas_geradas=TRUE, total_parcelas=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        total_p, now, nf_id, tid,
     )
 
     logger.info(f"NF {nf_num}: {total_p} duplicata(s) gerada(s) por {user['name']}")
-    return dups
+    rows = await pg_db.fetch_all(
+        "SELECT * FROM faturamento_duplicatas WHERE nf_id=$1 AND tenant_id=$2 ORDER BY numero_parcela",
+        nf_id, tid,
+    )
+    return [_row(r) for r in rows]
 
 
 # ===== DUPLICATA ROUTES =====
@@ -388,31 +392,22 @@ async def duplicatas_dashboard(request: Request):
     today = date.today().isoformat()
     in_30 = (date.today() + timedelta(days=30)).isoformat()
 
-    em_aberto = await db.faturamento_duplicatas.count_documents({"tenant_id": tid, "status": "aberta"})
-    vencidas = await db.faturamento_duplicatas.count_documents({"tenant_id": tid, "status": "vencida"})
-    a_vencer_30 = await db.faturamento_duplicatas.count_documents({
-        "tenant_id": tid, "status": "aberta",
-        "data_vencimento": {"$gte": today, "$lte": in_30}
-    })
-
-    pipe_aberto = [
-        {"$match": {"tenant_id": tid, "status": {"$in": ["aberta", "vencida"]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$valor"}}}
-    ]
-    agg_aberto = await db.faturamento_duplicatas.aggregate(pipe_aberto).to_list(1)
-
-    pipe_venc = [
-        {"$match": {"tenant_id": tid, "status": "vencida"}},
-        {"$group": {"_id": None, "total": {"$sum": "$valor"}}}
-    ]
-    agg_venc = await db.faturamento_duplicatas.aggregate(pipe_venc).to_list(1)
-
+    row = _row(await pg_db.fetch_one(
+        """SELECT
+               COUNT(*) FILTER (WHERE status='aberta') AS em_aberto,
+               COUNT(*) FILTER (WHERE status='vencida') AS vencidas,
+               COUNT(*) FILTER (WHERE status='aberta' AND data_vencimento >= $2 AND data_vencimento <= $3) AS a_vencer_30,
+               COALESCE(SUM(valor) FILTER (WHERE status IN ('aberta','vencida')), 0) AS total_aberto,
+               COALESCE(SUM(valor) FILTER (WHERE status='vencida'), 0) AS total_vencido
+           FROM faturamento_duplicatas WHERE tenant_id=$1""",
+        tid, today, in_30,
+    ))
     return {
-        "em_aberto": em_aberto,
-        "vencidas": vencidas,
-        "a_vencer_30_dias": a_vencer_30,
-        "total_em_aberto": round(agg_aberto[0]["total"] if agg_aberto else 0.0, 2),
-        "total_vencido": round(agg_venc[0]["total"] if agg_venc else 0.0, 2),
+        "em_aberto": row["em_aberto"],
+        "vencidas": row["vencidas"],
+        "a_vencer_30_dias": row["a_vencer_30"],
+        "total_em_aberto": round(float(row["total_aberto"]), 2),
+        "total_vencido": round(float(row["total_vencido"]), 2),
     }
 
 
@@ -427,63 +422,57 @@ async def list_duplicatas(
     tid = user["tenant_id"]
     await _auto_mark_vencidas(tid)
 
-    query: Dict[str, Any] = {"tenant_id": tid}
+    clauses = ["tenant_id=$1"]
+    vals = [tid]
+    i = 2
     if status and status != "all":
-        query["status"] = status
+        clauses.append(f"status=${i}"); vals.append(status); i += 1
     if q:
-        query["$or"] = [
-            {"nf_numero": {"$regex": q, "$options": "i"}},
-            {"cliente_nome": {"$regex": q, "$options": "i"}},
-            {"order_numero": {"$regex": q, "$options": "i"}},
-        ]
+        clauses.append(
+            f"(nf_numero ILIKE ${i} OR cliente_nome ILIKE ${i} OR order_numero ILIKE ${i})"
+        )
+        vals.append(f"%{q}%"); i += 1
     if venc_ate:
-        query.setdefault("data_vencimento", {})
-        query["data_vencimento"]["$lte"] = venc_ate
+        clauses.append(f"data_vencimento <= ${i}"); vals.append(venc_ate); i += 1
 
-    dups = await db.faturamento_duplicatas.find(query, {"_id": 0}).sort("data_vencimento", 1).to_list(500)
-    return dups
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM faturamento_duplicatas WHERE {' AND '.join(clauses)} ORDER BY data_vencimento",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 @faturamento_router.post("/duplicatas")
 async def create_duplicata(data: DuplicataCreate, request: Request):
     user = await get_current_user(request)
     now = _now()
-    dup = {
-        "id": _new_id(),
-        "tenant_id": user["tenant_id"],
-        "nf_id": data.nf_id,
-        "nf_numero": data.nf_numero,
-        "order_id": None,
-        "order_numero": None,
-        "cliente_nome": data.cliente_nome,
-        "cliente_cnpj": data.cliente_cnpj,
-        "cliente_id": data.cliente_id,
-        "numero_parcela": data.numero_parcela,
-        "total_parcelas": data.total_parcelas,
-        "label": f"{data.numero_parcela}/{data.total_parcelas}",
-        "valor": data.valor,
-        "valor_pago": 0.0,
-        "data_emissao": data.data_emissao or now[:10],
-        "data_vencimento": data.data_vencimento,
-        "status": "aberta",
-        "forma_pagamento": data.forma_pagamento,
-        "data_pagamento": None,
-        "data_protesto": None,
-        "observacoes": data.observacoes,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.faturamento_duplicatas.insert_one(dup)
-    dup.pop("_id", None)
-    return dup
+    dup_id = _new_id()
+    await pg_db.execute(
+        """INSERT INTO faturamento_duplicatas
+           (id, tenant_id, nf_id, nf_numero, order_id, order_numero,
+            cliente_nome, cliente_cnpj, cliente_id,
+            numero_parcela, total_parcelas, label,
+            valor, valor_pago, data_emissao, data_vencimento,
+            status, forma_pagamento, data_pagamento, data_protesto, observacoes,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                   $17,$18,$19,$20,$21,$22,$23,$24,$25)""",
+        dup_id, user["tenant_id"], data.nf_id, data.nf_numero, None, None,
+        data.cliente_nome, data.cliente_cnpj, data.cliente_id,
+        data.numero_parcela, data.total_parcelas, f"{data.numero_parcela}/{data.total_parcelas}",
+        data.valor, 0.0, data.data_emissao or now[:10], data.data_vencimento,
+        "aberta", data.forma_pagamento, None, None, data.observacoes,
+        user["id"], user.get("name", ""), now, now,
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM faturamento_duplicatas WHERE id=$1", dup_id))
 
 
 @faturamento_router.put("/duplicatas/{dup_id}")
 async def update_duplicata(dup_id: str, data: DuplicataUpdate, request: Request):
     user = await get_current_user(request)
-    dup = await db.faturamento_duplicatas.find_one({"id": dup_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dup = _row(await pg_db.fetch_one(
+        "SELECT * FROM faturamento_duplicatas WHERE id=$1 AND tenant_id=$2", dup_id, user["tenant_id"]
+    ))
     if not dup:
         raise HTTPException(status_code=404, detail="Duplicata não encontrada")
 
@@ -500,15 +489,23 @@ async def update_duplicata(dup_id: str, data: DuplicataUpdate, request: Request)
         if field in payload and payload[field] is not None:
             updates[field] = payload[field]
 
-    # Auto-resolve status based on valor_pago
     if "valor_pago" in updates:
-        if updates["valor_pago"] >= dup["valor"]:
+        if float(updates["valor_pago"]) >= float(dup.get("valor", 0)):
             updates["status"] = "paga"
             if "data_pagamento" not in updates:
                 updates["data_pagamento"] = now[:10]
 
-    await db.faturamento_duplicatas.update_one({"id": dup_id}, {"$set": updates})
-    return await db.faturamento_duplicatas.find_one({"id": dup_id}, {"_id": 0})
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE faturamento_duplicatas SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, dup_id, user["tenant_id"],
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM faturamento_duplicatas WHERE id=$1", dup_id))
 
 
 # ===== DASHBOARD (NFs) =====
@@ -516,19 +513,19 @@ async def update_duplicata(dup_id: str, data: DuplicataUpdate, request: Request)
 async def faturamento_dashboard(request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
-    emitidas = await db.faturamento_notas.count_documents({"tenant_id": tid, "status": "emitida"})
-    aguardando = await db.faturamento_notas.count_documents({"tenant_id": tid, "status_pagamento": "aguardando"})
-    vencidas = await db.faturamento_notas.count_documents({"tenant_id": tid, "status_pagamento": "vencido"})
-    pipeline = [
-        {"$match": {"tenant_id": tid, "status": "emitida", "status_pagamento": {"$in": ["aguardando", "pago_parcial"]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$valor_total"}, "pago": {"$sum": "$valor_pago"}}}
-    ]
-    agg = await db.faturamento_notas.aggregate(pipeline).to_list(1)
-    total_ar = agg[0]["total"] if agg else 0.0
-    total_pago = agg[0]["pago"] if agg else 0.0
+    row = _row(await pg_db.fetch_one(
+        """SELECT
+               COUNT(*) FILTER (WHERE status='emitida') AS emitidas,
+               COUNT(*) FILTER (WHERE status_pagamento='aguardando') AS aguardando,
+               COUNT(*) FILTER (WHERE status_pagamento='vencido') AS vencidas,
+               COALESCE(SUM(valor_total) FILTER (WHERE status='emitida' AND status_pagamento IN ('aguardando','pago_parcial')), 0) AS total_ar,
+               COALESCE(SUM(valor_pago)  FILTER (WHERE status='emitida' AND status_pagamento IN ('aguardando','pago_parcial')), 0) AS total_pago
+           FROM faturamento_notas WHERE tenant_id=$1""",
+        tid,
+    ))
     return {
-        "emitidas": emitidas,
-        "aguardando_pagamento": aguardando,
-        "vencidas": vencidas,
-        "total_a_receber": round(total_ar - total_pago, 2),
+        "emitidas": row["emitidas"],
+        "aguardando_pagamento": row["aguardando"],
+        "vencidas": row["vencidas"],
+        "total_a_receber": round(float(row["total_ar"]) - float(row["total_pago"]), 2),
     }

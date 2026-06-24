@@ -16,23 +16,22 @@ Regras de Negócio:
 """
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from datetime import datetime, timedelta
 import logging
+import database as pg_db
 
 logger = logging.getLogger(__name__)
 
 recebimento_router = APIRouter(prefix="/api/recebimento")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_recebimento(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -44,6 +43,16 @@ def new_id():
 
 def now_iso():
     return now_iso_func()
+
+
+def _row(r):
+    if r is None:
+        return None
+    d = dict(r)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
+    return d
 
 
 # ===== MAPS =====
@@ -59,7 +68,6 @@ _TIPO_MP_TO_RA_TIPO = {
     "EMBALAGEM": "recepcao_embalagem",
 }
 
-# Default SLA in business days per tipo_mp
 _DEFAULT_SLA = {"FORMULACAO": 3, "ROTULO": 2, "EMBALAGEM": 2}
 
 
@@ -73,8 +81,8 @@ class RecebimentoItem(BaseModel):
     lote: str = ""
     validade: Optional[str] = None
     mp_id: Optional[str] = None
-    origem_cliente: bool = False     # RN-REC-04: insumo cedido pelo cliente
-    pedido_id: Optional[str] = None  # RN-REC-04: pedido de origem
+    origem_cliente: bool = False
+    pedido_id: Optional[str] = None
 
 
 class RecebimentoCreate(BaseModel):
@@ -83,7 +91,7 @@ class RecebimentoCreate(BaseModel):
     fornecedor_id: Optional[str] = None
     fornecedor_nome: Optional[str] = None
     numero_nf: str
-    data_nf: str                     # YYYY-MM-DD
+    data_nf: str
     items: List[RecebimentoItem]
     observacoes: str = ""
 
@@ -99,26 +107,34 @@ async def _check_urgente(tid: str, item_nome: str) -> bool:
     """RN-REC-00B: True if item is blocking a scheduled OP within 14 days."""
     deadline = (datetime.utcnow() + timedelta(days=14)).isoformat()[:10]
     today = datetime.utcnow().isoformat()[:10]
-    ops = await db.ops.find(
-        {
-            "tenant_id": tid,
-            "status": {"$in": ["pendente", "liberada", "em_producao"]},
-            "data_prevista": {"$lte": deadline, "$gte": today},
-        },
-        {"_id": 0, "insumos": 1},
-    ).to_list(300)
+    rows = await pg_db.fetch_all(
+        """SELECT insumos FROM ops
+           WHERE tenant_id=$1
+             AND status IN ('pendente','liberada','em_producao')
+             AND data_prevista IS NOT NULL
+             AND data_prevista <= $2 AND data_prevista >= $3
+           LIMIT 300""",
+        tid, deadline, today,
+    )
     nome_lower = item_nome.lower()
-    for op in ops:
-        for ins in op.get("insumos") or []:
+    for op in rows:
+        for ins in (op.get("insumos") or []):
             if nome_lower in (ins.get("nome") or "").lower():
                 return True
     return False
 
 
 async def _get_sla(tid: str) -> dict:
-    cfg = await db.recebimento_sla_config.find_one({"tenant_id": tid}, {"_id": 0})
-    if cfg:
-        return cfg
+    row = _row(await pg_db.fetch_one(
+        "SELECT * FROM recebimento_sla_config WHERE tenant_id=$1", tid
+    ))
+    if row:
+        return {
+            "tenant_id": tid,
+            "FORMULACAO": row["formulacao"],
+            "ROTULO": row["rotulo"],
+            "EMBALAGEM": row["embalagem"],
+        }
     return {**_DEFAULT_SLA, "tenant_id": tid}
 
 
@@ -137,17 +153,17 @@ async def update_sla_config(data: SLAConfig, request: Request):
     """RN-REC-00: Update CQ SLA days by material type."""
     user = await get_current_user(request)
     tid = user["tenant_id"]
-    cfg = {
-        "tenant_id": tid,
-        "FORMULACAO": data.FORMULACAO,
-        "ROTULO": data.ROTULO,
-        "EMBALAGEM": data.EMBALAGEM,
-        "updated_at": now_iso(),
-    }
-    await db.recebimento_sla_config.update_one(
-        {"tenant_id": tid}, {"$set": cfg}, upsert=True
+    await pg_db.execute(
+        """INSERT INTO recebimento_sla_config (tenant_id, formulacao, rotulo, embalagem, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (tenant_id) DO UPDATE SET
+               formulacao = EXCLUDED.formulacao,
+               rotulo     = EXCLUDED.rotulo,
+               embalagem  = EXCLUDED.embalagem,
+               updated_at = NOW()""",
+        tid, data.FORMULACAO, data.ROTULO, data.EMBALAGEM,
     )
-    return cfg
+    return {"tenant_id": tid, "FORMULACAO": data.FORMULACAO, "ROTULO": data.ROTULO, "EMBALAGEM": data.EMBALAGEM}
 
 
 # ---- PO Auto-link Suggestion ----
@@ -161,14 +177,22 @@ async def sugerir_po(
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    query: Dict[str, Any] = {
-        "tenant_id": tid,
-        "status": {"$in": ["aprovada", "em_entrega"]},
-    }
     if fornecedor_id:
-        query["fornecedor_id"] = fornecedor_id
+        rows = await pg_db.fetch_all(
+            """SELECT * FROM compras_pos
+               WHERE tenant_id=$1 AND status IN ('aprovada','em_entrega') AND fornecedor_id=$2
+               ORDER BY created_at DESC LIMIT 100""",
+            tid, fornecedor_id,
+        )
+    else:
+        rows = await pg_db.fetch_all(
+            """SELECT * FROM compras_pos
+               WHERE tenant_id=$1 AND status IN ('aprovada','em_entrega')
+               ORDER BY created_at DESC LIMIT 100""",
+            tid,
+        )
 
-    pos = await db.compras_pos.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
+    pos = [_row(r) for r in rows]
 
     if item_nome:
         nome_lower = item_nome.lower()
@@ -200,23 +224,35 @@ async def list_entradas(
     q: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    tid = user["tenant_id"]
+
+    clauses = ["tenant_id=$1"]
+    vals: list = [tid]
+    i = 2
+
     if status:
-        query["status"] = status
+        clauses.append(f"status=${i}")
+        vals.append(status)
+        i += 1
     if q:
-        query["$or"] = [
-            {"numero_nf": {"$regex": q, "$options": "i"}},
-            {"fornecedor_nome": {"$regex": q, "$options": "i"}},
-            {"po_numero": {"$regex": q, "$options": "i"}},
-        ]
-    entradas = await db.recebimentos.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return entradas
+        pat = f"%{q}%"
+        clauses.append(
+            f"(numero_nf ILIKE ${i} OR fornecedor_nome ILIKE ${i+1} OR po_numero ILIKE ${i+2})"
+        )
+        vals.extend([pat, pat, pat])
+
+    sql = f"SELECT * FROM recebimentos WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 500"
+    rows = await pg_db.fetch_all(sql, *vals)
+    return [_row(r) for r in rows]
 
 
 @recebimento_router.get("/entradas/{entrada_id}")
 async def get_entrada(entrada_id: str, request: Request):
     user = await get_current_user(request)
-    entrada = await db.recebimentos.find_one({"id": entrada_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    entrada = _row(await pg_db.fetch_one(
+        "SELECT * FROM recebimentos WHERE id=$1 AND tenant_id=$2",
+        entrada_id, user["tenant_id"],
+    ))
     if not entrada:
         raise HTTPException(status_code=404, detail="Recebimento não encontrado")
     return entrada
@@ -249,151 +285,119 @@ async def create_entrada(data: RecebimentoCreate, request: Request):
         ra_tipo = _TIPO_MP_TO_RA_TIPO.get(item.tipo_mp, "recepcao_mp")
         urgente = await _check_urgente(tid, item.nome)
 
-        # SLA deadline
         sla_days = sla.get(item.tipo_mp, 3)
         data_limite_cq = (datetime.utcnow() + timedelta(days=sla_days)).isoformat()[:10]
 
         # 1) Find or create estoque item
-        query_estoque: Dict[str, Any] = {"tenant_id": tid, "setor": setor}
         if item.mp_id:
-            query_estoque["mp_id"] = item.mp_id
+            estoque_item = _row(await pg_db.fetch_one(
+                "SELECT * FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND mp_id=$3 LIMIT 1",
+                tid, setor, item.mp_id,
+            ))
         else:
-            query_estoque["nome"] = item.nome
-            query_estoque["mp_id"] = None
+            estoque_item = _row(await pg_db.fetch_one(
+                "SELECT * FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND nome=$3 AND mp_id IS NULL LIMIT 1",
+                tid, setor, item.nome,
+            ))
 
-        estoque_item = await db.estoque_items.find_one(query_estoque, {"_id": 0})
         estoque_item_id = None
 
         if estoque_item:
             estoque_item_id = estoque_item["id"]
             if estoque_item.get("posicao_cq") not in ("aprovado",):
-                await db.estoque_items.update_one(
-                    {"id": estoque_item_id},
-                    {"$set": {"posicao_cq": "quarentena", "lote": item.lote or estoque_item.get("lote", ""), "updated_at": now}}
+                await pg_db.execute(
+                    "UPDATE estoque_items SET posicao_cq='quarentena', lote=$1, updated_at=$2 WHERE id=$3",
+                    item.lote or estoque_item.get("lote", ""), now, estoque_item_id,
                 )
         else:
             estoque_item_id = new_id()
-            new_item = {
-                "id": estoque_item_id,
-                "tenant_id": tid,
-                "tipo_item": "mp",
-                "setor": setor,
-                "nome": item.nome,
-                "codigo": item.codigo,
-                "mp_id": item.mp_id,
-                "produto_id": None,
-                "unidade": item.unidade,
-                "quantidade_atual": 0,
-                "estoque_minimo": 0,
-                "localizacao": "",
-                "lote": item.lote,
-                "validade": item.validade,
-                "observacoes": "",
-                "posicao_cq": "quarentena",
-                "created_by": user["id"],
-                "created_by_name": user["name"],
-                "created_at": now,
-                "updated_at": now,
-            }
-            await db.estoque_items.insert_one(new_item)
+            await pg_db.execute(
+                """INSERT INTO estoque_items
+                   (id, tenant_id, tipo_item, setor, nome, codigo, mp_id, produto_id,
+                    unidade, quantidade_atual, estoque_minimo, localizacao, lote, validade,
+                    observacoes, posicao_cq, created_by, created_by_name, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)""",
+                estoque_item_id, tid, "mp", setor, item.nome, item.codigo,
+                item.mp_id, None, item.unidade, 0, 0, "", item.lote, item.validade,
+                "", "quarentena", user["id"], user["name"], now, now,
+            )
 
         # 2) WMS entry movement
-        estoque_item_full = await db.estoque_items.find_one({"id": estoque_item_id}, {"_id": 0})
+        estoque_item_full = _row(await pg_db.fetch_one(
+            "SELECT * FROM estoque_items WHERE id=$1", estoque_item_id
+        ))
         if estoque_item_full:
-            qty_antes = estoque_item_full.get("quantidade_atual", 0)
+            qty_antes = float(estoque_item_full.get("quantidade_atual") or 0)
             qty_depois = qty_antes + item.quantidade
-            await db.estoque_items.update_one(
-                {"id": estoque_item_id},
-                {"$set": {"quantidade_atual": qty_depois, "updated_at": now}}
+            await pg_db.execute(
+                "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
+                qty_depois, now, estoque_item_id,
             )
-            mov = {
-                "id": new_id(),
-                "tenant_id": tid,
-                "item_id": estoque_item_id,
-                "setor": setor,
-                "tipo_item": "mp",
-                "nome_item": item.nome,
-                "codigo_item": item.codigo,
-                "lote": item.lote,
-                "tipo": "ENTRADA_RECEBIMENTO",
-                "direcao": "entrada",
-                "quantidade": item.quantidade,
-                "unidade": item.unidade,
-                "quantidade_antes": qty_antes,
-                "quantidade_depois": qty_depois,
-                "motivo": f"Recebimento NF {data.numero_nf}",
-                "referencia": entrada_id,
-                "documento": data.numero_nf,
-                "usuario": user["name"],
-                "usuario_id": user["id"],
-                "created_at": now,
-            }
-            await db.estoque_movimentos.insert_one(mov)
+            await pg_db.execute(
+                """INSERT INTO estoque_movimentos
+                   (id, tenant_id, item_id, setor, tipo_item, nome_item, codigo_item, lote,
+                    tipo, direcao, quantidade, unidade, quantidade_antes, quantidade_depois,
+                    motivo, referencia, documento, usuario, usuario_id, created_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)""",
+                new_id(), tid, estoque_item_id, setor, "mp",
+                item.nome, item.codigo, item.lote,
+                "ENTRADA_RECEBIMENTO", "entrada", item.quantidade, item.unidade,
+                qty_antes, qty_depois,
+                f"Recebimento NF {data.numero_nf}", entrada_id, data.numero_nf,
+                user["name"], user["id"], now,
+            )
 
         # 3) Create RA in CQ with SLA deadline
         lote_numero = item.lote or f"L{now[:10].replace('-', '')}"
-        ra = {
-            "id": new_id(),
-            "tenant_id": tid,
-            "lote_id": new_id(),
-            "lote_numero": lote_numero,
-            "tipo": ra_tipo,
-            "status": "rascunho",
-            "item_id": estoque_item_id,
-            "item_nome": item.nome,
-            "item_tipo": item.tipo_mp,
-            "fornecedor_id": data.fornecedor_id,
-            "fornecedor_nome": data.fornecedor_nome,
-            "nf_numero": data.numero_nf,
-            "nf_data": data.data_nf,
-            "quantidade_recebida": item.quantidade,
-            "unidade": item.unidade,
-            "numero_lote_fornecedor": item.lote,
-            "data_validade_fornecedor": item.validade,
-            "data_limite_cq": data_limite_cq,
-            "urgente": urgente,
-            "parametros": [],
-            "recebimento_id": entrada_id,
-            "created_by": user["id"],
-            "created_by_name": user["name"],
-            "created_at": now,
-            "updated_at": now,
-        }
-        await db.cq_registros_analise.insert_one(ra)
+        ra_id = new_id()
+        await pg_db.execute(
+            """INSERT INTO cq_registros_analise
+               (id, tenant_id, lote_id, lote_numero, tipo, status,
+                item_id, item_nome, item_tipo, fornecedor_id, fornecedor_nome,
+                nf_numero, nf_data, quantidade_recebida, unidade,
+                numero_lote_fornecedor, data_validade_fornecedor,
+                data_limite_cq, urgente, parametros, recebimento_id,
+                created_by, created_by_name, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)""",
+            ra_id, tid, new_id(), lote_numero, ra_tipo, "rascunho",
+            estoque_item_id, item.nome, item.tipo_mp,
+            data.fornecedor_id, data.fornecedor_nome,
+            data.numero_nf, data.data_nf, item.quantidade, item.unidade,
+            item.lote, item.validade,
+            data_limite_cq, urgente, [], entrada_id,
+            user["id"], user["name"], now, now,
+        )
 
         items_processados.append({
             **item.model_dump(),
             "estoque_item_id": estoque_item_id,
             "setor": setor,
-            "ra_id": ra["id"],
+            "ra_id": ra_id,
             "ra_status": "rascunho",
             "urgente": urgente,
             "data_limite_cq": data_limite_cq,
         })
 
     # 4) Create immutable recebimento record (RN-REC-05)
-    entrada = {
-        "id": entrada_id,
-        "tenant_id": tid,
-        "po_id": data.po_id,
-        "po_numero": data.po_numero,
-        "fornecedor_id": data.fornecedor_id,
-        "fornecedor_nome": data.fornecedor_nome or "",
-        "numero_nf": data.numero_nf,
-        "data_nf": data.data_nf,
-        "status": "quarentena",
-        "items": items_processados,
-        "tem_urgente": any(i.get("urgente") for i in items_processados),
-        "observacoes": data.observacoes,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.recebimentos.insert_one(entrada)
-    entrada.pop("_id", None)
-    logger.info(f"Recebimento {entrada_id} criado: NF={data.numero_nf} itens={len(items_processados)} urgente={entrada['tem_urgente']}")
-    return entrada
+    tem_urgente = any(i.get("urgente") for i in items_processados)
+    await pg_db.execute(
+        """INSERT INTO recebimentos
+           (id, tenant_id, po_id, po_numero, fornecedor_id, fornecedor_nome,
+            numero_nf, data_nf, status, items, tem_urgente, observacoes,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+        entrada_id, tid, data.po_id, data.po_numero or "",
+        data.fornecedor_id, data.fornecedor_nome or "",
+        data.numero_nf, data.data_nf, "quarentena",
+        items_processados, tem_urgente, data.observacoes,
+        user["id"], user["name"], now, now,
+    )
+
+    logger.info(
+        f"Recebimento {entrada_id} criado: NF={data.numero_nf} "
+        f"itens={len(items_processados)} urgente={tem_urgente}"
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM recebimentos WHERE id=$1", entrada_id))
 
 
 # ---- RN-REC-05: No DELETE ----
@@ -401,5 +405,5 @@ async def create_entrada(data: RecebimentoCreate, request: Request):
 async def delete_blocked(entrada_id: str):
     raise HTTPException(
         status_code=405,
-        detail="Registros de recebimento são imutáveis. Exclusão não permitida (RN-REC-05)."
+        detail="Registros de recebimento são imutáveis. Exclusão não permitida (RN-REC-05).",
     )

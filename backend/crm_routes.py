@@ -11,7 +11,9 @@ import logging
 import asyncio
 import os
 import base64
+import json
 from pathlib import Path
+import database as pg_db
 from validation_utils import (
     clean_text,
     normalize_cnpj,
@@ -665,6 +667,56 @@ class FollowUpSchedule(BaseModel):
 
 # ============ HELPER ============
 
+def _row(row) -> Optional[dict]:
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+    return d
+
+def _rows(rows) -> list:
+    return [_row(r) for r in (rows or [])]
+
+async def _update_variacao_in_sample(sample_id: str, tenant_id: str, variacao_id: str, updates: dict) -> None:
+    """Load sample variacoes, update the matching variacao in Python, save back."""
+    row = _row(await pg_db.fetch_one(
+        "SELECT variacoes FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, tenant_id
+    ))
+    if not row:
+        return
+    variacoes = row.get("variacoes") or []
+    for v in variacoes:
+        if v.get("id") == variacao_id:
+            v.update(updates)
+            break
+    await pg_db.execute(
+        "UPDATE crm_samples SET variacoes=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        variacoes, sample_id, tenant_id
+    )
+
+async def _push_variacao_history(sample_id: str, tenant_id: str, variacao_id: str, entry: dict) -> None:
+    """Append entry to variacoes[i].historico_status inside JSONB."""
+    row = _row(await pg_db.fetch_one(
+        "SELECT variacoes FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, tenant_id
+    ))
+    if not row:
+        return
+    variacoes = row.get("variacoes") or []
+    for v in variacoes:
+        if v.get("id") == variacao_id:
+            hist = v.get("historico_status") or []
+            hist.append(entry)
+            v["historico_status"] = hist
+            break
+    await pg_db.execute(
+        "UPDATE crm_samples SET variacoes=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        variacoes, sample_id, tenant_id
+    )
+
 def _serialize(doc: dict) -> dict:
     """Remove MongoDB _id from doc"""
     if doc:
@@ -685,9 +737,10 @@ async def _resolve_cli4(tenant_id: str, requested: str, nome_empresa: str) -> st
     """
     if requested:
         code = normalise_cli4(requested)
-        conflict = await db.crm_clients.find_one(
-            {"tenant_id": tenant_id, "cli4": code}, {"_id": 0, "nome_empresa": 1}
-        )
+        conflict = _row(await pg_db.fetch_one(
+            "SELECT nome_empresa FROM crm_clients WHERE tenant_id=$1 AND cli4=$2",
+            tenant_id, code
+        ))
         if conflict:
             raise HTTPException(
                 status_code=409,
@@ -698,9 +751,10 @@ async def _resolve_cli4(tenant_id: str, requested: str, nome_empresa: str) -> st
     # Auto-suggest from name
     candidates = suggest_cli4_candidates(nome_empresa)
     for code in candidates:
-        conflict = await db.crm_clients.find_one(
-            {"tenant_id": tenant_id, "cli4": code}, {"_id": 0}
-        )
+        conflict = _row(await pg_db.fetch_one(
+            "SELECT id FROM crm_clients WHERE tenant_id=$1 AND cli4=$2",
+            tenant_id, code
+        ))
         if not conflict:
             return code
     # Fallback: first candidate even if occupied (caller can update later)
@@ -814,8 +868,9 @@ async def _rollback_batch_created_projects(
             {"tenant_id": tenant_id, "id": {"$in": audit_log_ids}}
         )
     if project_ids:
-        await db.crm_projects.delete_many(
-            {"tenant_id": tenant_id, "id": {"$in": project_ids}}
+        await pg_db.execute(
+            "DELETE FROM crm_projects WHERE tenant_id=$1 AND id = ANY($2::text[])",
+            tenant_id, project_ids
         )
 
 
@@ -864,21 +919,19 @@ async def _sync_pd_cards_from_crm_stage(
     else:
         query["amostra_id"] = sample_id
 
-    cards = await db.pd_cards.find(query, {"_id": 0}).to_list(200)
+    if variacao_id:
+        cards = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_cards WHERE tenant_id=$1 AND amostra_variacao_id=$2",
+            tenant_id, variacao_id
+        ))
+    else:
+        cards = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_cards WHERE tenant_id=$1 AND amostra_id=$2",
+            tenant_id, sample_id
+        ))
     updated_cards = []
     for card in cards:
         old_status = card.get("status_pd", "")
-        updates = {
-            "status_pd": pd_status,
-            "updated_at": now,
-        }
-        if feedback_cliente:
-            updates["feedback_cliente"] = feedback_cliente
-        if direcoes_retrabalho:
-            updates["direcoes_retrabalho"] = direcoes_retrabalho
-        if resultado_cliente:
-            updates["resultado_cliente"] = resultado_cliente
-
         history_entry = {
             "de": old_status,
             "para": pd_status,
@@ -890,16 +943,25 @@ async def _sync_pd_cards_from_crm_stage(
         }
         if resultado_cliente:
             history_entry["resultado_cliente"] = resultado_cliente
-
-        await db.pd_cards.update_one(
-            {"id": card["id"], "tenant_id": tenant_id},
-            {
-                "$set": updates,
-                "$push": {"historico_movimentacoes": history_entry},
-            },
+        extra_merge: dict = {}
+        if feedback_cliente:
+            extra_merge["feedback_cliente"] = feedback_cliente
+        if direcoes_retrabalho:
+            extra_merge["direcoes_retrabalho"] = direcoes_retrabalho
+        if resultado_cliente:
+            extra_merge["resultado_cliente"] = resultado_cliente
+        await pg_db.execute(
+            """UPDATE pd_cards
+               SET status_pd=$1, updated_at=$2,
+                   extra = jsonb_set(
+                       extra || $3::jsonb,
+                       '{historico_movimentacoes}',
+                       COALESCE(extra->'historico_movimentacoes', '[]'::jsonb) || jsonb_build_array($4::jsonb)
+                   )
+               WHERE id=$5 AND tenant_id=$6""",
+            pd_status, now, extra_merge, history_entry, card["id"], tenant_id
         )
-
-        updated_card = {**card, **updates}
+        updated_card = {**card, "status_pd": pd_status, "updated_at": now}
         updated_cards.append(updated_card)
         await _broadcast_pd_card_update(tenant_id, updated_card, old_status, pd_status)
 
@@ -913,9 +975,10 @@ async def _advance_project_stage_if_needed(
     movement_source: str,
     extra_set: Optional[dict] = None,
 ):
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if not project:
         return None
 
@@ -938,20 +1001,22 @@ async def _advance_project_stage_if_needed(
         "origem": movement_source,
     }
 
-    update_fields = {"stage": new_stage, "updated_at": now}
+    set_parts = ["stage=$1", "updated_at=$2",
+                 "historico_movimentacoes = historico_movimentacoes || jsonb_build_array($3::jsonb)"]
+    params: list = [new_stage, now, movement]
     if extra_set:
-        update_fields.update(extra_set)
-
-    await db.crm_projects.update_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]},
-        {
-            "$set": update_fields,
-            "$push": {"historico_movimentacoes": movement},
-        },
+        for k, v in extra_set.items():
+            params.append(v)
+            set_parts.append(f"{k}=${len(params)}")
+    params.extend([project_id, user["tenant_id"]])
+    await pg_db.execute(
+        f"UPDATE crm_projects SET {', '.join(set_parts)} WHERE id=${len(params)-1} AND tenant_id=${len(params)}",
+        *params
     )
-    updated = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
 
     new_tasks = await trigger_tasks_for_transition(
         entity_type="project",
@@ -986,9 +1051,10 @@ async def _mirror_client_stage_to_negociacao(project: dict, user: dict):
     cliente_id = project.get("cliente_id")
     if not cliente_id:
         return
-    client = await db.crm_clients.find_one(
-        {"id": cliente_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT id, stage FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        cliente_id, user["tenant_id"]
+    ))
     if not client:
         return
     old_stage = client.get("stage", "")
@@ -1003,12 +1069,12 @@ async def _mirror_client_stage_to_negociacao(project: dict, user: dict):
         "usuario_id": user["id"],
         "origem": "espelho_crm2_em_negociacao",
     }
-    await db.crm_clients.update_one(
-        {"id": cliente_id, "tenant_id": user["tenant_id"]},
-        {
-            "$set": {"stage": "negociacao", "updated_at": now},
-            "$push": {"historico_movimentacoes": movement},
-        },
+    await pg_db.execute(
+        """UPDATE crm_clients
+           SET stage='negociacao', updated_at=$1,
+               historico_movimentacoes = historico_movimentacoes || jsonb_build_array($2::jsonb)
+           WHERE id=$3 AND tenant_id=$4""",
+        now, movement, cliente_id, user["tenant_id"]
     )
 
 
@@ -1072,10 +1138,16 @@ async def _validate_client_payload(
     payload["cnpj"] = clean_text(payload.get("cnpj", ""))
     payload["cnpj_normalized"] = cnpj_normalized
     if cnpj_normalized:
-        query = {"tenant_id": tenant_id, "cnpj_normalized": cnpj_normalized}
         if exclude_id:
-            query["id"] = {"$ne": exclude_id}
-        existing = await db.crm_clients.find_one(query, {"_id": 0, "nome_empresa": 1})
+            existing = _row(await pg_db.fetch_one(
+                "SELECT nome_empresa FROM crm_clients WHERE tenant_id=$1 AND cnpj_normalized=$2 AND id != $3",
+                tenant_id, cnpj_normalized, exclude_id
+            ))
+        else:
+            existing = _row(await pg_db.fetch_one(
+                "SELECT nome_empresa FROM crm_clients WHERE tenant_id=$1 AND cnpj_normalized=$2",
+                tenant_id, cnpj_normalized
+            ))
         if existing:
             raise HTTPException(
                 status_code=409,
@@ -1221,10 +1293,10 @@ async def suggest_cli4_endpoint(nome: str, request: Request):
     candidates = suggest_cli4_candidates(nome)
     result = []
     for code in candidates[:6]:
-        conflict = await db.crm_clients.find_one(
-            {"tenant_id": user["tenant_id"], "cli4": code},
-            {"_id": 0, "nome_empresa": 1},
-        )
+        conflict = _row(await pg_db.fetch_one(
+            "SELECT nome_empresa FROM crm_clients WHERE tenant_id=$1 AND cli4=$2",
+            user["tenant_id"], code
+        ))
         result.append({
             "cli4": code,
             "disponivel": conflict is None,
@@ -1319,7 +1391,35 @@ async def create_client(data: ClientCreate, request: Request):
         "updated_at": now,
     }
 
-    await db.crm_clients.insert_one(client)
+    await pg_db.execute(
+        """INSERT INTO crm_clients (
+            id, tenant_id, stage, nome_empresa, cnpj, cnpj_normalized, cli3, cli4, cli4_congelado,
+            canal_origem, origem_lead, temperatura_lead, responsavel_comercial, segmento, porte,
+            regiao, site, instagram, observacoes, has_grau2_anvisa, ultima_atualizacao_temperatura,
+            tem_anvisa, volume_estimado_mensal, created_by, created_by_name, created_at, updated_at,
+            categoria_interesse, contato_principal, contatos_adicionais, decisores, fornecedor_atual,
+            anvisa_necessario, concorrentes_envolvidos, skus_confirmados, amostras_aprovadas,
+            historico_movimentacoes
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+            $22,$23,$24,$25,NOW(),NOW(),$26,$27,$28,$29,$30,$31,$32,$33,$34,$35
+        )""",
+        client["id"], client["tenant_id"], client["stage"], client["nome_empresa"],
+        client.get("cnpj",""), client.get("cnpj_normalized"),
+        client.get("cli3",""), client.get("cli4",""), client.get("cli4_congelado", False),
+        client.get("canal_origem",""), client.get("origem_lead",""),
+        client.get("temperatura_lead","morno"), client.get("responsavel_comercial",""),
+        client.get("segmento",""), client.get("porte",""), client.get("regiao",""),
+        client.get("site",""), client.get("instagram",""), client.get("observacoes",""),
+        client.get("has_grau2_anvisa", False), client.get("ultima_atualizacao_temperatura"),
+        client.get("tem_anvisa",""), client.get("volume_estimado_mensal",""),
+        client.get("created_by",""), client.get("created_by_name",""),
+        client.get("categoria_interesse", []), client.get("contato_principal", {}),
+        client.get("contatos_adicionais", []), client.get("decisores", []),
+        client.get("fornecedor_atual", {}), client.get("anvisa_necessario", {}),
+        client.get("concorrentes_envolvidos", []), client.get("skus_confirmados", []),
+        client.get("amostras_aprovadas", []), client.get("historico_movimentacoes", [])
+    )
     initial_task = await create_workflow_task(
         tenant_id=user["tenant_id"],
         entity_type="client",
@@ -1353,35 +1453,38 @@ async def list_clients(
     search: Optional[str] = None,
 ):
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM crm_clients WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if stage:
-        query["stage"] = stage
+        params.append(stage)
+        sql += f" AND stage=${len(params)}"
     if search:
         search = clean_text(search)
-        digits = normalize_phone(search)
-        query["$or"] = [
-            {"nome_empresa": {"$regex": search, "$options": "i"}},
-            {"cnpj": {"$regex": search, "$options": "i"}},
-            {"contato_principal.nome": {"$regex": search, "$options": "i"}},
-            {"contato_principal.email": {"$regex": search, "$options": "i"}},
-            {"categoria_interesse": {"$regex": search, "$options": "i"}},
-        ]
+        digits = normalize_phone(search) or ""
+        params.append(f"%{search}%")
+        n = len(params)
+        sql += (
+            f" AND (nome_empresa ILIKE ${n} OR cnpj ILIKE ${n}"
+            f" OR contato_principal->>'nome' ILIKE ${n}"
+            f" OR contato_principal->>'email' ILIKE ${n}"
+        )
         if digits:
-            query["$or"].extend([
-                {"cnpj_normalized": {"$regex": digits}},
-                {"contato_principal.whatsapp": {"$regex": digits}},
-            ])
-
-    clients = await db.crm_clients.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+            params.append(f"%{digits}%")
+            m = len(params)
+            sql += f" OR cnpj_normalized ILIKE ${m} OR contato_principal->>'whatsapp' ILIKE ${m}"
+        sql += ")"
+    sql += " ORDER BY created_at DESC LIMIT 5000"
+    clients = _rows(await pg_db.fetch_all(sql, *params))
     return clients
 
 
 @crm_router.get("/clients/{client_id}")
 async def get_client(client_id: str, request: Request):
     user = await _get_current_user(request)
-    client = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     return client
@@ -1391,9 +1494,10 @@ async def get_client(client_id: str, request: Request):
 async def update_client(client_id: str, data: ClientUpdate, request: Request):
     user = await _get_current_user(request)
     require_roles(user, COMERCIAL_FULL)
-    existing = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, user["tenant_id"]
+    ))
     if not existing:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     update_fields = {}
@@ -1427,10 +1531,10 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
                 detail=f"CLI4 '{existing.get('cli4')}' está congelado — já existe SKU gerado para este cliente e o código não pode mais ser alterado"
             )
         new_cli4 = normalise_cli4(str(update_fields["cli4"] or ""))
-        conflict = await db.crm_clients.find_one(
-            {"tenant_id": user["tenant_id"], "cli4": new_cli4, "id": {"$ne": client_id}},
-            {"_id": 0, "nome_empresa": 1},
-        )
+        conflict = _row(await pg_db.fetch_one(
+            "SELECT nome_empresa FROM crm_clients WHERE tenant_id=$1 AND cli4=$2 AND id != $3",
+            user["tenant_id"], new_cli4, client_id
+        ))
         if conflict:
             raise HTTPException(
                 status_code=409,
@@ -1467,15 +1571,17 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
             update_fields[field] = payload[field]
 
     update_fields["updated_at"] = _now_iso()
-
-    result = await db.crm_clients.update_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    set_parts = [f"{k}=${i+1}" for i, k in enumerate(update_fields.keys())]
+    params = list(update_fields.values())
+    params.extend([client_id, user["tenant_id"]])
+    rows = await pg_db.fetch_all(
+        f"UPDATE crm_clients SET {', '.join(set_parts)} WHERE id=${len(params)-1} AND tenant_id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not rows:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
-    client = await db.crm_clients.find_one({"id": client_id}, {"_id": 0})
+    client = _row(await pg_db.fetch_one("SELECT * FROM crm_clients WHERE id=$1", client_id))
 
     # Auto-complete "qualificacao" blocking task when all 4 fields are present
     await _auto_complete_qualificacao_task(client, user["tenant_id"], user)
@@ -1519,9 +1625,10 @@ async def _auto_complete_qualificacao_task(client: dict, tenant_id: str, user: d
 async def move_client(client_id: str, data: ClientMove, request: Request):
     user = await _get_current_user(request)
     require_roles(user, COMERCIAL_FULL)
-    client = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
@@ -1588,15 +1695,15 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
     if is_regression and data.justificativa:
         movement["justificativa"] = data.justificativa.strip()
 
-    await db.crm_clients.update_one(
-        {"id": client_id},
-        {
-            "$set": update_data,
-            "$push": {"historico_movimentacoes": movement}
-        }
+    set_parts = [f"{k}=${i+1}" for i, k in enumerate(update_data.keys())]
+    set_parts.append(f"historico_movimentacoes = historico_movimentacoes || jsonb_build_array(${len(update_data)+1}::jsonb)")
+    params = list(update_data.values()) + [movement, client_id]
+    await pg_db.execute(
+        f"UPDATE crm_clients SET {', '.join(set_parts)} WHERE id=${len(params)}",
+        *params
     )
 
-    updated = await db.crm_clients.find_one({"id": client_id}, {"_id": 0})
+    updated = _row(await pg_db.fetch_one("SELECT * FROM crm_clients WHERE id=$1", client_id))
 
     # ERP v3.0: trigger workflow tasks for the new stage
     new_tasks = await trigger_tasks_for_transition(
@@ -1636,30 +1743,30 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
 @crm_router.get("/clients/{client_id}/full")
 async def get_client_full(client_id: str, request: Request):
     user = await _get_current_user(request)
-    client = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        client_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
-    projects = await db.crm_projects.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
-
-    samples = await db.crm_samples.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
-
-    skus = await db.skus.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
-
-    alerts = await db.crm_alerts.find(
-        {"tenant_id": user["tenant_id"], "entidade_ref": client_id, "status": {"$ne": "resolvido"}},
-        {"_id": 0}
-    ).to_list(100)
-
-    # Enrich with orders history
+    projects = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_projects WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        client_id, user["tenant_id"]
+    ))
+    samples = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_samples WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        client_id, user["tenant_id"]
+    ))
+    skus = _rows(await pg_db.fetch_all(
+        "SELECT * FROM skus WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        client_id, user["tenant_id"]
+    ))
+    alerts = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_alerts WHERE tenant_id=$1 AND entidade_ref=$2 AND status != 'resolvido' LIMIT 100",
+        user["tenant_id"], client_id
+    ))
+    # Enrich with orders history (stays MongoDB)
     orders = await db.orders.find(
         {"client_card_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
     ).sort("created_at", -1).to_list(200)
@@ -1768,9 +1875,38 @@ async def batch_create_projects(data: ProjectBatchCreate, request: Request):
             }
             inherit(project, client, INHERITED_FROM_CLIENT)
 
-            await db.crm_projects.insert_one(project)
+            await pg_db.execute(
+                """INSERT INTO crm_projects (
+                    id, tenant_id, cliente_id, cliente_nome, stage, nome_projeto, categoria,
+                    briefing_tecnico, responsavel_comercial, responsavel_interno,
+                    ideia_conceito, referencia_mercado, publico_alvo, posicionamento,
+                    faixa_preco_venda, volume_estimado_pedido, tipo_servico, sensorial_desejado,
+                    claims_desejados, prazo_desejado_amostra, prazo_prometido_cliente,
+                    observacoes_livres, data_inicio_desenvolvimento, data_ultima_amostra_enviada,
+                    numero_amostras_solicitadas, motivo_arquivamento,
+                    created_by, created_by_name, created_at, updated_at,
+                    restricoes_tecnicas, historico_movimentacoes
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,NOW(),NOW(),$29,$30
+                )""",
+                project["id"], project["tenant_id"], project["cliente_id"], project["cliente_nome"],
+                project["stage"], project["nome_projeto"], project.get("categoria",""),
+                project.get("briefing_tecnico",""), project.get("responsavel_comercial",""),
+                project.get("responsavel_interno",""), project.get("ideia_conceito",""),
+                project.get("referencia_mercado",""), project.get("publico_alvo",""),
+                project.get("posicionamento",""), project.get("faixa_preco_venda"),
+                project.get("volume_estimado_pedido"), project.get("tipo_servico",""),
+                project.get("sensorial_desejado",""), project.get("claims_desejados",""),
+                project.get("prazo_desejado_amostra",""), project.get("prazo_prometido_cliente"),
+                project.get("observacoes_livres",""), project.get("data_inicio_desenvolvimento"),
+                project.get("data_ultima_amostra_enviada"),
+                project.get("numero_amostras_solicitadas", 0), project.get("motivo_arquivamento",""),
+                project.get("created_by",""), project.get("created_by_name",""),
+                project.get("restricoes_tecnicas", []),
+                project.get("historico_movimentacoes", [])
+            )
             created_project_ids.append(project_id)
-            project.pop("_id", None)
 
             viability_task = await create_workflow_task(
                 tenant_id=user["tenant_id"],
@@ -1842,32 +1978,30 @@ async def list_projects(
     search: Optional[str] = None,
 ):
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM crm_projects WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if cliente_id:
-        query["cliente_id"] = cliente_id
+        params.append(cliente_id); sql += f" AND cliente_id=${len(params)}"
     if stage:
-        query["stage"] = _normalize_project_stage(stage)
+        params.append(_normalize_project_stage(stage)); sql += f" AND stage=${len(params)}"
     if search:
-        query["$or"] = [
-            {"nome_projeto": {"$regex": search, "$options": "i"}},
-            {"cliente_nome": {"$regex": search, "$options": "i"}},
-            {"categoria": {"$regex": search, "$options": "i"}},
-            {"briefing_tecnico": {"$regex": search, "$options": "i"}},
-            {"ideia_conceito": {"$regex": search, "$options": "i"}},
-            {"publico_alvo": {"$regex": search, "$options": "i"}},
-            {"claims_desejados": {"$regex": search, "$options": "i"}},
-        ]
-
-    projects = await db.crm_projects.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+        params.append(f"%{search}%"); n = len(params)
+        sql += (f" AND (nome_projeto ILIKE ${n} OR cliente_nome ILIKE ${n}"
+                f" OR categoria ILIKE ${n} OR briefing_tecnico ILIKE ${n}"
+                f" OR ideia_conceito ILIKE ${n} OR publico_alvo ILIKE ${n}"
+                f" OR claims_desejados ILIKE ${n})")
+    sql += " ORDER BY created_at DESC LIMIT 5000"
+    projects = _rows(await pg_db.fetch_all(sql, *params))
     return projects
 
 
 @crm_router.get("/projects/{project_id}")
 async def get_project(project_id: str, request: Request):
     user = await _get_current_user(request)
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
     return project
@@ -1883,17 +2017,21 @@ async def update_project(project_id: str, data: ProjectUpdate, request: Request)
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
     update_fields["updated_at"] = _now_iso()
-
-    result = await db.crm_projects.update_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    fields = list(update_fields.keys())
+    params: list = [update_fields[k] for k in fields]
+    set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields))
+    params.extend([project_id, user["tenant_id"]])
+    matched = await pg_db.fetch_val(
+        f"UPDATE crm_projects SET {set_clause} WHERE id=${len(params)-1} AND tenant_id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
 
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if project and update_fields.get("prazo_desejado_amostra"):
         await _create_project_deadline_alert_task(project, user)
     return project
@@ -1903,9 +2041,10 @@ async def update_project(project_id: str, data: ProjectUpdate, request: Request)
 async def move_project(project_id: str, data: ProjectMove, request: Request):
     user = await _get_current_user(request)
     require_roles(user, COMERCIAL_FULL)
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
 
@@ -1953,17 +2092,22 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
     if new_stage == "projeto_arquivado":
         update_fields["motivo_arquivamento"] = clean_text(data.motivo_arquivamento or "")
 
-    await db.crm_projects.update_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]},
-        {
-            "$set": update_fields,
-            "$push": {"historico_movimentacoes": movement}
-        }
+    set_parts = ["stage=$1", "updated_at=$2",
+                 "historico_movimentacoes = historico_movimentacoes || jsonb_build_array($3::jsonb)"]
+    params: list = [new_stage, now, json.dumps(movement)]
+    for k, v in update_fields.items():
+        if k not in ("stage", "updated_at"):
+            params.append(v); set_parts.append(f"{k}=${len(params)}")
+    params.extend([project_id, user["tenant_id"]])
+    await pg_db.execute(
+        f"UPDATE crm_projects SET {', '.join(set_parts)} WHERE id=${len(params)-1} AND tenant_id=${len(params)}",
+        *params
     )
 
-    updated = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if new_stage == "amostra_solicitada":
         await _create_project_deadline_alert_task(updated, user)
 
@@ -2018,23 +2162,27 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
 @crm_router.get("/projects/{project_id}/full")
 async def get_project_full(project_id: str, request: Request):
     user = await _get_current_user(request)
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
 
-    client = await db.crm_clients.find_one(
-        {"id": project["cliente_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        project["cliente_id"], user["tenant_id"]
+    ))
 
-    samples = await db.crm_samples.find(
-        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    samples = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_samples WHERE projeto_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        project_id, user["tenant_id"]
+    ))
 
-    skus = await db.skus.find(
-        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    skus = _rows(await pg_db.fetch_all(
+        "SELECT * FROM skus WHERE projeto_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        project_id, user["tenant_id"]
+    ))
 
     # Enrich each variation with live P&D status
     all_card_ids = []
@@ -2044,10 +2192,10 @@ async def get_project_full(project_id: str, request: Request):
                 all_card_ids.append(v["pd_card_id"])
 
     if all_card_ids:
-        pd_cards_docs = await db.pd_cards.find(
-            {"id": {"$in": all_card_ids}, "tenant_id": user["tenant_id"]},
-            {"_id": 0, "id": 1, "pd_request_id": 1, "status_pd": 1}
-        ).to_list(1000)
+        pd_cards_docs = _rows(await pg_db.fetch_all(
+            "SELECT id, pd_request_id, status_pd FROM pd_cards WHERE id = ANY($1::text[]) AND tenant_id=$2",
+            all_card_ids, user["tenant_id"]
+        ))
         cards_map = {c["id"]: c for c in pd_cards_docs}
 
         req_ids = list({c["pd_request_id"] for c in pd_cards_docs if c.get("pd_request_id")})
@@ -2083,16 +2231,18 @@ async def delete_project(project_id: str, request: Request):
     Bloqueia se houver SKU já gerado a partir deste projeto."""
     user = await _get_current_user(request)
     require_roles(user, ADMIN_ONLY | {"sales_ops"})
-    project = await db.crm_projects.find_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
 
     # Bloquear se houver SKU vinculado
-    sku_count = await db.skus.count_documents(
-        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}
-    )
+    sku_count = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM skus WHERE projeto_id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ) or 0
     if sku_count > 0:
         raise HTTPException(
             status_code=400,
@@ -2100,9 +2250,10 @@ async def delete_project(project_id: str, request: Request):
         )
 
     # Coletar samples e pd_cards para deletar
-    samples = await db.crm_samples.find(
-        {"projeto_id": project_id, "tenant_id": user["tenant_id"]}, {"_id": 0, "id": 1, "variacoes": 1}
-    ).to_list(5000)
+    samples = _rows(await pg_db.fetch_all(
+        "SELECT id, variacoes FROM crm_samples WHERE projeto_id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
+    ))
 
     sample_ids = [s["id"] for s in samples]
     pd_card_ids = []
@@ -2113,17 +2264,20 @@ async def delete_project(project_id: str, request: Request):
 
     # Apagar pd_cards vinculados
     if pd_card_ids:
-        await db.pd_cards.delete_many(
-            {"id": {"$in": pd_card_ids}, "tenant_id": user["tenant_id"]}
+        await pg_db.execute(
+            "DELETE FROM pd_cards WHERE id = ANY($1::text[]) AND tenant_id=$2",
+            pd_card_ids, user["tenant_id"]
         )
     # Apagar samples
     if sample_ids:
-        await db.crm_samples.delete_many(
-            {"id": {"$in": sample_ids}, "tenant_id": user["tenant_id"]}
+        await pg_db.execute(
+            "DELETE FROM crm_samples WHERE id = ANY($1::text[]) AND tenant_id=$2",
+            sample_ids, user["tenant_id"]
         )
     # Apagar projeto
-    await db.crm_projects.delete_one(
-        {"id": project_id, "tenant_id": user["tenant_id"]}
+    await pg_db.execute(
+        "DELETE FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        project_id, user["tenant_id"]
     )
 
     logger.info(f"Deleted project {project_id} (samples={len(sample_ids)}, pd_cards={len(pd_card_ids)})")
@@ -2144,9 +2298,10 @@ async def batch_create_samples(data: SampleBatchCreate, request: Request):
     require_roles(user, COMERCIAL_FULL | PD_FULL)
 
     # Verify project exists
-    project = await db.crm_projects.find_one(
-        {"id": data.projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        data.projeto_id, user["tenant_id"]
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
 
@@ -2169,20 +2324,16 @@ async def batch_create_samples(data: SampleBatchCreate, request: Request):
             "cliente_nome": project.get("cliente_nome", ""),
             "stage": "solicitada",
             "nome_amostra": item.nome_amostra,
-            "codigo_referencia": item.codigo_referencia,
             "observacao_tecnica": item.observacao_tecnica,
             "responsavel_pd": "",
             "data_envio": None,
-            "motivo_retrabalho": "",
-            "historico_retrabalhos": [],
             "feedback_cliente": "",
-            # Novos campos de briefing
             "produto": item.produto,
             "objetivo_projeto": item.objetivo_projeto,
             "aplicacoes_desenvolver": item.aplicacoes_desenvolver,
             "ativos_claims": item.ativos_claims,
             "referencias": item.referencias,
-            "referencias_fotos": item.referencias_fotos,
+            "referencias_fotos": item.referencias_fotos or [],
             "orcamento_projeto": item.orcamento_projeto,
             "textura_esperada": item.textura_esperada,
             "aplicacao": item.aplicacao,
@@ -2194,8 +2345,25 @@ async def batch_create_samples(data: SampleBatchCreate, request: Request):
             "created_at": now,
             "updated_at": now,
         }
-        await db.crm_samples.insert_one(sample)
-        sample.pop("_id", None)
+        await pg_db.execute(
+            """INSERT INTO crm_samples (
+                id, tenant_id, projeto_id, projeto_nome, cliente_id, cliente_nome, stage,
+                nome_amostra, observacao_tecnica, responsavel_pd, data_envio, feedback_cliente,
+                produto, objetivo_projeto, aplicacoes_desenvolver, ativos_claims, referencias,
+                referencias_fotos, orcamento_projeto, textura_esperada, aplicacao, sensorial, ph,
+                historico_movimentacoes, created_by, created_by_name, created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                $18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),NOW()
+            )""",
+            sample_id, user["tenant_id"], data.projeto_id, project["nome_projeto"],
+            project["cliente_id"], project.get("cliente_nome", ""), "solicitada",
+            item.nome_amostra, item.observacao_tecnica, "", None, "",
+            item.produto, item.objetivo_projeto, item.aplicacoes_desenvolver, item.ativos_claims,
+            item.referencias, item.referencias_fotos or [], item.orcamento_projeto,
+            item.textura_esperada, item.aplicacao, item.sensorial, item.ph,
+            [], user["id"], user["name"]
+        )
         created.append(sample)
 
     logger.info(f"Batch created {len(created)} samples for project {data.projeto_id}")
@@ -2259,9 +2427,13 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
         patch = {k: v for k, v in data.projeto_updates.items() if k in _ALLOWED_PROJETO_FIELDS}
         if patch:
             patch["updated_at"] = _now_iso()
-            await db.crm_projects.update_one(
-                {"id": data.projeto_id, "tenant_id": user["tenant_id"]},
-                {"$set": patch},
+            fields = list(patch.keys())
+            p2: list = [patch[k] for k in fields]
+            set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields))
+            p2.extend([data.projeto_id, user["tenant_id"]])
+            await pg_db.execute(
+                f"UPDATE crm_projects SET {set_clause} WHERE id=${len(p2)-1} AND tenant_id=${len(p2)}",
+                *p2
             )
             # Recarregar projeto com campos atualizados
             project = await assert_project_exists(user["tenant_id"], data.projeto_id)
@@ -2420,8 +2592,48 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
         # R02: inheritance do projeto → amostra (preenche campos vazios)
         inherit(sample, project, INHERITED_FROM_PROJECT)
 
-        await db.crm_samples.insert_one(sample)
-        sample.pop("_id", None)
+        await pg_db.execute(
+            """INSERT INTO crm_samples (
+                id, tenant_id, projeto_id, projeto_nome, cliente_id, cliente_nome,
+                numero_amostra, nome_produto, categoria, briefing_base, responsavel_pd,
+                parametro_variacao, tipo_amostra, referencia_formula, quantidade_por_variacao,
+                unidade_quantidade, prazo_entrega_cliente, briefing_especifico, feedback_cliente,
+                direcoes_retrabalho, resultado, aprovacao_interna, aprovacao_externa,
+                data_envio, enviado_comercial_em, aprovado_cliente_em, reprovacao_motivo,
+                tem_variacoes, variacoes, produto, objetivo_projeto, aplicacoes_desenvolver,
+                ativos_claims, referencias, referencias_fotos, orcamento_projeto, textura_esperada,
+                aplicacao, sensorial, ph, observacao_tecnica, stage, rework_de_amostra_id,
+                rework_motivo, projeto_briefing, historico_movimentacoes,
+                created_by, created_by_name, created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+                $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,NOW(),NOW()
+            )""",
+            sample["id"], sample["tenant_id"], sample["projeto_id"], sample["projeto_nome"],
+            sample["cliente_id"], sample.get("cliente_nome", ""),
+            str(sample.get("numero_amostra", "")), sample.get("nome_produto", ""),
+            sample.get("categoria", ""), sample.get("briefing_base", ""),
+            sample.get("responsavel_pd", ""), sample.get("parametro_variacao", ""),
+            sample.get("tipo_amostra", ""), sample.get("referencia_formula", ""),
+            sample.get("quantidade_por_variacao"), sample.get("unidade_quantidade", "g"),
+            sample.get("prazo_entrega_cliente", ""), sample.get("briefing_especifico", ""),
+            sample.get("feedback_cliente", ""), sample.get("direcoes_retrabalho", ""),
+            sample.get("resultado", ""), sample.get("aprovacao_interna", False),
+            sample.get("aprovacao_externa", False), sample.get("data_envio"),
+            sample.get("enviado_comercial_em"), sample.get("aprovado_cliente_em"),
+            sample.get("reprovacao_motivo", ""), sample.get("tem_variacoes", False),
+            sample.get("variacoes", []), sample.get("produto", ""),
+            sample.get("objetivo_projeto", ""), sample.get("aplicacoes_desenvolver", ""),
+            sample.get("ativos_claims", ""), sample.get("referencias", ""),
+            sample.get("referencias_fotos", []), sample.get("orcamento_projeto", ""),
+            sample.get("textura_esperada", ""), sample.get("aplicacao", ""),
+            sample.get("sensorial", ""), sample.get("ph", ""),
+            sample.get("observacao_tecnica", ""), sample.get("stage", "solicitada"),
+            sample.get("rework_de_amostra_id"), sample.get("rework_motivo", ""),
+            sample.get("projeto_briefing", {}), sample.get("historico_movimentacoes", []),
+            sample.get("created_by", ""), sample.get("created_by_name", "")
+        )
 
         await audit_log(
             tenant_id=user["tenant_id"],
@@ -2563,9 +2775,9 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
     })
 
     # Link card -> pd_request
-    await db.pd_cards.update_one(
-        {"id": card["id"], "tenant_id": user["tenant_id"]},
-        {"$set": {"pd_request_id": req_id, "updated_at": now}},
+    await pg_db.execute(
+        "UPDATE pd_cards SET pd_request_id=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        req_id, now, card["id"], user["tenant_id"]
     )
     card["pd_request_id"] = req_id
 
@@ -2591,9 +2803,10 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
     if not sample_id or not variacao_id:
         return
 
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         return
     variacao = next(
@@ -2789,13 +3002,23 @@ async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict)
         "updated_at": now,
     }
     
-    await db.pd_cards.insert_one(card)
-    
-    # Atualizar variação com o card_id
-    await db.crm_samples.update_one(
-        {"id": sample["id"], "variacoes.id": variacao["id"]},
-        {"$set": {"variacoes.$.pd_card_id": card_id}}
+    extra = {k: v for k, v in card.items() if k not in {
+        "id", "tenant_id", "amostra_id", "amostra_variacao_id",
+        "pd_request_id", "status_pd", "executor_id", "executor_name",
+        "atribuido_em", "atribuido_por", "atribuido_por_nome",
+        "extra", "created_at", "updated_at"
+    }}
+    await pg_db.execute(
+        """INSERT INTO pd_cards (
+            id, tenant_id, amostra_id, amostra_variacao_id, pd_request_id,
+            status_pd, extra, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),NOW())""",
+        card_id, user["tenant_id"], sample["id"], variacao["id"], None,
+        card.get("status_pd", "solicitado"), extra
     )
+
+    # Atualizar variação com o card_id
+    await _update_variacao_in_sample(sample["id"], user["tenant_id"], variacao["id"], {"pd_card_id": card_id})
 
     await audit_log(
         tenant_id=user["tenant_id"],
@@ -2826,34 +3049,31 @@ async def list_samples(
     search: Optional[str] = None,
 ):
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM crm_samples WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if projeto_id:
-        query["projeto_id"] = projeto_id
+        params.append(projeto_id); sql += f" AND projeto_id=${len(params)}"
     if cliente_id:
-        query["cliente_id"] = cliente_id
+        params.append(cliente_id); sql += f" AND cliente_id=${len(params)}"
     if stage:
-        query["stage"] = stage
+        params.append(stage); sql += f" AND stage=${len(params)}"
     if search:
-        query["$or"] = [
-            {"nome_amostra": {"$regex": search, "$options": "i"}},
-            {"nome_produto": {"$regex": search, "$options": "i"}},
-            {"numero_amostra": {"$regex": search, "$options": "i"}},
-            {"projeto_nome": {"$regex": search, "$options": "i"}},
-            {"cliente_nome": {"$regex": search, "$options": "i"}},
-            {"variacoes.codigo": {"$regex": search, "$options": "i"}},
-            {"variacoes.descricao_aplicacao": {"$regex": search, "$options": "i"}},
-        ]
-
-    samples = await db.crm_samples.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+        params.append(f"%{search}%"); n = len(params)
+        sql += (f" AND (nome_amostra ILIKE ${n} OR nome_produto ILIKE ${n}"
+                f" OR numero_amostra ILIKE ${n} OR projeto_nome ILIKE ${n}"
+                f" OR cliente_nome ILIKE ${n})")
+    sql += " ORDER BY created_at DESC LIMIT 5000"
+    samples = _rows(await pg_db.fetch_all(sql, *params))
     return samples
 
 
 @crm_router.get("/samples/{sample_id}")
 async def get_sample(sample_id: str, request: Request):
     user = await _get_current_user(request)
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
     return sample
@@ -2869,17 +3089,21 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
     update_fields["updated_at"] = _now_iso()
-
-    result = await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    fields = list(update_fields.keys())
+    params: list = [update_fields[k] for k in fields]
+    set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields))
+    params.extend([sample_id, user["tenant_id"]])
+    matched = await pg_db.fetch_val(
+        f"UPDATE crm_samples SET {set_clause} WHERE id=${len(params)-1} AND tenant_id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     return sample
 
 
@@ -2887,9 +3111,10 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
 async def move_sample(sample_id: str, data: SampleMove, request: Request):
     user = await _get_current_user(request)
     require_roles(user, COMERCIAL_FULL | PD_FULL)
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
@@ -2964,17 +3189,21 @@ async def move_sample(sample_id: str, data: SampleMove, request: Request):
     if new_stage == "reprovada" and data.motivo_retrabalho:
         update_data["motivo_retrabalho"] = data.motivo_retrabalho
 
-    await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]},
-        {
-            "$set": update_data,
-            "$push": push_ops,
-        }
+    movement = push_ops["historico_movimentacoes"]
+    set_parts = ["historico_movimentacoes = historico_movimentacoes || jsonb_build_array($1::jsonb)"]
+    params: list = [json.dumps(movement)]
+    for k, v in update_data.items():
+        params.append(v); set_parts.append(f"{k}=${len(params)}")
+    params.extend([sample_id, user["tenant_id"]])
+    await pg_db.execute(
+        f"UPDATE crm_samples SET {', '.join(set_parts)} WHERE id=${len(params)-1} AND tenant_id=${len(params)}",
+        *params
     )
 
-    updated = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
 
     new_tasks = await trigger_tasks_for_transition(
         entity_type="sample",
@@ -3064,9 +3293,10 @@ async def create_rework_sample(sample_id: str, data: SampleReworkInput, request:
     A amostra original permanece imutável (mas registra o retrabalho no histórico)."""
     user = await _get_current_user(request)
 
-    original = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    original = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not original:
         raise HTTPException(status_code=404, detail="Amostra original não encontrada")
 
@@ -3178,54 +3408,71 @@ async def create_rework_sample(sample_id: str, data: SampleReworkInput, request:
         "updated_at": now,
     }
     inherit(nova_sample, project, INHERITED_FROM_PROJECT)
-    await db.crm_samples.insert_one(nova_sample)
-    nova_sample.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO crm_samples (
+            id, tenant_id, projeto_id, projeto_nome, cliente_id, cliente_nome,
+            numero_amostra, nome_produto, categoria, briefing_base, responsavel_pd,
+            parametro_variacao, tipo_amostra, referencia_formula, quantidade_por_variacao,
+            unidade_quantidade, prazo_entrega_cliente, briefing_especifico, feedback_cliente,
+            direcoes_retrabalho, resultado, aprovacao_interna, aprovacao_externa,
+            data_envio, enviado_comercial_em, aprovado_cliente_em, reprovacao_motivo,
+            tem_variacoes, variacoes, produto, objetivo_projeto, aplicacoes_desenvolver,
+            ativos_claims, referencias, referencias_fotos, orcamento_projeto, textura_esperada,
+            aplicacao, sensorial, ph, observacao_tecnica, stage, rework_de_amostra_id,
+            rework_motivo, historico_movimentacoes, created_by, created_by_name, created_at, updated_at
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+            $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+            $37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,NOW(),NOW()
+        )""",
+        nova_sample["id"], nova_sample["tenant_id"], nova_sample["projeto_id"],
+        nova_sample.get("projeto_nome", ""), nova_sample["cliente_id"],
+        nova_sample.get("cliente_nome", ""), str(nova_sample.get("numero_amostra", "")),
+        nova_sample.get("nome_produto", ""), nova_sample.get("categoria", ""),
+        nova_sample.get("briefing_base", ""), nova_sample.get("responsavel_pd", ""),
+        nova_sample.get("parametro_variacao", ""), nova_sample.get("tipo_amostra", ""),
+        nova_sample.get("referencia_formula", ""), nova_sample.get("quantidade_por_variacao"),
+        nova_sample.get("unidade_quantidade", "g"), nova_sample.get("prazo_entrega_cliente", ""),
+        nova_sample.get("briefing_especifico", ""), nova_sample.get("feedback_cliente", ""),
+        nova_sample.get("direcoes_retrabalho", ""), nova_sample.get("resultado", ""),
+        nova_sample.get("aprovacao_interna", False), nova_sample.get("aprovacao_externa", False),
+        nova_sample.get("data_envio"), nova_sample.get("enviado_comercial_em"),
+        nova_sample.get("aprovado_cliente_em"), nova_sample.get("reprovacao_motivo", ""),
+        nova_sample.get("tem_variacoes", False), nova_sample.get("variacoes", []),
+        nova_sample.get("produto", ""), nova_sample.get("objetivo_projeto", ""),
+        nova_sample.get("aplicacoes_desenvolver", ""), nova_sample.get("ativos_claims", ""),
+        nova_sample.get("referencias", ""), nova_sample.get("referencias_fotos", []),
+        nova_sample.get("orcamento_projeto", ""), nova_sample.get("textura_esperada", ""),
+        nova_sample.get("aplicacao", ""), nova_sample.get("sensorial", ""),
+        nova_sample.get("ph", ""), nova_sample.get("observacao_tecnica", ""),
+        nova_sample.get("stage", "solicitada"), nova_sample.get("rework_de_amostra_id"),
+        nova_sample.get("rework_motivo", ""), [],
+        nova_sample.get("created_by", ""), nova_sample.get("created_by_name", "")
+    )
 
     # Marcar a original com referência ao retrabalho gerado
-    await db.crm_samples.update_one(
-        {"id": original["id"], "tenant_id": user["tenant_id"]},
-        {
-            "$push": {
-                "historico_retrabalhos": {
-                    "data": now,
-                    "motivo": data.motivo,
-                    "origem": data.origem,
-                    "nova_amostra_id": nova_sample_id,
-                    "novo_numero": str(novo_numero),
-                    "usuario": user["name"],
-                    "usuario_id": user["id"],
-                }
-            },
-            "$set": {
-                "updated_at": now,
+    rework_entry = {
+        "data": now, "motivo": data.motivo, "origem": data.origem,
+        "nova_amostra_id": nova_sample_id, "novo_numero": str(novo_numero),
+        "usuario": user["name"], "usuario_id": user["id"],
+    }
+    await pg_db.execute(
+        """UPDATE crm_samples SET
+            feedback_cliente=$1, direcoes_retrabalho=$2, resultado=$3, updated_at=$4,
+            historico_movimentacoes = historico_movimentacoes || jsonb_build_array($5::jsonb)
+           WHERE id=$6 AND tenant_id=$7""",
+        data.feedback_cliente, data.direcoes_retrabalho, "retrabalho", now,
+        json.dumps(rework_entry), original["id"], user["tenant_id"]
+    )
+    if data.variacao_id:
+        await _update_variacao_in_sample(
+            original["id"], user["tenant_id"], data.variacao_id,
+            {
+                "motivo_retrabalho": data.motivo,
                 "feedback_cliente": data.feedback_cliente,
                 "direcoes_retrabalho": data.direcoes_retrabalho,
                 "resultado": "retrabalho",
-            },
-        },
-    )
-    if data.variacao_id:
-        await db.crm_samples.update_one(
-            {"id": original["id"], "tenant_id": user["tenant_id"], "variacoes.id": data.variacao_id},
-            {
-                "$set": {
-                    "variacoes.$.motivo_retrabalho": data.motivo,
-                    "variacoes.$.feedback_cliente": data.feedback_cliente,
-                    "variacoes.$.direcoes_retrabalho": data.direcoes_retrabalho,
-                    "variacoes.$.resultado": "retrabalho",
-                },
-                "$push": {
-                    "variacoes.$.historico_retrabalhos": {
-                        "data": now,
-                        "motivo": data.motivo,
-                        "origem": data.origem,
-                        "nova_amostra_id": nova_sample_id,
-                        "novo_numero": str(novo_numero),
-                        "usuario": user["name"],
-                        "usuario_id": user["id"],
-                    }
-                },
-            },
+            }
         )
 
     # Criar P&D card para a nova variação
@@ -3259,20 +3506,27 @@ async def update_variacao(sample_id: str, variacao_id: str, data: VariacaoUpdate
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
     
-    # Montar update com dot notation para variação específica
-    set_fields = {f"variacoes.$.{k}": v for k, v in update_fields.items()}
-    set_fields["updated_at"] = _now_iso()
-    
-    result = await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"], "variacoes.id": variacao_id},
-        {"$set": set_fields}
-    )
-    
-    if result.matched_count == 0:
+    sample = _row(await pg_db.fetch_one(
+        "SELECT variacoes FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
+    if not sample:
         raise HTTPException(status_code=404, detail="Amostra ou variação não encontrada")
-    
-    sample = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
-    return sample
+    variacoes = sample.get("variacoes") or []
+    target = next((v for v in variacoes if v.get("id") == variacao_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Amostra ou variação não encontrada")
+
+    target.update(update_fields)
+    target["updated_at"] = _now_iso()
+    await pg_db.execute(
+        "UPDATE crm_samples SET variacoes=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        variacoes, sample_id, user["tenant_id"]
+    )
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
 
 
 @crm_router.put("/samples/{sample_id}/variacoes/{variacao_id}/move")
@@ -3296,12 +3550,13 @@ async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, re
             },
         )
 
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
-    
+
     # Encontrar a variação
     variacao = next((v for v in sample.get("variacoes", []) if v["id"] == variacao_id), None)
     if not variacao:
@@ -3383,17 +3638,41 @@ async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, re
     if data.origem_retrabalho:
         set_ops["variacoes.$.origem_retrabalho"] = data.origem_retrabalho
     
-    await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"], "variacoes.id": variacao_id},
-        {
-            "$set": set_ops,
-            "$push": push_ops
-        }
-    )
-    
-    updated = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    var_updates = {
+        "status": new_status,
+        "updated_at": now,
+        "aprovacao_interna": set_ops.get("variacoes.$.aprovacao_interna", variacao.get("aprovacao_interna", False)),
+        "aprovacao_externa": set_ops.get("variacoes.$.aprovacao_externa", variacao.get("aprovacao_externa", False)),
+    }
+    if new_status == "enviada":
+        var_updates["enviado_comercial_em"] = now
+        var_updates["aprovacao_interna"] = True
+    if new_status == "reprovada":
+        var_updates["resultado"] = "reprovada"
+        var_updates["aprovacao_externa"] = False
+        var_updates["reprovacao_motivo"] = data.motivo_retrabalho or data.feedback_cliente or ""
+    if data.feedback_cliente:
+        var_updates["feedback_cliente"] = data.feedback_cliente
+    if data.direcoes_retrabalho:
+        var_updates["direcoes_retrabalho"] = data.direcoes_retrabalho
+    if new_status == "reprovada" and data.motivo_retrabalho:
+        var_updates["motivo_retrabalho"] = data.motivo_retrabalho
+    if data.origem_retrabalho:
+        var_updates["origem_retrabalho"] = data.origem_retrabalho
+
+    await _update_variacao_in_sample(sample_id, user["tenant_id"], variacao_id, var_updates)
+    hist_entry = {"de": old_status, "para": new_status, "data": now, "usuario": user["name"], "usuario_id": user["id"]}
+    await _push_variacao_history(sample_id, user["tenant_id"], variacao_id, hist_entry)
+    if new_status == "enviada":
+        await pg_db.execute(
+            "UPDATE crm_samples SET data_envio=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+            now, now, sample_id, user["tenant_id"]
+        )
+
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
 
     new_tasks = await trigger_tasks_for_transition(
         entity_type="variacao",
@@ -3500,7 +3779,10 @@ async def resultado_cliente(
         )
 
     tenant_id = user["tenant_id"]
-    sample = await db.crm_samples.find_one({"id": sample_id, "tenant_id": tenant_id}, {"_id": 0})
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, tenant_id
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
@@ -3565,22 +3847,36 @@ async def resultado_cliente(
         set_ops["variacoes.$.aprovacao_externa"] = False
         set_ops["variacoes.$.reprovacao_motivo"] = data.feedback_cliente or ""
 
-    await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": tenant_id, "variacoes.id": variacao_id},
-        {
-            "$set": set_ops,
-            "$push": {
-                "variacoes.$.historico_status": {
-                    "de": "enviada",
-                    "para": novo_status_crm,
-                    "data": now,
-                    "usuario": user["name"],
-                    "usuario_id": user["id"],
-                    "origem": "resultado_cliente",
-                }
-            },
-        },
-    )
+    var_resultado = {
+        "status": novo_status_crm,
+        "status_pd_label": pd_label,
+        "feedback_cliente": data.feedback_cliente or "",
+        "resultado_cliente_registrado_por": user["id"],
+        "resultado_cliente_registrado_em": now,
+        "aprovacao_interna": True,
+        "updated_at": now,
+    }
+    if data.direcoes_retrabalho:
+        var_resultado["direcoes_retrabalho"] = data.direcoes_retrabalho
+    if data.resultado == "aprovada":
+        var_resultado["resultado"] = "aprovada"
+        var_resultado["aprovacao_externa"] = True
+        var_resultado["aprovado_cliente_em"] = now
+    if data.resultado == "reprovada":
+        var_resultado["resultado"] = "reprovada"
+        var_resultado["aprovacao_externa"] = False
+        var_resultado["reprovacao_motivo"] = data.feedback_cliente or ""
+        var_resultado["arquivada"] = True
+    if data.resultado == "retrabalho":
+        var_resultado["aprovacao_externa"] = False
+        var_resultado["reprovacao_motivo"] = data.feedback_cliente or ""
+
+    await _update_variacao_in_sample(sample_id, tenant_id, variacao_id, var_resultado)
+    hist_rc = {
+        "de": "enviada", "para": novo_status_crm, "data": now,
+        "usuario": user["name"], "usuario_id": user["id"], "origem": "resultado_cliente",
+    }
+    await _push_variacao_history(sample_id, tenant_id, variacao_id, hist_rc)
 
     await _sync_pd_cards_from_crm_stage(
         tenant_id=tenant_id,
@@ -3595,7 +3891,10 @@ async def resultado_cliente(
     )
 
     # Notificar pd_card vinculado
-    pd_card = await db.pd_cards.find_one({"amostra_variacao_id": variacao_id, "tenant_id": tenant_id}, {"_id": 0})
+    pd_card = _row(await pg_db.fetch_one(
+        "SELECT id, status_pd, extra FROM pd_cards WHERE amostra_variacao_id=$1 AND tenant_id=$2",
+        variacao_id, tenant_id
+    ))
     pd_card_notificado = False
     if pd_card:
         novo_status_pd = {
@@ -3603,27 +3902,24 @@ async def resultado_cliente(
             "reprovada":  "retrabalho_interno",
             "retrabalho": "retrabalho_interno",
         }[data.resultado]
-        await db.pd_cards.update_one(
-            {"id": pd_card["id"], "tenant_id": tenant_id},
-            {
-                "$set": {
-                    "status_pd": novo_status_pd,
-                    "feedback_cliente": data.feedback_cliente or "",
-                    "direcoes_retrabalho": data.direcoes_retrabalho or "",
-                    "resultado_cliente": data.resultado,
-                    "updated_at": now,
-                },
-                "$push": {
-                    "historico_movimentacoes": {
-                        "de": pd_card.get("status_pd", ""),
-                        "para": novo_status_pd,
-                        "data": now,
-                        "usuario": user["name"],
-                        "usuario_id": user["id"],
-                        "observacao": f"Resultado do cliente: {pd_label}",
-                    }
-                },
-            },
+        hist_card = {
+            "de": pd_card.get("status_pd", ""), "para": novo_status_pd,
+            "data": now, "usuario": user["name"], "usuario_id": user["id"],
+            "observacao": f"Resultado do cliente: {pd_label}",
+        }
+        extra_merge = {"feedback_cliente": data.feedback_cliente or "",
+                       "direcoes_retrabalho": data.direcoes_retrabalho or "",
+                       "resultado_cliente": data.resultado}
+        await pg_db.execute(
+            """UPDATE pd_cards SET status_pd=$1, updated_at=$2,
+               extra = jsonb_set(
+                   extra || $3::jsonb,
+                   '{historico_movimentacoes}',
+                   COALESCE(extra->'historico_movimentacoes','[]'::jsonb) || jsonb_build_array($4::jsonb)
+               )
+               WHERE id=$5 AND tenant_id=$6""",
+            novo_status_pd, now, json.dumps(extra_merge), json.dumps(hist_card),
+            pd_card["id"], tenant_id
         )
         pd_card_notificado = True
         logger.info(f"Resultado cliente: variação {variacao_id} → {novo_status_crm} / pd_card {pd_card['id']} → {novo_status_pd}")
@@ -3662,9 +3958,10 @@ async def delete_sample(sample_id: str, request: Request):
     """Deleta uma amostra completa (todas variações + pd_cards).
     Bloqueia se alguma variação já gerou SKU."""
     user = await _get_current_user(request)
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
@@ -3680,11 +3977,13 @@ async def delete_sample(sample_id: str, request: Request):
     pd_card_ids = [v["pd_card_id"] for v in (sample.get("variacoes") or []) if v.get("pd_card_id")]
 
     if pd_card_ids:
-        await db.pd_cards.delete_many(
-            {"id": {"$in": pd_card_ids}, "tenant_id": user["tenant_id"]}
+        await pg_db.execute(
+            "DELETE FROM pd_cards WHERE id = ANY($1::text[]) AND tenant_id=$2",
+            pd_card_ids, user["tenant_id"]
         )
-    await db.crm_samples.delete_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}
+    await pg_db.execute(
+        "DELETE FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
     )
 
     logger.info(f"Deleted sample {sample_id} with {len(pd_card_ids)} pd_cards")
@@ -3699,9 +3998,10 @@ async def delete_variacao(sample_id: str, variacao_id: str, request: Request):
     """Deleta uma variação específica (e seu pd_card).
     Bloqueia se a variação já gerou SKU ou se é a última variação."""
     user = await _get_current_user(request)
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
@@ -3724,25 +4024,17 @@ async def delete_variacao(sample_id: str, variacao_id: str, request: Request):
 
     # Remover pd_card vinculado
     if variacao.get("pd_card_id"):
-        await db.pd_cards.delete_one(
-            {"id": variacao["pd_card_id"], "tenant_id": user["tenant_id"]}
+        await pg_db.execute(
+            "DELETE FROM pd_cards WHERE id=$1 AND tenant_id=$2",
+            variacao["pd_card_id"], user["tenant_id"]
         )
 
-    # Remover variação do array
-    await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]},
-        {
-            "$pull": {"variacoes": {"id": variacao_id}},
-            "$set": {"updated_at": _now_iso()}
-        }
-    )
-
-    # Recalcular tem_variacoes
-    updated = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
-    tem_variacoes = len(updated.get("variacoes") or []) > 1
-    await db.crm_samples.update_one(
-        {"id": sample_id},
-        {"$set": {"tem_variacoes": tem_variacoes}}
+    # Remover variação do array e recalcular tem_variacoes
+    new_variacoes = [v for v in variacoes if v["id"] != variacao_id]
+    tem_variacoes = len(new_variacoes) > 1
+    await pg_db.execute(
+        "UPDATE crm_samples SET variacoes=$1, tem_variacoes=$2, updated_at=NOW() WHERE id=$3 AND tenant_id=$4",
+        new_variacoes, tem_variacoes, sample_id, user["tenant_id"]
     )
 
     logger.info(f"Deleted variação {variacao_id} from sample {sample_id}")
@@ -3754,9 +4046,10 @@ async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, req
     """Adiciona novas variações a uma amostra existente.
     Gera automaticamente próximas letras (se tem A,B,C → adiciona D, E...)."""
     user = await _get_current_user(request)
-    sample = await db.crm_samples.find_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sample = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     if not sample:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
@@ -3802,21 +4095,24 @@ async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, req
         new_variacoes.append(variacao)
 
     # Inserir no array
-    await db.crm_samples.update_one(
-        {"id": sample_id, "tenant_id": user["tenant_id"]},
-        {
-            "$push": {"variacoes": {"$each": new_variacoes}},
-            "$set": {"tem_variacoes": True, "updated_at": now},
-        }
+    all_variacoes = existing + new_variacoes
+    await pg_db.execute(
+        "UPDATE crm_samples SET variacoes=$1, tem_variacoes=TRUE, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        all_variacoes, sample_id, user["tenant_id"]
     )
 
     # Criar pd_cards para cada nova variação
-    updated = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     for new_var in new_variacoes:
-        # Recuperar a variação recém-persistida para linkar pd_card
         await _create_pd_card_for_variacao(updated, new_var, user)
 
-    final = await db.crm_samples.find_one({"id": sample_id}, {"_id": 0})
+    final = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+        sample_id, user["tenant_id"]
+    ))
     logger.info(f"Added {len(new_variacoes)} variações to sample {sample_id}")
     return {
         "sample": final,
@@ -3832,7 +4128,10 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
     # Resolve CAT2 and CLI3 for new code format [CAT2]-[CLI3]-[SEQ4]
     categoria = sample.get("categoria", "")
     cat2 = cat2_from_categoria(categoria)
-    client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        sample["cliente_id"], tenant_id
+    ))
     raw_cli3 = (client.get("cli3") or client.get("nome_empresa", "") if client else "")
     cli3 = normalise_cli3(raw_cli3)
     seq = await next_sku_per_pair(tenant_id, cat2, cli3)
@@ -3882,14 +4181,28 @@ async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) ->
         "updated_at": now,
     }
 
-    await db.skus.insert_one(sku)
-    sku.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO skus (
+            id, tenant_id, codigo_interno, cat2, cat3, cli3, cli4, nome_produto, categoria,
+            formula_vinculada, cliente_id, cliente_nome, projeto_id, projeto_nome,
+            amostra_id, amostra_variacao_id, descricao_aplicacao, preco_unitario,
+            moq, anvisa, status, historico_pedidos, data_ultimo_pedido,
+            frequencia_media_recompra_dias, medias_producao, created_at, updated_at
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+            $19,$20,$21,$22,$23,$24,$25,NOW(),NOW()
+        )""",
+        sku_id, tenant_id, codigo, cat2, sku.get("cat3", ""), cli3, sku.get("cli4", ""),
+        sku["nome_produto"], categoria, "", sample["cliente_id"],
+        sample.get("cliente_nome", ""), sample["projeto_id"], sample.get("projeto_nome", ""),
+        sample["id"], variacao["id"], variacao.get("descricao_aplicacao", ""),
+        float(variacao.get("custo_fragrancia") or 0.0), 0,
+        {"numero": "", "validade": None}, "ativo", [], None, 0,
+        sku.get("medias_producao", {})
+    )
 
     # Atualizar variação com SKU ID
-    await db.crm_samples.update_one(
-        {"id": sample["id"], "variacoes.id": variacao["id"]},
-        {"$set": {"variacoes.$.sku_id": sku_id, "variacoes.$.gera_sku": True}}
-    )
+    await _update_variacao_in_sample(sample["id"], tenant_id, variacao["id"], {"sku_id": sku_id, "gera_sku": True})
 
     logger.info(f"Auto-created SKU {codigo} from variação {variacao['codigo']}")
     return sku
@@ -3910,7 +4223,9 @@ async def _check_sku_dependency_chain(sample: dict, tenant_id: str) -> None:
     projeto_id = sample.get("projeto_id")
 
     # 1. Cliente with CLI4
-    client = await db.crm_clients.find_one({"id": cliente_id, "tenant_id": tenant_id}, {"_id": 0})
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2", cliente_id, tenant_id
+    ))
     if not client:
         raise HTTPException(status_code=409, detail="[R25] Cliente não encontrado — pré-requisito para geração de SKU")
     if not client.get("cli4"):
@@ -3919,7 +4234,9 @@ async def _check_sku_dependency_chain(sample: dict, tenant_id: str) -> None:
     # 2. Categoria exists and is active (must be in db.categorias)
     categoria = sample.get("categoria") or ""
     if not categoria:
-        project = await db.crm_projects.find_one({"id": projeto_id, "tenant_id": tenant_id}, {"_id": 0})
+        project = _row(await pg_db.fetch_one(
+            "SELECT categoria FROM crm_projects WHERE id=$1 AND tenant_id=$2", projeto_id, tenant_id
+        ))
         categoria = (project or {}).get("categoria", "")
     cat3 = cat3_from_categoria(categoria)
     if cat3 == "GEN":
@@ -3952,7 +4269,9 @@ async def _check_sku_dependency_chain(sample: dict, tenant_id: str) -> None:
         )
 
     # 5. Pedido de Industrialização aprovado (pedido_aprovado stage on project)
-    project = await db.crm_projects.find_one({"id": projeto_id, "tenant_id": tenant_id}, {"_id": 0})
+    project = _row(await pg_db.fetch_one(
+        "SELECT stage FROM crm_projects WHERE id=$1 AND tenant_id=$2", projeto_id, tenant_id
+    ))
     if not project or project.get("stage") not in ("pedido_aprovado", "cliente_fechado"):
         proj_stage = (project or {}).get("stage", "não encontrado")
         raise HTTPException(
@@ -3976,12 +4295,18 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         return {"blocked": True, "reason": exc.detail}
 
     # Resolve category
-    project = await db.crm_projects.find_one({"id": sample["projeto_id"]}, {"_id": 0})
+    project = _row(await pg_db.fetch_one(
+        "SELECT categoria FROM crm_projects WHERE id=$1 AND tenant_id=$2",
+        sample["projeto_id"], tenant_id
+    ))
     categoria = sample.get("categoria") or (project.get("categoria") if project else "") or ""
 
     # New format: [CAT3]-[CLI4]-[SEQ4]
     cat3 = cat3_from_categoria(categoria)
-    client = await db.crm_clients.find_one({"id": sample["cliente_id"], "tenant_id": tenant_id}, {"_id": 0})
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        sample["cliente_id"], tenant_id
+    ))
     cli4 = normalise_cli4(client.get("cli4") or client.get("nome_empresa", ""))
     seq = await next_sku_per_pair_v2(tenant_id, cat3, cli4)
     codigo = build_sku_code_v2(cat3, cli4, seq)
@@ -4036,14 +4361,30 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
         "updated_at": now,
     }
 
-    await db.skus.insert_one(sku)
-    sku.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO skus (
+            id, tenant_id, codigo_interno, cat3, cli4, cat2, cli3, nome_produto, categoria,
+            formula_vinculada, cliente_id, cliente_nome, projeto_id, projeto_nome,
+            amostra_id, produto_pai_id, preco_unitario, moq, anvisa, status,
+            historico_pedidos, data_ultimo_pedido, frequencia_media_recompra_dias,
+            medias_producao, created_at, updated_at
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+            $19,$20,$21,$22,$23,$24,NOW(),NOW()
+        )""",
+        sku_id, tenant_id, codigo, cat3, cli4, cat2, cli3,
+        sku["nome_produto"], categoria, "", sample["cliente_id"],
+        sample.get("cliente_nome", ""), sample["projeto_id"], sample.get("projeto_nome", ""),
+        sample["id"], None, 0.0, 0,
+        {"numero": "", "validade": None}, "ativo",
+        [], None, 0, sku.get("medias_producao", {})
+    )
 
     # R23: freeze cli4 after first SKU
     if client and not client.get("cli4_congelado"):
-        await db.crm_clients.update_one(
-            {"id": sample["cliente_id"], "tenant_id": tenant_id},
-            {"$set": {"cli4_congelado": True, "updated_at": now}},
+        await pg_db.execute(
+            "UPDATE crm_clients SET cli4_congelado=TRUE, updated_at=$1 WHERE id=$2 AND tenant_id=$3",
+            now, sample["cliente_id"], tenant_id
         )
 
     logger.info(f"Auto-created SKU {codigo} from sample {sample['id']}")
@@ -4058,18 +4399,17 @@ async def list_skus(
     search: Optional[str] = None,
 ):
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM skus WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if cliente_id:
-        query["cliente_id"] = cliente_id
+        params.append(cliente_id); sql += f" AND cliente_id=${len(params)}"
     if status:
-        query["status"] = status
+        params.append(status); sql += f" AND status=${len(params)}"
     if search:
-        query["$or"] = [
-            {"nome_produto": {"$regex": search, "$options": "i"}},
-            {"codigo_interno": {"$regex": search, "$options": "i"}},
-        ]
-
-    skus = await db.skus.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+        params.append(f"%{search}%"); n = len(params)
+        sql += f" AND (nome_produto ILIKE ${n} OR codigo_interno ILIKE ${n})"
+    sql += " ORDER BY created_at DESC LIMIT 5000"
+    skus = _rows(await pg_db.fetch_all(sql, *params))
     return skus
 
 
@@ -4078,7 +4418,9 @@ async def preview_sku_code(cliente_id: str, categoria: str, request: Request):
     """Return the code that would be generated for a new SKU (without consuming the sequence)."""
     user = await _get_current_user(request)
     cat2 = cat2_from_categoria(categoria)
-    client = await db.crm_clients.find_one({"id": cliente_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2", cliente_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     raw_cli3 = client.get("cli3") or client.get("nome_empresa", "")
@@ -4099,9 +4441,9 @@ async def preview_sku_code(cliente_id: str, categoria: str, request: Request):
 @crm_router.get("/skus/{sku_id}")
 async def get_sku(sku_id: str, request: Request):
     user = await _get_current_user(request)
-    sku = await db.skus.find_one(
-        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
     return sku
@@ -4111,74 +4453,85 @@ async def get_sku(sku_id: str, request: Request):
 async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
     """Limited update — SKU code is immutable (RN-SK-04), other fields are editable."""
     user = await _get_current_user(request)
-    update_fields = {}
+    scalar_fields: dict = {}
+    anvisa_patch: dict = {}
 
     if data.nome_produto is not None:
-        update_fields["nome_produto"] = data.nome_produto
+        scalar_fields["nome_produto"] = data.nome_produto
     if data.preco_unitario is not None:
-        update_fields["preco_unitario"] = data.preco_unitario
+        scalar_fields["preco_unitario"] = data.preco_unitario
     if data.preco_unitario_currency is not None:
-        update_fields["preco_unitario_currency"] = data.preco_unitario_currency
+        scalar_fields["preco_unitario_currency"] = data.preco_unitario_currency
     if data.moq is not None:
-        update_fields["moq"] = data.moq
+        scalar_fields["moq"] = data.moq
     if data.status is not None:
         if data.status not in ("ativo", "suspenso", "descontinuado"):
             raise HTTPException(status_code=400, detail="Status inválido")
-        update_fields["status"] = data.status
+        scalar_fields["status"] = data.status
     if data.anvisa_numero is not None:
-        update_fields["anvisa.numero"] = data.anvisa_numero
+        anvisa_patch["numero"] = data.anvisa_numero
     if data.anvisa_validade is not None:
-        update_fields["anvisa.validade"] = data.anvisa_validade
+        anvisa_patch["validade"] = data.anvisa_validade
 
-    if not update_fields:
+    if not scalar_fields and not anvisa_patch:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
-    update_fields["updated_at"] = _now_iso()
-
-    result = await db.skus.update_one(
-        {"id": sku_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    now = _now_iso()
+    scalar_fields["updated_at"] = now
+    fields = list(scalar_fields.keys())
+    params: list = [scalar_fields[k] for k in fields]
+    set_parts = [f"{k}=${i+1}" for i, k in enumerate(fields)]
+    if anvisa_patch:
+        params.append(json.dumps(anvisa_patch)); set_parts.append(f"anvisa = anvisa || ${len(params)}::jsonb")
+    params.extend([sku_id, user["tenant_id"]])
+    matched = await pg_db.fetch_val(
+        f"UPDATE skus SET {', '.join(set_parts)} WHERE id=${len(params)-1} AND tenant_id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
-
-    sku = await db.skus.find_one({"id": sku_id}, {"_id": 0})
-    return sku
+    return _row(await pg_db.fetch_one("SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]))
 
 
 @crm_router.post("/skus/{sku_id}/meta")
 async def update_sku_meta(sku_id: str, data: SKUMetaUpdate, request: Request):
     """Update manual Meta un/h and ajuste percentual (RN-SK-05)."""
     user = await _get_current_user(request)
-    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
 
     now = _now_iso()
-    updates = {}
+    patch: dict = {}
     if data.meta_unh is not None:
         if data.meta_unh < 0:
             raise HTTPException(status_code=422, detail="meta_unh não pode ser negativa")
-        updates["medias_producao.meta_unh"] = data.meta_unh
-        updates["medias_producao.meta_set_by"] = user["name"]
-        updates["medias_producao.meta_set_at"] = now
+        patch["meta_unh"] = data.meta_unh
+        patch["meta_set_by"] = user["name"]
+        patch["meta_set_at"] = now
     if data.ajuste_percentual is not None:
         if not (-100 <= data.ajuste_percentual <= 100):
             raise HTTPException(status_code=422, detail="ajuste_percentual deve estar entre -100 e +100")
-        updates["medias_producao.ajuste_percentual"] = data.ajuste_percentual
-    if not updates:
+        patch["ajuste_percentual"] = data.ajuste_percentual
+    if not patch:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
-    updates["updated_at"] = now
-    await db.skus.update_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"$set": updates})
-    return await db.skus.find_one({"id": sku_id}, {"_id": 0})
+    await pg_db.execute(
+        "UPDATE skus SET medias_producao = medias_producao || $1::jsonb, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        json.dumps(patch), now, sku_id, user["tenant_id"]
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]))
 
 
 @crm_router.post("/skus/{sku_id}/descontinuar")
 async def descontinuar_sku(sku_id: str, data: SKUDescontinuar, request: Request):
     """Mark SKU as discontinued with mandatory reason (RN-SK-03)."""
     user = await _get_current_user(request)
-    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
     if sku.get("status") == "descontinuado":
@@ -4187,24 +4540,22 @@ async def descontinuar_sku(sku_id: str, data: SKUDescontinuar, request: Request)
         raise HTTPException(status_code=422, detail="Motivo obrigatório para descontinuar (RN-SK-03)")
 
     now = _now_iso()
-    await db.skus.update_one(
-        {"id": sku_id, "tenant_id": user["tenant_id"]},
-        {"$set": {
-            "status": "descontinuado",
-            "descontinuado_motivo": data.motivo.strip(),
-            "descontinuado_em": now,
-            "descontinuado_por": user["name"],
-            "updated_at": now,
-        }}
+    await pg_db.execute(
+        """UPDATE skus SET status='descontinuado', descontinuado_motivo=$1,
+           descontinuado_em=$2, descontinuado_por=$3, updated_at=$4
+           WHERE id=$5 AND tenant_id=$6""",
+        data.motivo.strip(), now, user["name"], now, sku_id, user["tenant_id"]
     )
-    return await db.skus.find_one({"id": sku_id}, {"_id": 0})
+    return _row(await pg_db.fetch_one("SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]))
 
 
 @crm_router.get("/skus/{sku_id}/saldo")
 async def get_sku_saldo(sku_id: str, request: Request):
     """Return consolidated open balance (saldo aberto) view per order for a SKU."""
     user = await _get_current_user(request)
-    sku = await db.skus.find_one({"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
 
@@ -4273,9 +4624,9 @@ async def get_sku_saldo(sku_id: str, request: Request):
 async def add_order_to_sku(sku_id: str, data: OrderAdd, request: Request):
     """Add an order to SKU history and recalculate metrics"""
     user = await _get_current_user(request)
-    sku = await db.skus.find_one(
-        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
 
@@ -4305,20 +4656,14 @@ async def add_order_to_sku(sku_id: str, data: OrderAdd, request: Request):
         except Exception:
             freq = 0
 
-    await db.skus.update_one(
-        {"id": sku_id},
-        {
-            "$push": {"historico_pedidos": order},
-            "$set": {
-                "data_ultimo_pedido": data.data_pedido,
-                "frequencia_media_recompra_dias": round(freq),
-                "updated_at": now,
-            }
-        }
+    await pg_db.execute(
+        """UPDATE skus SET
+            historico_pedidos = historico_pedidos || jsonb_build_array($1::jsonb),
+            data_ultimo_pedido=$2, frequencia_media_recompra_dias=$3, updated_at=$4
+           WHERE id=$5 AND tenant_id=$6""",
+        json.dumps(order), data.data_pedido, round(freq), now, sku_id, user["tenant_id"]
     )
-
-    updated = await db.skus.find_one({"id": sku_id}, {"_id": 0})
-    return updated
+    return _row(await pg_db.fetch_one("SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]))
 
 
 # ======================================================================
@@ -4362,18 +4707,17 @@ async def list_pd_cards(
     """Listar cards do Pipeline P&D"""
     user = await _get_current_user(request)
     require_roles(user, PD_READ | COMERCIAL_FULL)
-    query = {"tenant_id": user["tenant_id"]}
-    
+    sql = "SELECT * FROM pd_cards WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if status:
-        query["status_pd"] = status
+        params.append(status); sql += f" AND status_pd=${len(params)}"
     if search:
-        query["$or"] = [
-            {"numero_completo": {"$regex": search, "$options": "i"}},
-            {"produto": {"$regex": search, "$options": "i"}},
-            {"cliente": {"$regex": search, "$options": "i"}},
-        ]
-    
-    cards = await db.pd_cards.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+        params.append(f"%{search}%"); n = len(params)
+        sql += (f" AND (extra->>'numero_completo' ILIKE ${n}"
+                f" OR extra->>'produto' ILIKE ${n}"
+                f" OR extra->>'cliente' ILIKE ${n})")
+    sql += " ORDER BY created_at DESC LIMIT 5000"
+    cards = _rows(await pg_db.fetch_all(sql, *params))
     return cards
 
 
@@ -4382,31 +4726,32 @@ async def get_pd_card(card_id: str, request: Request):
     """Obter detalhes de um card P&D"""
     user = await _get_current_user(request)
     require_roles(user, PD_READ | COMERCIAL_FULL)
-    card = await db.pd_cards.find_one(
-        {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    card = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"]
+    ))
     if not card:
         raise HTTPException(status_code=404, detail="Card não encontrado")
 
     # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
     if not card.get("pd_request_id"):
         try:
-            await _ensure_pd_request_for_card(card, user)
+            merged = {**card, **(card.get("extra") or {})}
+            await _ensure_pd_request_for_card(merged, user)
         except Exception as exc:  # pragma: no cover
             logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
 
     # Buscar amostra e variação relacionadas
     if card.get("amostra_id"):
-        sample = await db.crm_samples.find_one(
-            {"id": card["amostra_id"]}, {"_id": 0}
-        )
+        sample = _row(await pg_db.fetch_one(
+            "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+            card["amostra_id"], user["tenant_id"]
+        ))
         if sample:
             card["amostra_completa"] = sample
-            # Encontrar variação específica
             variacao = next((v for v in sample.get("variacoes", []) if v["id"] == card.get("amostra_variacao_id")), None)
             if variacao:
                 card["variacao"] = variacao
-    
+
     return card
 
 
@@ -4419,10 +4764,10 @@ async def sync_all_pd_cards_to_crm(request: Request):
     require_roles(user, {"admin", "lider_pd"})
 
     tenant_id = user["tenant_id"]
-    pd_cards = await db.pd_cards.find(
-        {"tenant_id": tenant_id, "amostra_variacao_id": {"$exists": True}},
-        {"_id": 0},
-    ).to_list(5000)
+    pd_cards = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_cards WHERE tenant_id=$1 AND amostra_variacao_id IS NOT NULL",
+        tenant_id
+    ))
 
     synced = 0
     errors = 0
@@ -4435,25 +4780,14 @@ async def sync_all_pd_cards_to_crm(request: Request):
                 status_pd,
                 (PD_TO_CRM_STATUS_MAP.get(status_pd), PD_STATUS_LABELS.get(status_pd, status_pd)),
             )
-            if not crm_status:
+            if not crm_status or not card.get("amostra_id") or not card.get("amostra_variacao_id"):
                 continue
-            result = await db.crm_samples.update_one(
-                {
-                    "id": card["amostra_id"],
-                    "tenant_id": tenant_id,
-                    "variacoes.id": card["amostra_variacao_id"],
-                },
-                {
-                    "$set": {
-                        "variacoes.$.status": crm_status,
-                        "variacoes.$.status_pd_label": crm_label,
-                        "variacoes.$.status_pd_raw": status_pd,
-                        "variacoes.$.ultima_atualizacao_pd": now,
-                    }
-                },
+            await _update_variacao_in_sample(
+                card["amostra_id"], tenant_id, card["amostra_variacao_id"],
+                {"status": crm_status, "status_pd_label": crm_label,
+                 "status_pd_raw": status_pd, "ultima_atualizacao_pd": now}
             )
-            if result.matched_count:
-                synced += 1
+            synced += 1
         except Exception as exc:
             logger.error(f"sync-all error card {card.get('id')}: {exc}")
             errors += 1
@@ -4477,12 +4811,12 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     user = await _get_current_user(request)
     require_roles(user, PD_WRITE | QA_APPROVERS)
     
-    card = await db.pd_cards.find_one(
-        {"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    card = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"]
+    ))
     if not card:
         raise HTTPException(status_code=404, detail="Card não encontrado")
-    
+
     old_status = card["status_pd"]
     new_status = data.status
     
@@ -4505,24 +4839,17 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     now = _now_iso()
     
     # Atualizar card P&D
-    await db.pd_cards.update_one(
-        {"id": card_id},
-        {
-            "$set": {
-                "status_pd": new_status,
-                "updated_at": now
-            },
-            "$push": {
-                "historico_movimentacoes": {
-                    "de": old_status,
-                    "para": new_status,
-                    "data": now,
-                    "usuario": user["name"],
-                    "usuario_id": user["id"],
-                    "observacao": data.observacao
-                }
-            }
-        }
+    hist_mv = {"de": old_status, "para": new_status, "data": now,
+               "usuario": user["name"], "usuario_id": user["id"], "observacao": data.observacao}
+    await pg_db.execute(
+        """UPDATE pd_cards SET status_pd=$1, updated_at=$2,
+           extra = jsonb_set(
+               extra,
+               '{historico_movimentacoes}',
+               COALESCE(extra->'historico_movimentacoes','[]'::jsonb) || jsonb_build_array($3::jsonb)
+           )
+           WHERE id=$4 AND tenant_id=$5""",
+        new_status, now, json.dumps(hist_mv), card_id, user["tenant_id"]
     )
 
     # ERP v3.0: trigger tasks (CQ approval, lab tests)
@@ -4555,61 +4882,36 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
         )
 
         if crm_status:
-            # Atualiza status, label rico e histórico
-            await db.crm_samples.update_one(
-                {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
-                {
-                    "$set": {
-                        "variacoes.$.status": crm_status,
-                        "variacoes.$.status_pd_label": crm_label,
-                        "variacoes.$.status_pd_raw": new_status,
-                        "variacoes.$.ultima_atualizacao_pd": now,
-                        "variacoes.$.updated_at": now,
-                    },
-                    "$push": {
-                        "variacoes.$.historico_status": {
-                            "de": "",
-                            "para": crm_status,
-                            "data": now,
-                            "usuario": user["name"],
-                            "usuario_id": user["id"],
-                            "sincronizado_pd": True,
-                            "status_pd": new_status,
-                            "label_pd": crm_label,
-                        }
-                    }
-                }
+            await _update_variacao_in_sample(
+                card["amostra_id"], user["tenant_id"], card["amostra_variacao_id"],
+                {"status": crm_status, "status_pd_label": crm_label,
+                 "status_pd_raw": new_status, "ultima_atualizacao_pd": now, "updated_at": now}
+            )
+            await _push_variacao_history(
+                card["amostra_id"], user["tenant_id"], card["amostra_variacao_id"],
+                {"de": "", "para": crm_status, "data": now, "usuario": user["name"],
+                 "usuario_id": user["id"], "sincronizado_pd": True,
+                 "status_pd": new_status, "label_pd": crm_label}
             )
             logger.info(f"Sincronizado P&D→CRM: Card {card_id} ({new_status}) → Variação {card['amostra_variacao_id']} ({crm_status} / {crm_label})")
         else:
-            # Apenas adiciona ao histórico sem mudar status (ex: em_testes sem mapeamento direto)
             crm_label_obs = PD_CARD_STATUS_TO_CRM_DISPLAY.get(new_status, (None, PD_STATUS_LABELS.get(new_status, new_status)))[1]
-            await db.crm_samples.update_one(
-                {"id": card["amostra_id"], "variacoes.id": card["amostra_variacao_id"]},
-                {
-                    "$set": {
-                        "variacoes.$.status_pd_label": crm_label_obs,
-                        "variacoes.$.status_pd_raw": new_status,
-                        "variacoes.$.ultima_atualizacao_pd": now,
-                        "variacoes.$.updated_at": now,
-                    },
-                    "$push": {
-                        "variacoes.$.historico_status": {
-                            "de": "",
-                            "para": "",
-                            "data": now,
-                            "usuario": user["name"],
-                            "usuario_id": user["id"],
-                            "sincronizado_pd": True,
-                            "status_pd": new_status,
-                            "observacao": f"P&D movido para: {crm_label_obs}",
-                        }
-                    }
-                }
+            await _update_variacao_in_sample(
+                card["amostra_id"], user["tenant_id"], card["amostra_variacao_id"],
+                {"status_pd_label": crm_label_obs, "status_pd_raw": new_status,
+                 "ultima_atualizacao_pd": now, "updated_at": now}
+            )
+            await _push_variacao_history(
+                card["amostra_id"], user["tenant_id"], card["amostra_variacao_id"],
+                {"de": "", "para": "", "data": now, "usuario": user["name"],
+                 "usuario_id": user["id"], "sincronizado_pd": True,
+                 "status_pd": new_status, "observacao": f"P&D movido para: {crm_label_obs}"}
             )
             logger.info(f"Histórico P&D→CRM: Card {card_id} ({new_status} / {crm_label_obs}) registrado na variação {card['amostra_variacao_id']}")
-    
-    updated = await db.pd_cards.find_one({"id": card_id}, {"_id": 0})
+
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"]
+    ))
     await _broadcast_pd_card_update(user["tenant_id"], updated, old_status, new_status)
 
     await audit_log(
@@ -4654,16 +4956,18 @@ async def update_pd_card(card_id: str, data: PDCardUpdate, request: Request):
     
     update_fields["updated_at"] = _now_iso()
     
-    result = await db.pd_cards.update_one(
-        {"id": card_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    now = _now_iso()
+    extra_patch = {k: v for k, v in update_fields.items()}
+    extra_patch["updated_at"] = now
+    matched = await pg_db.fetch_val(
+        "UPDATE pd_cards SET extra = extra || $1::jsonb, updated_at=$2 WHERE id=$3 AND tenant_id=$4 RETURNING id",
+        json.dumps(extra_patch), now, card_id, user["tenant_id"]
     )
-    
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Card não encontrado")
-    
-    card = await db.pd_cards.find_one({"id": card_id}, {"_id": 0})
-    return card
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"]
+    ))
 
 
 # ======================================================================
@@ -4683,18 +4987,25 @@ async def list_alerts(
     if tipo:
         query["tipo"] = tipo
 
-    alerts = await db.crm_alerts.find(query, {"_id": 0}).sort("data_criacao", -1).to_list(500)
+    sql = "SELECT * FROM crm_alerts WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
+    if status:
+        params.append(status); sql += f" AND status=${len(params)}"
+    if tipo:
+        params.append(tipo); sql += f" AND tipo=${len(params)}"
+    sql += " ORDER BY data_criacao DESC LIMIT 500"
+    alerts = _rows(await pg_db.fetch_all(sql, *params))
     return alerts
 
 
 @crm_router.put("/alerts/{alert_id}/read")
 async def mark_alert_read(alert_id: str, request: Request):
     user = await _get_current_user(request)
-    result = await db.crm_alerts.update_one(
-        {"id": alert_id, "tenant_id": user["tenant_id"]},
-        {"$set": {"status": "lido"}}
+    matched = await pg_db.fetch_val(
+        "UPDATE crm_alerts SET status='lido' WHERE id=$1 AND tenant_id=$2 RETURNING id",
+        alert_id, user["tenant_id"]
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Alerta não encontrado")
     return {"message": "Alerta marcado como lido"}
 
@@ -4703,16 +5014,12 @@ async def mark_alert_read(alert_id: str, request: Request):
 async def resolve_alert(alert_id: str, data: AlertResolve, request: Request):
     user = await _get_current_user(request)
     now = _now_iso()
-    result = await db.crm_alerts.update_one(
-        {"id": alert_id, "tenant_id": user["tenant_id"]},
-        {"$set": {
-            "status": "resolvido",
-            "resolved_at": now,
-            "resolved_by": user["id"],
-            "resolved_comment": data.comment,
-        }}
+    matched = await pg_db.fetch_val(
+        """UPDATE crm_alerts SET status='resolvido', resolved_at=$1, resolved_by=$2, resolved_comment=$3
+           WHERE id=$4 AND tenant_id=$5 RETURNING id""",
+        now, user["id"], data.comment, alert_id, user["tenant_id"]
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Alerta não encontrado")
     return {"message": "Alerta resolvido"}
 
@@ -4731,10 +5038,10 @@ async def schedule_follow_up(data: FollowUpSchedule, request: Request):
     user = await _get_current_user(request)
     
     # Validar que o cliente existe
-    client = await db.crm_clients.find_one(
-        {"id": data.client_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0, "nome_empresa": 1}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT nome_empresa FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        data.client_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     
@@ -4792,307 +5099,174 @@ async def check_alerts_for_tenant(tenant_id: str) -> int:
     created_count = 0
 
     try:
+        async def _alert_exists(tipo: str, ref: str) -> bool:
+            r = await pg_db.fetch_val(
+                "SELECT 1 FROM crm_alerts WHERE tenant_id=$1 AND tipo=$2 AND entidade_ref=$3 AND status!='resolvido'",
+                tenant_id, tipo, ref
+            )
+            return bool(r)
+
+        async def _insert_alert(tipo: str, ref: str, etipo: str, enome: str, msg: str, resp: str = "") -> None:
+            nonlocal created_count
+            await pg_db.execute(
+                """INSERT INTO crm_alerts (id, tenant_id, tipo, entidade_ref, entidade_tipo, entidade_nome,
+                   mensagem, data_criacao, status, responsavel) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pendente',$9)""",
+                _new_id(), tenant_id, tipo, ref, etipo, enome, msg, _now_iso(), resp
+            )
+            created_count += 1
+
         # ALERT_001: Sample in "enviada" > 7 days
-        samples_enviadas = await db.crm_samples.find(
-            {"tenant_id": tenant_id, "stage": "enviada"}, {"_id": 0}
-        ).to_list(1000)
+        samples_enviadas = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_samples WHERE tenant_id=$1 AND stage='enviada'", tenant_id
+        ))
         for s in samples_enviadas:
             updated = s.get("updated_at") or s.get("created_at", "")
             try:
-                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-                if (now - dt).days > 7:
-                    exists = await db.crm_alerts.find_one({
-                        "tenant_id": tenant_id, "tipo": "ALERT_001",
-                        "entidade_ref": s["id"], "status": {"$ne": "resolvido"}
-                    })
-                    if not exists:
-                        await db.crm_alerts.insert_one({
-                            "id": _new_id(), "tenant_id": tenant_id,
-                            "tipo": "ALERT_001",
-                            "entidade_ref": s["id"],
-                            "entidade_tipo": "sample",
-                            "entidade_nome": s.get("nome_amostra", ""),
-                            "mensagem": f"Amostra '{s.get('nome_amostra', '')}' está em 'Enviada' há mais de 7 dias sem movimentação.",
-                            "data_criacao": _now_iso(),
-                            "status": "pendente",
-                            "responsavel": s.get("responsavel_pd") or s.get("created_by", ""),
-                        })
-                        created_count += 1
+                dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                if (now - dt).days > 7 and not await _alert_exists("ALERT_001", s["id"]):
+                    await _insert_alert("ALERT_001", s["id"], "sample", s.get("nome_amostra", ""),
+                        f"Amostra '{s.get('nome_amostra', '')}' está em 'Enviada' há mais de 7 dias sem movimentação.",
+                        s.get("responsavel_pd") or s.get("created_by", ""))
             except Exception:
                 pass
 
         # ALERT_002: Client in "negociacao" > 30 days
-        clients_neg = await db.crm_clients.find(
-            {"tenant_id": tenant_id, "stage": "negociacao"}, {"_id": 0}
-        ).to_list(1000)
+        clients_neg = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_clients WHERE tenant_id=$1 AND stage='negociacao'", tenant_id
+        ))
         for c in clients_neg:
             updated = c.get("updated_at") or c.get("created_at", "")
             try:
-                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-                if (now - dt).days > 30:
-                    exists = await db.crm_alerts.find_one({
-                        "tenant_id": tenant_id, "tipo": "ALERT_002",
-                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
-                    })
-                    if not exists:
-                        await db.crm_alerts.insert_one({
-                            "id": _new_id(), "tenant_id": tenant_id,
-                            "tipo": "ALERT_002",
-                            "entidade_ref": c["id"],
-                            "entidade_tipo": "client",
-                            "entidade_nome": c.get("nome_empresa", ""),
-                            "mensagem": f"Cliente '{c.get('nome_empresa', '')}' está em 'Negociação' há mais de 30 dias.",
-                            "data_criacao": _now_iso(),
-                            "status": "pendente",
-                            "responsavel": c.get("created_by", ""),
-                        })
-                        created_count += 1
+                dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                if (now - dt).days > 30 and not await _alert_exists("ALERT_002", c["id"]):
+                    await _insert_alert("ALERT_002", c["id"], "client", c.get("nome_empresa", ""),
+                        f"Cliente '{c.get('nome_empresa', '')}' está em 'Negociação' há mais de 30 dias.",
+                        c.get("created_by", ""))
             except Exception:
                 pass
 
         # ALERT_003: Active SKU without order > 60 days
-        active_skus = await db.skus.find(
-            {"tenant_id": tenant_id, "status": "ativo"}, {"_id": 0}
-        ).to_list(1000)
-        clients_perdidos = await db.crm_clients.find(
-            {"tenant_id": tenant_id, "stage": "cliente_perdido"}, {"_id": 0}
-        ).to_list(1000)
+        active_skus = _rows(await pg_db.fetch_all(
+            "SELECT * FROM skus WHERE tenant_id=$1 AND status='ativo'", tenant_id
+        ))
+        clients_perdidos = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_clients WHERE tenant_id=$1 AND stage='cliente_perdido'", tenant_id
+        ))
         for c in clients_perdidos:
             ref_date = c.get("updated_at") or c.get("created_at", "")
             try:
                 dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
-                if (now - dt).days >= 90:
-                    exists = await db.crm_alerts.find_one({
-                        "tenant_id": tenant_id, "tipo": "ALERT_008",
-                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
-                    })
-                    if not exists:
-                        await db.crm_alerts.insert_one({
-                            "id": _new_id(), "tenant_id": tenant_id,
-                            "tipo": "ALERT_008",
-                            "entidade_ref": c["id"],
-                            "entidade_tipo": "client",
-                            "entidade_nome": c.get("nome_empresa", ""),
-                            "mensagem": f"Cliente perdido '{c.get('nome_empresa', '')}' pode ser reativado após 90 dias.",
-                            "data_criacao": _now_iso(),
-                            "status": "pendente",
-                            "responsavel": c.get("created_by", ""),
-                        })
-                        created_count += 1
+                if (now - dt).days >= 90 and not await _alert_exists("ALERT_008", c["id"]):
+                    await _insert_alert("ALERT_008", c["id"], "client", c.get("nome_empresa", ""),
+                        f"Cliente perdido '{c.get('nome_empresa', '')}' pode ser reativado após 90 dias.",
+                        c.get("created_by", ""))
             except Exception:
                 pass
 
         for sku in active_skus:
-            last_order = sku.get("data_ultimo_pedido")
-            ref_date = sku.get("created_at", "")
-            if last_order:
-                ref_date = last_order
+            ref_date = sku.get("data_ultimo_pedido") or sku.get("created_at", "")
             try:
                 dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
-                if (now - dt).days > 60:
-                    exists = await db.crm_alerts.find_one({
-                        "tenant_id": tenant_id, "tipo": "ALERT_003",
-                        "entidade_ref": sku["id"], "status": {"$ne": "resolvido"}
-                    })
-                    if not exists:
-                        await db.crm_alerts.insert_one({
-                            "id": _new_id(), "tenant_id": tenant_id,
-                            "tipo": "ALERT_003",
-                            "entidade_ref": sku["id"],
-                            "entidade_tipo": "sku",
-                            "entidade_nome": f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
-                            "mensagem": f"SKU '{sku.get('codigo_interno', '')}' ativo sem pedido registrado há mais de 60 dias.",
-                            "data_criacao": _now_iso(),
-                            "status": "pendente",
-                            "responsavel": "",
-                        })
-                        created_count += 1
+                if (now - dt).days > 60 and not await _alert_exists("ALERT_003", sku["id"]):
+                    await _insert_alert("ALERT_003", sku["id"], "sku",
+                        f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
+                        f"SKU '{sku.get('codigo_interno', '')}' ativo sem pedido registrado há mais de 60 dias.")
             except Exception:
                 pass
 
         # ALERT_004: Client in "cliente_fechado" without new project > 90 days
-        clients_fechado = await db.crm_clients.find(
-            {"tenant_id": tenant_id, "stage": "cliente_fechado"}, {"_id": 0}
-        ).to_list(1000)
+        clients_fechado = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_clients WHERE tenant_id=$1 AND stage='cliente_fechado'", tenant_id
+        ))
         for c in clients_fechado:
-            # Check last project creation date
-            last_proj = await db.crm_projects.find_one(
-                {"cliente_id": c["id"], "tenant_id": tenant_id},
-                sort=[("created_at", -1)]
-            )
-            ref_date = c.get("updated_at") or c.get("created_at", "")
-            if last_proj:
-                ref_date = last_proj.get("created_at", ref_date)
+            last_proj = _row(await pg_db.fetch_one(
+                "SELECT created_at FROM crm_projects WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1",
+                c["id"], tenant_id
+            ))
+            ref_date = (last_proj.get("created_at") if last_proj else None) or c.get("updated_at") or c.get("created_at", "")
             try:
                 dt = datetime.fromisoformat(str(ref_date).replace("Z", "+00:00"))
-                if (now - dt).days > 90:
-                    exists = await db.crm_alerts.find_one({
-                        "tenant_id": tenant_id, "tipo": "ALERT_004",
-                        "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
-                    })
-                    if not exists:
-                        await db.crm_alerts.insert_one({
-                            "id": _new_id(), "tenant_id": tenant_id,
-                            "tipo": "ALERT_004",
-                            "entidade_ref": c["id"],
-                            "entidade_tipo": "client",
-                            "entidade_nome": c.get("nome_empresa", ""),
-                            "mensagem": f"Cliente fechado '{c.get('nome_empresa', '')}' sem novo projeto há mais de 90 dias.",
-                            "data_criacao": _now_iso(),
-                            "status": "pendente",
-                            "responsavel": c.get("created_by", ""),
-                        })
-                        created_count += 1
+                if (now - dt).days > 90 and not await _alert_exists("ALERT_004", c["id"]):
+                    await _insert_alert("ALERT_004", c["id"], "client", c.get("nome_empresa", ""),
+                        f"Cliente fechado '{c.get('nome_empresa', '')}' sem novo projeto há mais de 90 dias.",
+                        c.get("created_by", ""))
             except Exception:
                 pass
 
         # ALERT_005: SKU ANVISA expiring in ≤ 60 days
         for sku in active_skus:
-            anvisa_val = sku.get("anvisa", {}).get("validade")
+            anvisa_val = (sku.get("anvisa") or {}).get("validade")
             if anvisa_val:
                 try:
                     dt = datetime.fromisoformat(str(anvisa_val).replace("Z", "+00:00"))
-                    if 0 <= (dt - now).days <= 60:
-                        exists = await db.crm_alerts.find_one({
-                            "tenant_id": tenant_id, "tipo": "ALERT_005",
-                            "entidade_ref": sku["id"], "status": {"$ne": "resolvido"}
-                        })
-                        if not exists:
-                            await db.crm_alerts.insert_one({
-                                "id": _new_id(), "tenant_id": tenant_id,
-                                "tipo": "ALERT_005",
-                                "entidade_ref": sku["id"],
-                                "entidade_tipo": "sku",
-                                "entidade_nome": f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
-                                "mensagem": f"ANVISA do SKU '{sku.get('codigo_interno', '')}' vence em {(dt - now).days} dias.",
-                                "data_criacao": _now_iso(),
-                                "status": "pendente",
-                                "responsavel": "",
-                            })
-                            created_count += 1
+                    if 0 <= (dt - now).days <= 60 and not await _alert_exists("ALERT_005", sku["id"]):
+                        await _insert_alert("ALERT_005", sku["id"], "sku",
+                            f"{sku.get('codigo_interno', '')} - {sku.get('nome_produto', '')}",
+                            f"ANVISA do SKU '{sku.get('codigo_interno', '')}' vence em {(dt - now).days} dias.")
                 except Exception:
                     pass
 
         # ALERT_006: previsao_segundo_pedido D-7
-        clients_with_previsao = await db.crm_clients.find(
-            {"tenant_id": tenant_id, "previsao_segundo_pedido": {"$ne": None}},
-            {"_id": 0}
-        ).to_list(1000)
+        clients_with_previsao = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_clients WHERE tenant_id=$1 AND previsao_segundo_pedido IS NOT NULL", tenant_id
+        ))
         for c in clients_with_previsao:
             previsao = c.get("previsao_segundo_pedido")
             if previsao:
                 try:
                     dt = datetime.fromisoformat(str(previsao).replace("Z", "+00:00"))
                     days_until = (dt - now).days
-                    if 0 <= days_until <= 7:
-                        exists = await db.crm_alerts.find_one({
-                            "tenant_id": tenant_id, "tipo": "ALERT_006",
-                            "entidade_ref": c["id"], "status": {"$ne": "resolvido"}
-                        })
-                        if not exists:
-                            await db.crm_alerts.insert_one({
-                                "id": _new_id(), "tenant_id": tenant_id,
-                                "tipo": "ALERT_006",
-                                "entidade_ref": c["id"],
-                                "entidade_tipo": "client",
-                                "entidade_nome": c.get("nome_empresa", ""),
-                                "mensagem": f"Previsão de segundo pedido de '{c.get('nome_empresa', '')}' em {days_until} dia(s).",
-                                "data_criacao": _now_iso(),
-                                "status": "pendente",
-                                "responsavel": c.get("created_by", ""),
-                            })
-                            created_count += 1
+                    if 0 <= days_until <= 7 and not await _alert_exists("ALERT_006", c["id"]):
+                        await _insert_alert("ALERT_006", c["id"], "client", c.get("nome_empresa", ""),
+                            f"Previsão de segundo pedido de '{c.get('nome_empresa', '')}' em {days_until} dia(s).",
+                            c.get("created_by", ""))
                 except Exception:
                     pass
 
         # ALERT_007: Variação em "solicitada" sem P&D aceitar > 2 dias úteis
-        samples_with_variacoes = await db.crm_samples.find(
-            {"tenant_id": tenant_id, "variacoes": {"$exists": True, "$ne": []}},
-            {"_id": 0}
-        ).to_list(1000)
-        
+        samples_with_variacoes = _rows(await pg_db.fetch_all(
+            "SELECT * FROM crm_samples WHERE tenant_id=$1 AND jsonb_array_length(variacoes) > 0", tenant_id
+        ))
         for sample in samples_with_variacoes:
             for variacao in sample.get("variacoes", []):
                 if variacao.get("status") == "solicitada":
-                    # Verificar se tem card P&D associado
-                    pd_card = await db.pd_cards.find_one({
-                        "amostra_variacao_id": variacao["id"],
-                        "status_pd": "solicitado"
-                    })
-                    
+                    pd_card = _row(await pg_db.fetch_one(
+                        "SELECT id, created_at FROM pd_cards WHERE amostra_variacao_id=$1 AND status_pd='solicitado' AND tenant_id=$2",
+                        variacao["id"], tenant_id
+                    ))
                     if pd_card:
                         created = pd_card.get("created_at", "")
                         try:
-                            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                            # Calcular dias úteis (aproximação simples: dias corridos * 0.7)
+                            dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                             days_elapsed = (now - dt).days
-                            if days_elapsed > 2:
-                                exists = await db.crm_alerts.find_one({
-                                    "tenant_id": tenant_id,
-                                    "tipo": "ALERT_007",
-                                    "entidade_ref": variacao["id"],
-                                    "status": {"$ne": "resolvido"}
-                                })
-                                if not exists:
-                                    await db.crm_alerts.insert_one({
-                                        "id": _new_id(),
-                                        "tenant_id": tenant_id,
-                                        "tipo": "ALERT_007",
-                                        "entidade_ref": variacao["id"],
-                                        "entidade_tipo": "variacao",
-                                        "entidade_nome": f"{sample.get('nome_produto', '')} - {variacao.get('codigo', '')}",
-                                        "mensagem": f"Variação '{variacao.get('codigo', '')}' está em 'Solicitada' há {days_elapsed} dias sem aceite do P&D.",
-                                        "data_criacao": _now_iso(),
-                                        "status": "pendente",
-                                        "responsavel": sample.get("responsavel_pd", ""),
-                                    })
-                                    created_count += 1
+                            if days_elapsed > 2 and not await _alert_exists("ALERT_007", variacao["id"]):
+                                await _insert_alert("ALERT_007", variacao["id"], "variacao",
+                                    f"{sample.get('nome_produto', '')} - {variacao.get('codigo', '')}",
+                                    f"Variação '{variacao.get('codigo', '')}' está em 'Solicitada' há {days_elapsed} dias sem aceite do P&D.",
+                                    sample.get("responsavel_pd", ""))
                         except Exception:
                             pass
 
-        # RN-FU-01: Follow-up automático por etapa (alerta quando cliente sem interação por X dias)
-        # Prazo configurável: Prospecção 3d / Qualificado 5d / Projeto em Discussão 7d / Negociação 5d
+        # RN-FU-01: Follow-up automático por etapa
         for stage, prazo_dias in FOLLOW_UP_PRAZOS.items():
             if stage in ["cliente_fechado", "cliente_perdido"]:
-                continue  # Não gera follow-up para etapas finais
-            
-            clients_in_stage = await db.crm_clients.find(
-                {"tenant_id": tenant_id, "stage": stage}, {"_id": 0}
-            ).to_list(1000)
-            
+                continue
+            clients_in_stage = _rows(await pg_db.fetch_all(
+                "SELECT * FROM crm_clients WHERE tenant_id=$1 AND stage=$2", tenant_id, stage
+            ))
             for c in clients_in_stage:
-                # Usar a data da última interação (updated_at ou última movimentação)
                 last_interaction = c.get("updated_at") or c.get("created_at", "")
                 historico = c.get("historico_movimentacoes", [])
                 if historico:
                     last_interaction = historico[-1].get("data", last_interaction)
-                
                 try:
                     dt = datetime.fromisoformat(str(last_interaction).replace("Z", "+00:00"))
                     days_without_interaction = (now - dt).days
-                    
-                    if days_without_interaction > prazo_dias:
-                        exists = await db.crm_alerts.find_one({
-                            "tenant_id": tenant_id,
-                            "tipo": "FOLLOW_UP",
-                            "entidade_ref": c["id"],
-                            "status": {"$ne": "resolvido"}
-                        })
-                        if not exists:
-                            stage_label = STAGE_LABELS.get(stage, stage)
-                            await db.crm_alerts.insert_one({
-                                "id": _new_id(),
-                                "tenant_id": tenant_id,
-                                "tipo": "FOLLOW_UP",
-                                "entidade_ref": c["id"],
-                                "entidade_tipo": "client",
-                                "entidade_nome": c.get("nome_empresa", ""),
-                                "mensagem": f"Cliente '{c.get('nome_empresa', '')}' está em '{stage_label}' há {days_without_interaction} dias sem interação (prazo: {prazo_dias} dias).",
-                                "data_criacao": _now_iso(),
-                                "status": "pendente",
-                                "responsavel": c.get("responsavel_comercial") or c.get("created_by", ""),
-                            })
-                            created_count += 1
+                    if days_without_interaction > prazo_dias and not await _alert_exists("FOLLOW_UP", c["id"]):
+                        stage_label = STAGE_LABELS.get(stage, stage)
+                        await _insert_alert("FOLLOW_UP", c["id"], "client", c.get("nome_empresa", ""),
+                            f"Cliente '{c.get('nome_empresa', '')}' está em '{stage_label}' há {days_without_interaction} dias sem interação (prazo: {prazo_dias} dias).",
+                            c.get("responsavel_comercial") or c.get("created_by", ""))
                 except Exception:
                     pass
 
@@ -5131,7 +5305,9 @@ async def crm_dashboard(request: Request):
     # Funnel: count per stage
     funnel = []
     for stage in CLIENT_STAGES:
-        count = await db.crm_clients.count_documents({"tenant_id": tid, "stage": stage})
+        count = await pg_db.fetch_val(
+            "SELECT COUNT(*) FROM crm_clients WHERE tenant_id=$1 AND stage=$2", tid, stage
+        ) or 0
         funnel.append({"stage": stage, "label": STAGE_LABELS.get(stage, stage), "count": count})
 
     # Conversion rates
@@ -5140,23 +5316,28 @@ async def crm_dashboard(request: Request):
         s["percentage"] = round((s["count"] / total_clients * 100), 1) if total_clients > 0 else 0
 
     # Metrics
-    active_clients = await db.crm_clients.count_documents({
-        "tenant_id": tid,
-        "stage": {"$nin": ["cliente_perdido"]}
-    })
-    samples_in_progress = await db.crm_samples.count_documents({
-        "tenant_id": tid,
-        "stage": {"$in": ["solicitada", "em_elaboracao", "retrabalho", "enviada"]}
-    })
-    active_skus = await db.skus.count_documents({"tenant_id": tid, "status": "ativo"})
-    pending_alerts = await db.crm_alerts.count_documents({"tenant_id": tid, "status": "pendente"})
-    total_projects = await db.crm_projects.count_documents({"tenant_id": tid})
+    active_clients = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM crm_clients WHERE tenant_id=$1 AND stage != 'cliente_perdido'", tid
+    ) or 0
+    samples_in_progress = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM crm_samples WHERE tenant_id=$1 AND stage = ANY($2::text[])",
+        tid, ["solicitada", "em_elaboracao", "retrabalho", "enviada"]
+    ) or 0
+    active_skus = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM skus WHERE tenant_id=$1 AND status='ativo'", tid
+    ) or 0
+    pending_alerts = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM crm_alerts WHERE tenant_id=$1 AND status='pendente'", tid
+    ) or 0
+    total_projects = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM crm_projects WHERE tenant_id=$1", tid
+    ) or 0
 
     # Today's alerts
-    today_alerts = await db.crm_alerts.find(
-        {"tenant_id": tid, "status": "pendente"},
-        {"_id": 0}
-    ).sort("data_criacao", -1).to_list(20)
+    today_alerts = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_alerts WHERE tenant_id=$1 AND status='pendente' ORDER BY data_criacao DESC LIMIT 20",
+        tid
+    ))
 
     return {
         "funnel": funnel,
@@ -5175,16 +5356,16 @@ async def crm_dashboard(request: Request):
 @crm_router.get("/reports/client/{client_id}")
 async def client_report(client_id: str, request: Request):
     user = await _get_current_user(request)
-    client = await db.crm_clients.find_one(
-        {"id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2", client_id, user["tenant_id"]
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
 
     # SKUs linked to this client
-    skus = await db.skus.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).to_list(500)
+    skus = _rows(await pg_db.fetch_all(
+        "SELECT * FROM skus WHERE cliente_id=$1 AND tenant_id=$2", client_id, user["tenant_id"]
+    ))
 
     # Aggregate orders across all SKUs
     all_orders = []
@@ -5213,14 +5394,16 @@ async def client_report(client_id: str, request: Request):
     avg_freq = sum(freqs) / len(freqs) if freqs else 0
 
     # Projects
-    projects = await db.crm_projects.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    projects = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_projects WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        client_id, user["tenant_id"]
+    ))
 
     # Samples
-    samples = await db.crm_samples.find(
-        {"cliente_id": client_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    samples = _rows(await pg_db.fetch_all(
+        "SELECT * FROM crm_samples WHERE cliente_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        client_id, user["tenant_id"]
+    ))
 
     return {
         "client": client,
@@ -5244,9 +5427,9 @@ async def client_report(client_id: str, request: Request):
 @crm_router.get("/reports/sku/{sku_id}")
 async def sku_report(sku_id: str, request: Request):
     user = await _get_current_user(request)
-    sku = await db.skus.find_one(
-        {"id": sku_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    sku = _row(await pg_db.fetch_one(
+        "SELECT * FROM skus WHERE id=$1 AND tenant_id=$2", sku_id, user["tenant_id"]
+    ))
     if not sku:
         raise HTTPException(status_code=404, detail="SKU não encontrado")
 
@@ -5261,21 +5444,17 @@ async def sku_report(sku_id: str, request: Request):
         last_production = sorted_orders[0].get("data_pedido")
 
     # Find all clients that have this SKU (via amostras_aprovadas or skus_confirmados)
-    clients_with_sku = await db.crm_clients.find(
-        {
-            "tenant_id": user["tenant_id"],
-            "$or": [
-                {"amostras_aprovadas": sku_id},
-                {"skus_confirmados": sku_id},
-            ]
-        },
-        {"_id": 0, "id": 1, "nome_empresa": 1}
-    ).to_list(100)
+    clients_with_sku = _rows(await pg_db.fetch_all(
+        """SELECT id, nome_empresa FROM crm_clients WHERE tenant_id=$1
+           AND (amostras_aprovadas @> $2::jsonb OR skus_confirmados @> $2::jsonb)""",
+        user["tenant_id"], json.dumps([sku_id])
+    ))
 
     # Also check via the direct cliente_id
-    main_client = await db.crm_clients.find_one(
-        {"id": sku["cliente_id"]}, {"_id": 0, "id": 1, "nome_empresa": 1}
-    )
+    main_client = _row(await pg_db.fetch_one(
+        "SELECT id, nome_empresa FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        sku["cliente_id"], user["tenant_id"]
+    ))
 
     all_client_ids = set(c["id"] for c in clients_with_sku)
     if main_client and main_client["id"] not in all_client_ids:
@@ -5370,24 +5549,23 @@ class CRMFieldUpdate(BaseModel):
 
 async def _ensure_crm_config(tenant_id: str, crm_type: str):
     """Seed default CRM config if not exists"""
-    existing = await db.crm_column_configs.find_one({"tenant_id": tenant_id, "crm_type": crm_type})
+    existing = await pg_db.fetch_val(
+        "SELECT 1 FROM crm_column_configs WHERE tenant_id=$1 AND crm_type=$2 LIMIT 1",
+        tenant_id, crm_type
+    )
     if existing:
         return
 
     defaults = DEFAULT_CRM_COLUMNS.get(crm_type, [])
     for col_def in defaults:
         col_id = _new_id()
-        await db.crm_column_configs.insert_one({
-            "id": col_id,
-            "tenant_id": tenant_id,
-            "crm_type": crm_type,
-            "key": col_def["key"],
-            "label": col_def["label"],
-            "color": col_def["color"],
-            "order": col_def["order"],
-            "is_system": col_def.get("is_system", False),
-            "created_at": _now_iso(),
-        })
+        await pg_db.execute(
+            """INSERT INTO crm_column_configs (id, tenant_id, crm_type, key, label, color, "order", is_system, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+            col_id, tenant_id, crm_type,
+            col_def["key"], col_def["label"], col_def["color"], col_def["order"],
+            col_def.get("is_system", False), _now_iso()
+        )
     logger.info(f"Seeded CRM config for {crm_type} tenant {tenant_id}")
 
 
@@ -5409,11 +5587,10 @@ class LeadSourceUpdate(BaseModel):
 
 async def _get_valid_lead_sources(tenant_id: str) -> list:
     """Returns valid valor slugs: hardcoded defaults plus any DB-added sources."""
-    sources = await db.lead_sources.find(
-        {"tenant_id": tenant_id, "ativo": True}, {"_id": 0, "valor": 1}
-    ).to_list(200)
-    # DB entries EXTEND the hardcoded list — never replace it.
-    # This ensures existing clients don't break if someone adds a custom channel.
+    sources = _rows(await pg_db.fetch_all(
+        "SELECT valor FROM lead_sources WHERE tenant_id=$1 AND ativo=TRUE",
+        tenant_id
+    ))
     combined = list(CANAL_ORIGEM_OPTIONS)
     for s in sources:
         if s["valor"] not in combined:
@@ -5424,11 +5601,11 @@ async def _get_valid_lead_sources(tenant_id: str) -> list:
 @crm_router.get("/config/lead-sources")
 async def list_lead_sources(request: Request):
     user = await _get_current_user(request)
-    sources = await db.lead_sources.find(
-        {"tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("grupo", 1).to_list(200)
+    sources = _rows(await pg_db.fetch_all(
+        "SELECT id, tenant_id, valor, nome, grupo, ativo FROM lead_sources WHERE tenant_id=$1 ORDER BY grupo",
+        user["tenant_id"]
+    ))
     if not sources:
-        # Bootstrap from hardcoded list on first access
         return [
             {"id": v, "valor": v, "nome": v.replace("_", " ").title(), "grupo": _slug_to_group(v), "ativo": True}
             for v in CANAL_ORIGEM_OPTIONS
@@ -5447,49 +5624,57 @@ def _slug_to_group(valor: str) -> str:
 async def create_lead_source(body: LeadSourceCreate, request: Request):
     user = await _get_current_user(request)
     require_roles(user, ADMIN_ONLY)
-    existing = await db.lead_sources.find_one({"tenant_id": user["tenant_id"], "valor": body.valor})
+    existing = await pg_db.fetch_val(
+        "SELECT 1 FROM lead_sources WHERE tenant_id=$1 AND valor=$2",
+        user["tenant_id"], body.valor
+    )
     if existing:
         raise HTTPException(status_code=409, detail="Já existe uma fonte com esse valor/slug")
-    doc = {
-        "id": body.valor,
-        "valor": body.valor,
-        "nome": body.nome.strip(),
-        "grupo": body.grupo.strip(),
-        "ativo": body.ativo,
-        "tenant_id": user["tenant_id"],
-        "created_at": _now_iso(),
+    await pg_db.execute(
+        "INSERT INTO lead_sources (id, tenant_id, valor, nome, grupo, ativo, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        body.valor, user["tenant_id"], body.valor, body.nome.strip(), body.grupo.strip(), body.ativo, _now_iso()
+    )
+    return {
+        "id": body.valor, "valor": body.valor, "nome": body.nome.strip(),
+        "grupo": body.grupo.strip(), "ativo": body.ativo,
+        "tenant_id": user["tenant_id"], "created_at": _now_iso(),
     }
-    await db.lead_sources.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
 
 
 @crm_router.patch("/config/lead-sources/{source_id}")
 async def update_lead_source(source_id: str, body: LeadSourceUpdate, request: Request):
     user = await _get_current_user(request)
     require_roles(user, ADMIN_ONLY)
-    source = await db.lead_sources.find_one({"tenant_id": user["tenant_id"], "id": source_id})
+    source = _row(await pg_db.fetch_one(
+        "SELECT id, ativo FROM lead_sources WHERE tenant_id=$1 AND id=$2",
+        user["tenant_id"], source_id
+    ))
     if not source:
         raise HTTPException(status_code=404, detail="Fonte não encontrada")
-    # Cannot deactivate if any client still uses this canal_origem
     if body.ativo is False and source.get("ativo", True):
-        in_use = await db.crm_clients.find_one(
-            {"tenant_id": user["tenant_id"], "canal_origem": source_id}
+        in_use = await pg_db.fetch_val(
+            "SELECT 1 FROM crm_clients WHERE tenant_id=$1 AND canal_origem=$2 LIMIT 1",
+            user["tenant_id"], source_id
         )
         if in_use:
             raise HTTPException(
                 status_code=409,
                 detail="Não é possível desativar: há clientes usando este canal de origem"
             )
-    update: dict = {}
+    params: list = []
+    set_parts: list[str] = []
     if body.nome is not None:
-        update["nome"] = body.nome.strip()
+        params.append(body.nome.strip()); set_parts.append(f"nome=${len(params)}")
     if body.ativo is not None:
-        update["ativo"] = body.ativo
+        params.append(body.ativo); set_parts.append(f"ativo=${len(params)}")
     if body.grupo is not None:
-        update["grupo"] = body.grupo.strip()
-    if update:
-        await db.lead_sources.update_one({"tenant_id": user["tenant_id"], "id": source_id}, {"$set": update})
+        params.append(body.grupo.strip()); set_parts.append(f"grupo=${len(params)}")
+    if set_parts:
+        params.extend([user["tenant_id"], source_id])
+        await pg_db.execute(
+            f"UPDATE lead_sources SET {', '.join(set_parts)} WHERE tenant_id=${len(params)-1} AND id=${len(params)}",
+            *params
+        )
     return {"ok": True}
 
 
@@ -5501,10 +5686,10 @@ async def update_lead_source(source_id: str, body: LeadSourceUpdate, request: Re
 async def get_crm_constants(request: Request):
     """Retorna todas as constantes do PRD para o frontend"""
     user = await _get_current_user(request)
-    # Use DB lead sources when available, else fallback to hardcoded
-    db_sources = await db.lead_sources.find(
-        {"tenant_id": user["tenant_id"], "ativo": True}, {"_id": 0}
-    ).sort("grupo", 1).to_list(200)
+    db_sources = _rows(await pg_db.fetch_all(
+        "SELECT valor, grupo FROM lead_sources WHERE tenant_id=$1 AND ativo=TRUE ORDER BY grupo",
+        user["tenant_id"]
+    ))
     if db_sources:
         canal_origem_list = [s["valor"] for s in db_sources]
         canal_origem_groups: dict = {}
@@ -5552,17 +5737,22 @@ async def get_crm_columns(crm_type: str, request: Request):
 
     await _ensure_crm_config(user["tenant_id"], crm_type)
 
-    columns = await db.crm_column_configs.find(
-        {"tenant_id": user["tenant_id"], "crm_type": crm_type}, {"_id": 0}
-    ).sort("order", 1).to_list(100)
+    columns = _rows(await pg_db.fetch_all(
+        """SELECT id, tenant_id, crm_type, key, label, color, "order", is_system
+           FROM crm_column_configs WHERE tenant_id=$1 AND crm_type=$2 ORDER BY "order" """,
+        user["tenant_id"], crm_type
+    ))
 
-    # Load fields for each column
     col_ids = [c["id"] for c in columns]
-    fields = await db.crm_field_configs.find(
-        {"column_id": {"$in": col_ids}, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("order", 1).to_list(500)
+    fields: list = []
+    if col_ids:
+        fields = _rows(await pg_db.fetch_all(
+            """SELECT id, tenant_id, column_id, label, type, required, "order", options
+               FROM crm_field_configs WHERE column_id = ANY($1::text[]) AND tenant_id=$2 ORDER BY "order" """,
+            col_ids, user["tenant_id"]
+        ))
 
-    fields_by_col = {}
+    fields_by_col: dict = {}
     for f in fields:
         fields_by_col.setdefault(f["column_id"], []).append(f)
 
@@ -5580,33 +5770,25 @@ async def create_crm_column(data: CRMColumnCreate, request: Request):
 
     await _ensure_crm_config(user["tenant_id"], data.crm_type)
 
-    # Get next order
-    max_order_docs = await db.crm_column_configs.find(
-        {"tenant_id": user["tenant_id"], "crm_type": data.crm_type}
-    ).sort("order", -1).to_list(1)
-    next_order = (max_order_docs[0]["order"] + 1) if max_order_docs else 0
+    next_order = await pg_db.fetch_val(
+        """SELECT COALESCE(MAX("order") + 1, 0) FROM crm_column_configs WHERE tenant_id=$1 AND crm_type=$2""",
+        user["tenant_id"], data.crm_type
+    ) or 0
 
     col_id = _new_id()
     key = data.label.lower().replace(" ", "_").replace("/", "_")
-    col = {
-        "id": col_id,
-        "tenant_id": user["tenant_id"],
-        "crm_type": data.crm_type,
-        "key": key,
-        "label": data.label,
-        "color": data.color,
-        "order": next_order,
-        "is_system": False,
-        "created_at": _now_iso(),
-    }
-    await db.crm_column_configs.insert_one(col)
-    col.pop("_id", None)
-    col["fields"] = []
-
-    # Add key to allowed stages and transitions
+    await pg_db.execute(
+        """INSERT INTO crm_column_configs (id, tenant_id, crm_type, key, label, color, "order", is_system, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+        col_id, user["tenant_id"], data.crm_type, key, data.label, data.color, next_order, False, _now_iso()
+    )
     _update_stage_config(data.crm_type, key)
 
-    return col
+    return {
+        "id": col_id, "tenant_id": user["tenant_id"], "crm_type": data.crm_type,
+        "key": key, "label": data.label, "color": data.color, "order": next_order,
+        "is_system": False, "created_at": _now_iso(), "fields": []
+    }
 
 
 @crm_router.put("/config/columns/{column_id}")
@@ -5616,40 +5798,49 @@ async def update_crm_column(column_id: str, data: CRMColumnUpdate, request: Requ
     if not updates:
         raise HTTPException(status_code=400, detail="Nada para atualizar")
 
-    result = await db.crm_column_configs.update_one(
-        {"id": column_id, "tenant_id": user["tenant_id"]},
-        {"$set": updates}
+    params: list = []
+    set_parts: list[str] = []
+    for k, v in updates.items():
+        pg_col = '"order"' if k == "order" else k
+        params.append(v); set_parts.append(f"{pg_col}=${len(params)}")
+    params.extend([user["tenant_id"], column_id])
+    matched = await pg_db.fetch_val(
+        f"UPDATE crm_column_configs SET {', '.join(set_parts)} WHERE tenant_id=${len(params)-1} AND id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Coluna não encontrada")
-    updated = await db.crm_column_configs.find_one({"id": column_id}, {"_id": 0})
-    return updated
+    return _row(await pg_db.fetch_one(
+        """SELECT id, tenant_id, crm_type, key, label, color, "order", is_system FROM crm_column_configs WHERE id=$1""",
+        column_id
+    ))
 
 
 @crm_router.delete("/config/columns/{column_id}")
 async def delete_crm_column(column_id: str, request: Request):
     user = await _get_current_user(request)
-    col = await db.crm_column_configs.find_one(
-        {"id": column_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    col = _row(await pg_db.fetch_one(
+        """SELECT id, crm_type, key, is_system FROM crm_column_configs WHERE id=$1 AND tenant_id=$2""",
+        column_id, user["tenant_id"]
+    ))
     if not col:
         raise HTTPException(status_code=404, detail="Coluna não encontrada")
 
     if col.get("is_system"):
         raise HTTPException(status_code=400, detail="Não é possível excluir coluna do sistema")
 
-    # Check for items in this column
-    crm_type = col["crm_type"]
-    collection_map = {"clients": "crm_clients", "projects": "crm_projects", "samples": "crm_samples"}
-    coll_name = collection_map.get(crm_type)
-    if coll_name:
-        coll = db[coll_name]
-        count = await coll.count_documents({"stage": col["key"], "tenant_id": user["tenant_id"]})
-        if count > 0:
+    table_map = {"clients": "crm_clients", "projects": "crm_projects", "samples": "crm_samples"}
+    tbl = table_map.get(col["crm_type"])
+    if tbl:
+        count = await pg_db.fetch_val(
+            f"SELECT COUNT(*) FROM {tbl} WHERE tenant_id=$1 AND stage=$2",
+            user["tenant_id"], col["key"]
+        )
+        if count:
             raise HTTPException(status_code=400, detail=f"Não é possível excluir: {count} item(ns) nesta coluna")
 
-    await db.crm_field_configs.delete_many({"column_id": column_id})
-    await db.crm_column_configs.delete_one({"id": column_id})
+    await pg_db.execute("DELETE FROM crm_field_configs WHERE column_id=$1", column_id)
+    await pg_db.execute("DELETE FROM crm_column_configs WHERE id=$1 AND tenant_id=$2", column_id, user["tenant_id"])
     return {"message": "Coluna removida"}
 
 
@@ -5657,9 +5848,9 @@ async def delete_crm_column(column_id: str, request: Request):
 async def reorder_crm_columns(data: CRMColumnReorder, request: Request):
     user = await _get_current_user(request)
     for i, cid in enumerate(data.column_ids):
-        await db.crm_column_configs.update_one(
-            {"id": cid, "tenant_id": user["tenant_id"]},
-            {"$set": {"order": i}}
+        await pg_db.execute(
+            """UPDATE crm_column_configs SET "order"=$1 WHERE id=$2 AND tenant_id=$3""",
+            i, cid, user["tenant_id"]
         )
     return {"message": "Colunas reordenadas"}
 
@@ -5667,33 +5858,33 @@ async def reorder_crm_columns(data: CRMColumnReorder, request: Request):
 @crm_router.post("/config/fields")
 async def create_crm_field(data: CRMFieldCreate, request: Request):
     user = await _get_current_user(request)
-    col = await db.crm_column_configs.find_one({"id": data.column_id, "tenant_id": user["tenant_id"]})
-    if not col:
+    col_exists = await pg_db.fetch_val(
+        "SELECT 1 FROM crm_column_configs WHERE id=$1 AND tenant_id=$2",
+        data.column_id, user["tenant_id"]
+    )
+    if not col_exists:
         raise HTTPException(status_code=404, detail="Coluna não encontrada")
 
     if data.type not in FIELD_TYPES:
         raise HTTPException(status_code=400, detail=f"Tipo de campo inválido: {data.type}")
 
-    max_order_docs = await db.crm_field_configs.find(
-        {"column_id": data.column_id}
-    ).sort("order", -1).to_list(1)
-    next_order = (max_order_docs[0]["order"] + 1) if max_order_docs else 0
+    next_order = await pg_db.fetch_val(
+        """SELECT COALESCE(MAX("order") + 1, 0) FROM crm_field_configs WHERE column_id=$1""",
+        data.column_id
+    ) or 0
 
     field_id = _new_id()
-    field = {
-        "id": field_id,
-        "tenant_id": user["tenant_id"],
-        "column_id": data.column_id,
-        "label": data.label,
-        "type": data.type,
-        "required": data.required,
-        "options": data.options,
-        "order": next_order,
-        "created_at": _now_iso(),
+    await pg_db.execute(
+        """INSERT INTO crm_field_configs (id, tenant_id, column_id, label, type, required, options, "order", created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+        field_id, user["tenant_id"], data.column_id, data.label, data.type,
+        data.required, data.options, next_order, _now_iso()
+    )
+    return {
+        "id": field_id, "tenant_id": user["tenant_id"], "column_id": data.column_id,
+        "label": data.label, "type": data.type, "required": data.required,
+        "options": data.options, "order": next_order, "created_at": _now_iso(),
     }
-    await db.crm_field_configs.insert_one(field)
-    field.pop("_id", None)
-    return field
 
 
 @crm_router.put("/config/fields/{field_id}")
@@ -5703,20 +5894,32 @@ async def update_crm_field(field_id: str, data: CRMFieldUpdate, request: Request
     if not updates:
         raise HTTPException(status_code=400, detail="Nada para atualizar")
 
-    result = await db.crm_field_configs.update_one(
-        {"id": field_id, "tenant_id": user["tenant_id"]},
-        {"$set": updates}
+    params: list = []
+    set_parts: list[str] = []
+    for k, v in updates.items():
+        pg_col = '"order"' if k == "order" else k
+        params.append(v); set_parts.append(f"{pg_col}=${len(params)}")
+    params.extend([user["tenant_id"], field_id])
+    matched = await pg_db.fetch_val(
+        f"UPDATE crm_field_configs SET {', '.join(set_parts)} WHERE tenant_id=${len(params)-1} AND id=${len(params)} RETURNING id",
+        *params
     )
-    if result.matched_count == 0:
+    if not matched:
         raise HTTPException(status_code=404, detail="Campo não encontrado")
-    return await db.crm_field_configs.find_one({"id": field_id}, {"_id": 0})
+    return _row(await pg_db.fetch_one(
+        """SELECT id, tenant_id, column_id, label, type, required, "order", options FROM crm_field_configs WHERE id=$1""",
+        field_id
+    ))
 
 
 @crm_router.delete("/config/fields/{field_id}")
 async def delete_crm_field(field_id: str, request: Request):
     user = await _get_current_user(request)
-    result = await db.crm_field_configs.delete_one({"id": field_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_val(
+        "DELETE FROM crm_field_configs WHERE id=$1 AND tenant_id=$2 RETURNING id",
+        field_id, user["tenant_id"]
+    )
+    if not deleted:
         raise HTTPException(status_code=404, detail="Campo não encontrado")
     return {"message": "Campo removido"}
 

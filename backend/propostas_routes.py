@@ -1,7 +1,7 @@
 """
 propostas_routes.py — R14: Proposta Comercial & Pedido de Fabricação
 
-Coleção: db.propostas_comerciais  (uma por projeto, upsert)
+Coleção: propostas_comerciais  (uma por projeto, upsert)
 Endpoints:
   GET    /crm/projects/{id}/proposta
   POST   /crm/projects/{id}/proposta          (criar / atualizar inteiro)
@@ -9,26 +9,36 @@ Endpoints:
   GET    /crm/projects/{id}/amostras-status   (R18: validação antes de confirmar pedido)
 """
 
+import json
+import math
+import os
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
-import math
-import os
+import database as pg_db
 
 propostas_router = APIRouter(prefix="/api/crm/projects", tags=["propostas"])
 
-db = None
 _get_current_user = None
 _new_id = None
 _now_iso = None
 
 
 def init_propostas(database, get_current_user_fn, new_id_fn, now_iso_fn):
-    global db, _get_current_user, _new_id, _now_iso
-    db = database
+    global _get_current_user, _new_id, _now_iso
     _get_current_user = get_current_user_fn
     _new_id = new_id_fn
     _now_iso = now_iso_fn
+
+
+def _row(r):
+    if r is None:
+        return None
+    d = dict(r)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
+    return d
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -45,22 +55,19 @@ class PedidoItem(BaseModel):
     prazo_entrega: str = ""
     qtd: Optional[float] = None
     valor_unitario: Optional[float] = None
-    valor_total: Optional[float] = None  # calculado no frontend, salvo aqui
+    valor_total: Optional[float] = None
 
 class PropostaPayload(BaseModel):
-    # Bloco A — Proposta Comercial
     tipo_produto: str = ""
     variacao_produto: str = ""
     preco_unitario: Optional[float] = None
     insumos_inclusos: List[str] = []
     observacoes_proposta: str = ""
-    # Bloco B — Pedido de Fabricação
     items_pedido: List[PedidoItem] = []
     condicoes_pagamento: str = ""
     insumos_fabricacao: List[InsumoItem] = []
     rodape_observacoes: str = ""
-    # Controle
-    status: str = "rascunho"  # rascunho | confirmado | cancelado
+    status: str = "rascunho"
 
 class PropostaPatch(BaseModel):
     tipo_produto: Optional[str] = None
@@ -78,9 +85,9 @@ class PropostaPatch(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _get_project(projeto_id: str, tenant_id: str) -> dict:
-    proj = await db.crm_projects.find_one(
-        {"id": projeto_id, "tenant_id": tenant_id}, {"_id": 0}
-    )
+    proj = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2", projeto_id, tenant_id
+    ))
     if not proj:
         raise HTTPException(status_code=404, detail="Projeto não encontrado")
     return proj
@@ -92,9 +99,10 @@ async def _get_project(projeto_id: str, tenant_id: str) -> dict:
 async def get_proposta(projeto_id: str, request: Request):
     user = await _get_current_user(request)
     await _get_project(projeto_id, user["tenant_id"])
-    doc = await db.propostas_comerciais.find_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    doc = _row(await pg_db.fetch_one(
+        "SELECT * FROM propostas_comerciais WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    ))
     if not doc:
         return {}
     return doc
@@ -107,51 +115,56 @@ async def upsert_proposta(projeto_id: str, payload: PropostaPayload, request: Re
     project = await _get_project(projeto_id, user["tenant_id"])
 
     now = _now_iso()
-    existing = await db.propostas_comerciais.find_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT id FROM propostas_comerciais WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    ))
 
     items_dict = [item.dict() for item in payload.items_pedido]
     insumos_dict = [i.dict() for i in payload.insumos_fabricacao]
 
     if existing:
-        doc_id = existing.get("id", _new_id())
-        await db.propostas_comerciais.update_one(
-            {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]},
-            {"$set": {
-                **payload.dict(exclude={"items_pedido", "insumos_fabricacao"}),
-                "items_pedido": items_dict,
-                "insumos_fabricacao": insumos_dict,
-                "updated_at": now,
-                "updated_by": user["id"],
-                "updated_by_name": user.get("name", ""),
-            }},
+        doc_id = existing["id"]
+        await pg_db.execute(
+            """UPDATE propostas_comerciais SET
+                   tipo_produto=$1, variacao_produto=$2, preco_unitario=$3,
+                   insumos_inclusos=$4, observacoes_proposta=$5,
+                   items_pedido=$6, condicoes_pagamento=$7,
+                   insumos_fabricacao=$8, rodape_observacoes=$9, status=$10,
+                   updated_at=$11, updated_by=$12, updated_by_name=$13
+               WHERE id=$14""",
+            payload.tipo_produto, payload.variacao_produto, payload.preco_unitario,
+            payload.insumos_inclusos, payload.observacoes_proposta,
+            items_dict, payload.condicoes_pagamento,
+            insumos_dict, payload.rodape_observacoes, payload.status,
+            now, user["id"], user.get("name", ""),
+            doc_id,
         )
     else:
         doc_id = _new_id()
-        doc = {
-            "id": doc_id,
-            "tenant_id": user["tenant_id"],
-            "projeto_id": projeto_id,
-            "projeto_nome": project.get("nome_projeto", ""),
-            "cliente_id": project.get("cliente_id"),
-            "cliente_nome": project.get("cliente_nome", ""),
-            **payload.dict(exclude={"items_pedido", "insumos_fabricacao"}),
-            "items_pedido": items_dict,
-            "insumos_fabricacao": insumos_dict,
-            "arquivos": [],
-            "created_at": now,
-            "created_by": user["id"],
-            "created_by_name": user.get("name", ""),
-            "updated_at": now,
-            "updated_by": user["id"],
-            "updated_by_name": user.get("name", ""),
-        }
-        await db.propostas_comerciais.insert_one(doc)
+        await pg_db.execute(
+            """INSERT INTO propostas_comerciais
+               (id, tenant_id, projeto_id, projeto_nome, cliente_id, cliente_nome,
+                tipo_produto, variacao_produto, preco_unitario, insumos_inclusos,
+                observacoes_proposta, items_pedido, condicoes_pagamento, insumos_fabricacao,
+                rodape_observacoes, status, arquivos,
+                created_by, created_by_name, created_at, updated_at, updated_by, updated_by_name)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)""",
+            doc_id, user["tenant_id"], projeto_id,
+            project.get("nome_projeto", ""), project.get("cliente_id"),
+            project.get("cliente_nome", ""),
+            payload.tipo_produto, payload.variacao_produto, payload.preco_unitario,
+            payload.insumos_inclusos, payload.observacoes_proposta,
+            items_dict, payload.condicoes_pagamento, insumos_dict,
+            payload.rodape_observacoes, payload.status, [],
+            user["id"], user.get("name", ""), now, now,
+            user["id"], user.get("name", ""),
+        )
 
-    updated = await db.propostas_comerciais.find_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    updated = _row(await pg_db.fetch_one(
+        "SELECT * FROM propostas_comerciais WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    ))
 
     # R20: disparar explosão de BOM quando pedido confirmado
     if payload.status == "confirmado":
@@ -187,17 +200,34 @@ async def patch_proposta(projeto_id: str, payload: PropostaPatch, request: Reque
     patch["updated_by"] = user["id"]
     patch["updated_by_name"] = user.get("name", "")
 
-    result = await db.propostas_comerciais.update_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]},
-        {"$set": patch},
+    ALLOWED = {
+        "tipo_produto", "variacao_produto", "preco_unitario", "insumos_inclusos",
+        "observacoes_proposta", "items_pedido", "condicoes_pagamento", "insumos_fabricacao",
+        "rodape_observacoes", "status", "updated_at", "updated_by", "updated_by_name",
+    }
+    set_parts = []
+    vals: list = []
+    i = 1
+    for k, v in patch.items():
+        if k in ALLOWED:
+            set_parts.append(f"{k}=${i}")
+            vals.append(v)
+            i += 1
+
+    if not set_parts:
+        return {"ok": True}
+
+    res = await pg_db.execute(
+        f"UPDATE propostas_comerciais SET {', '.join(set_parts)} WHERE projeto_id=${i} AND tenant_id=${i+1}",
+        *vals, projeto_id, user["tenant_id"],
     )
-    if result.matched_count == 0:
+    if res == "UPDATE 0":
         raise HTTPException(status_code=404, detail="Proposta não encontrada — crie com POST primeiro")
 
-    updated = await db.propostas_comerciais.find_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
-    return updated
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM propostas_comerciais WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    ))
 
 
 # ── R18: Status das amostras do projeto ──────────────────────────────────────
@@ -212,10 +242,24 @@ async def get_amostras_status(projeto_id: str, request: Request):
     user = await _get_current_user(request)
     await _get_project(projeto_id, user["tenant_id"])
 
-    samples = await db.crm_samples.find(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0, "id": 1, "numero_amostra": 1, "nome_produto": 1, "variacoes": 1},
-    ).to_list(500)
+    samples = await pg_db.fetch_all(
+        "SELECT id, numero_amostra, nome_produto FROM crm_samples WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    )
+
+    variacoes_all: list = []
+    if samples:
+        sample_ids = [s["id"] for s in samples]
+        placeholders = ",".join(f"${j+1}" for j in range(len(sample_ids)))
+        variacoes_all = await pg_db.fetch_all(
+            f"SELECT * FROM crm_sample_variacoes WHERE sample_id IN ({placeholders})",
+            *sample_ids,
+        )
+
+    v_by_sample: dict = {}
+    for v in variacoes_all:
+        vd = dict(v)
+        v_by_sample.setdefault(vd["sample_id"], []).append(vd)
 
     resumo = []
     total_aprovadas = 0
@@ -225,7 +269,8 @@ async def get_amostras_status(projeto_id: str, request: Request):
     _STATUS_PD_REPROVADO = {"reprovado", "REJECTED"}
 
     for s in samples:
-        for v in s.get("variacoes", []):
+        sd = dict(s)
+        for v in v_by_sample.get(sd["id"], []):
             status_raw = v.get("status", "solicitada")
             resultado = v.get("resultado", "")
             status_pd_raw = v.get("status_pd_raw", "")
@@ -238,7 +283,11 @@ async def get_amostras_status(projeto_id: str, request: Request):
             if aprovada:
                 label = "aprovada"
                 total_aprovadas += 1
-            elif status_raw in ("reprovada", "cancelada") or resultado == "reprovada" or status_pd_raw in _STATUS_PD_REPROVADO:
+            elif (
+                status_raw in ("reprovada", "cancelada")
+                or resultado == "reprovada"
+                or status_pd_raw in _STATUS_PD_REPROVADO
+            ):
                 label = "reprovada"
             elif status_raw in ("plano_futuro",):
                 label = "plano_futuro"
@@ -250,9 +299,9 @@ async def get_amostras_status(projeto_id: str, request: Request):
                 sku_ids_needed.append(sku_id)
 
             resumo.append({
-                "amostra_id": s["id"],
-                "numero_amostra": s.get("numero_amostra", ""),
-                "nome_produto": s.get("nome_produto", "") or v.get("nome_produto", ""),
+                "amostra_id": sd["id"],
+                "numero_amostra": sd.get("numero_amostra", ""),
+                "nome_produto": sd.get("nome_produto", "") or v.get("nome_produto", ""),
                 "variacao_id": v["id"],
                 "codigo": v.get("codigo", ""),
                 "descricao": v.get("descricao_aplicacao", ""),
@@ -262,12 +311,12 @@ async def get_amostras_status(projeto_id: str, request: Request):
                 "sku_codigo": "",
             })
 
-    # Fetch SKU codes in one query
     if sku_ids_needed:
-        skus = await db.skus.find(
-            {"id": {"$in": sku_ids_needed}},
-            {"_id": 0, "id": 1, "codigo_interno": 1},
-        ).to_list(200)
+        placeholders = ",".join(f"${j+1}" for j in range(len(sku_ids_needed)))
+        skus = await pg_db.fetch_all(
+            f"SELECT id, codigo_interno FROM skus WHERE id IN ({placeholders})",
+            *sku_ids_needed,
+        )
         sku_map = {s["id"]: s.get("codigo_interno", "") for s in skus}
         for item in resumo:
             if item["sku_id"]:
@@ -290,38 +339,44 @@ async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -
     Composição 1 (bulk): (percentual/100) × qtd_envase_g × qtd_pedido → converte para kg
     Composição 2 (embalagem): quantidade_por_unidade × qtd_pedido → ceil(/ fator_conversao)
 
-    Consolida por codigo_material, salva em db.order_material_requirements.
+    Consolida por codigo_material, salva em order_material_requirements.
     """
-    necessidades: dict = {}  # key: codigo_material
+    necessidades: dict = {}
 
-    for pedido_item in proposta.get("items_pedido", []):
+    for pedido_item in (proposta.get("items_pedido") or []):
         codigo_kuryos = (pedido_item.get("codigo_kuryos") or "").strip()
         qtd_pedido = float(pedido_item.get("qtd") or 0)
         if not codigo_kuryos or qtd_pedido <= 0:
             continue
 
-        sku = await db.skus.find_one(
-            {"codigo": codigo_kuryos, "tenant_id": tenant_id}, {"_id": 0}
-        )
+        sku = _row(await pg_db.fetch_one(
+            "SELECT * FROM skus WHERE codigo_interno=$1 AND tenant_id=$2",
+            codigo_kuryos, tenant_id,
+        ))
         if not sku:
             continue
 
         sku_id = sku["id"]
         produto_pai_id = sku.get("produto_pai_id")
         apresentacao = sku.get("apresentacao") or {}
-        qtd_envase_g = apresentacao.get("qtd_envase")  # granel por unidade (g)
+        if isinstance(apresentacao, str):
+            try:
+                apresentacao = json.loads(apresentacao)
+            except Exception:
+                apresentacao = {}
+        qtd_envase_g = apresentacao.get("qtd_envase")
 
-        # ── Composição 2 — Embalagem (por unidade acabada, per SKU) ──────────
-        bom_embal = await db.bom_items.find(
-            {"sku_id": sku_id, "camada": "embalagem", "vigente": True, "tenant_id": tenant_id},
-            {"_id": 0},
-        ).to_list(200)
+        # ── Composição 2 — Embalagem ────────────────────────────────────────
+        bom_embal = await pg_db.fetch_all(
+            """SELECT * FROM bom_items
+               WHERE sku_id=$1 AND camada='embalagem' AND vigente=TRUE AND tenant_id=$2""",
+            sku_id, tenant_id,
+        )
 
         for item in bom_embal:
             cod = item["codigo_material"]
-            qtd_raw = item["quantidade_por_unidade"] * qtd_pedido
+            qtd_raw = float(item["quantidade_por_unidade"]) * qtd_pedido
             fator = float(item.get("fator_conversao") or 1.0)
-            # Arredonda para CIMA na unidade de compra (não compra fração de caixa/bobina)
             qtd_compra = math.ceil(qtd_raw / fator)
 
             if cod not in necessidades:
@@ -347,23 +402,18 @@ async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -
             if sku_id not in necessidades[cod]["sku_ids"]:
                 necessidades[cod]["sku_ids"].append(sku_id)
 
-        # ── Composição 1 — Bulk (percentual × granel por unidade × qtd) ──────
+        # ── Composição 1 — Bulk ─────────────────────────────────────────────
         if produto_pai_id:
-            bom_bulk = await db.bom_items.find(
-                {
-                    "produto_pai_id": produto_pai_id,
-                    "camada": "bulk",
-                    "vigente": True,
-                    "tenant_id": tenant_id,
-                },
-                {"_id": 0},
-            ).to_list(200)
+            bom_bulk = await pg_db.fetch_all(
+                """SELECT * FROM bom_items
+                   WHERE produto_pai_id=$1 AND camada='bulk' AND vigente=TRUE AND tenant_id=$2""",
+                produto_pai_id, tenant_id,
+            )
 
             for item in bom_bulk:
                 cod = item["codigo_material"]
 
-                if not qtd_envase_g or qtd_envase_g <= 0:
-                    # Sem peso por unidade — item fica como pendente_info
+                if not qtd_envase_g or float(qtd_envase_g) <= 0:
                     if cod not in necessidades:
                         necessidades[cod] = {
                             "insumo_id": cod,
@@ -384,7 +434,7 @@ async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -
                         necessidades[cod]["sku_ids"].append(sku_id)
                     continue
 
-                qtd_g = (item["percentual"] / 100.0) * float(qtd_envase_g) * qtd_pedido
+                qtd_g = (float(item["percentual"]) / 100.0) * float(qtd_envase_g) * qtd_pedido
                 qtd_kg = qtd_g / 1000.0
 
                 if cod not in necessidades:
@@ -405,7 +455,6 @@ async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -
                 necessidades[cod]["qtd_necessaria"] = round(
                     (necessidades[cod]["qtd_necessaria"] or 0) + qtd_g, 3
                 )
-                # Arredonda para 0.1 kg acima (ninguém pesa fração de grama num pedido)
                 qtd_kg_compra = math.ceil(qtd_kg * 10) / 10
                 necessidades[cod]["qtd_necessaria_compra"] = round(
                     (necessidades[cod]["qtd_necessaria_compra"] or 0) + qtd_kg_compra, 3
@@ -417,27 +466,28 @@ async def explode_bom_for_proposta(proposta: dict, tenant_id: str, user: dict) -
 
     now = _now_iso()
     tem_pendente = any(m.get("pendente_info") for m in materiais_list)
-    doc = {
-        "id": _new_id(),
-        "tenant_id": tenant_id,
-        "proposta_id": proposta.get("id"),
-        "projeto_id": proposta.get("projeto_id"),
-        "cliente_id": proposta.get("cliente_id"),
-        "cliente_nome": proposta.get("cliente_nome", ""),
-        "gerado_em": now,
-        "gerado_por": user["id"],
-        "gerado_por_name": user.get("name", ""),
-        "status": "pendente_info" if tem_pendente else "gerado",
-        "materiais": materiais_list,
-    }
-
-    await db.order_material_requirements.update_one(
-        {"proposta_id": proposta.get("id"), "tenant_id": tenant_id},
-        {"$set": doc},
-        upsert=True,
+    doc_id = _new_id()
+    await pg_db.execute(
+        """INSERT INTO order_material_requirements
+           (id, tenant_id, proposta_id, projeto_id, gerado_em,
+            gerado_por, gerado_por_nome, status, materiais, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (tenant_id, proposta_id) DO UPDATE SET
+               materiais    = EXCLUDED.materiais,
+               status       = EXCLUDED.status,
+               gerado_em    = EXCLUDED.gerado_em,
+               gerado_por   = EXCLUDED.gerado_por,
+               updated_at   = NOW()""",
+        doc_id, tenant_id,
+        proposta.get("id"), proposta.get("projeto_id"), now,
+        user["id"], user.get("name", ""),
+        "pendente_info" if tem_pendente else "gerado",
+        materiais_list, now, now,
     )
-    doc.pop("_id", None)
-    return doc
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM order_material_requirements WHERE proposta_id=$1 AND tenant_id=$2",
+        proposta.get("id"), tenant_id,
+    )) or {}
 
 
 @propostas_router.get("/{projeto_id}/material-requirements")
@@ -446,15 +496,17 @@ async def get_material_requirements(projeto_id: str, request: Request):
     user = await _get_current_user(request)
     await _get_project(projeto_id, user["tenant_id"])
 
-    proposta = await db.propostas_comerciais.find_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    proposta = _row(await pg_db.fetch_one(
+        "SELECT id FROM propostas_comerciais WHERE projeto_id=$1 AND tenant_id=$2",
+        projeto_id, user["tenant_id"],
+    ))
     if not proposta:
         return {}
 
-    req = await db.order_material_requirements.find_one(
-        {"proposta_id": proposta["id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    req = _row(await pg_db.fetch_one(
+        "SELECT * FROM order_material_requirements WHERE proposta_id=$1 AND tenant_id=$2",
+        proposta["id"], user["tenant_id"],
+    ))
     return req or {}
 
 
@@ -495,9 +547,11 @@ async def upload_attachment(
         "uploaded_by_name": user.get("name", ""),
     }
 
-    await db.propostas_comerciais.update_one(
-        {"projeto_id": projeto_id, "tenant_id": user["tenant_id"]},
-        {"$push": {"arquivos": ref}},
+    await pg_db.execute(
+        """UPDATE propostas_comerciais
+           SET arquivos = arquivos || $1::jsonb
+           WHERE projeto_id=$2 AND tenant_id=$3""",
+        json.dumps([ref]), projeto_id, user["tenant_id"],
     )
 
     return ref

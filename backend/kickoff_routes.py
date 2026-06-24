@@ -12,21 +12,20 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+import database as pg_db
 from rbac import require_roles, has_role
 from workflow_engine import audit_log, create_workflow_task, next_sequence
 
 
 kickoff_router = APIRouter(prefix="/api")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_kickoff(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -38,6 +37,10 @@ def new_id() -> str:
 
 def now_iso() -> str:
     return now_iso_func()
+
+
+def _row(r):
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} if r else None
 
 
 KICKOFF_STATUSES = {
@@ -309,33 +312,34 @@ def _block4_ready(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
 async def _get_user_for_roles(tenant_id: str, roles: List[str]) -> Optional[Dict[str, Any]]:
     for role in roles:
-        doc = await db.users.find_one(
-            {"tenant_id": tenant_id, "role": role},
-            {"_id": 0, "id": 1, "name": 1, "role": 1},
-        )
+        doc = _row(await pg_db.fetch_one(
+            "SELECT id, name, role FROM users WHERE tenant_id=$1 AND role=$2 LIMIT 1",
+            tenant_id, role,
+        ))
         if doc:
             return doc
     return None
 
 
 async def _find_formula_context(formula_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
-    formula = await db.pd_formulas.find_one({"id": formula_id, "tenant_id": tenant_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_formulas WHERE id=$1 AND tenant_id=$2", formula_id, tenant_id
+    ))
     if not formula:
         return None
-    development = await db.pd_developments.find_one(
-        {"id": formula.get("development_id"), "tenant_id": tenant_id},
-        {"_id": 0},
-    )
+    development = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_developments WHERE id=$1 AND tenant_id=$2",
+        formula.get("development_id"), tenant_id,
+    ))
     if not development:
         return None
-    pd_request = await db.pd_requests.find_one(
-        {"id": development.get("pd_request_id"), "tenant_id": tenant_id},
-        {"_id": 0},
-    )
-    approval = await db.pd_approvals.find_one(
-        {"development_id": development["id"]},
-        {"_id": 0},
-    )
+    pd_request = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2",
+        development.get("pd_request_id"), tenant_id,
+    ))
+    approval = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_approvals WHERE development_id=$1", development["id"]
+    ))
     return {
         "formula": formula,
         "development": development,
@@ -345,7 +349,9 @@ async def _find_formula_context(formula_id: str, tenant_id: str) -> Optional[Dic
 
 
 async def _resolve_registered_formula_for_project(project_id: str, tenant_id: str, explicit_formula_id: Optional[str] = None) -> Dict[str, Any]:
-    project = await db.crm_projects.find_one({"id": project_id, "tenant_id": tenant_id}, {"_id": 0})
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2", project_id, tenant_id
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto nao encontrado")
 
@@ -354,17 +360,18 @@ async def _resolve_registered_formula_for_project(project_id: str, tenant_id: st
         if not ctx:
             raise HTTPException(status_code=404, detail="Formula nao encontrada")
         pd_request = ctx.get("pd_request") or {}
-        if pd_request.get("linked_projeto_id") != project_id:
+        if pd_request.get("linked_projeto_id") != project_id and pd_request.get("crm_project_id") != project_id:
             raise HTTPException(status_code=400, detail="Formula informada nao pertence ao projeto")
         approval = ctx.get("approval") or {}
         if not (approval.get("approved_by_client") and approval.get("approved_by_internal")):
             raise HTTPException(status_code=400, detail="A formula informada ainda nao esta registrada no Banco P&D.")
         return {"project": project, **ctx}
 
-    requests_docs = await db.pd_requests.find(
-        {"tenant_id": tenant_id, "linked_projeto_id": project_id},
-        {"_id": 0},
-    ).to_list(500)
+    requests_rows = await pg_db.fetch_all(
+        "SELECT * FROM pd_requests WHERE tenant_id=$1 AND (linked_projeto_id=$2 OR crm_project_id=$2)",
+        tenant_id, project_id,
+    )
+    requests_docs = [_row(r) for r in requests_rows]
     if not requests_docs:
         raise HTTPException(
             status_code=400,
@@ -372,10 +379,12 @@ async def _resolve_registered_formula_for_project(project_id: str, tenant_id: st
         )
 
     req_map = {req["id"]: req for req in requests_docs if req.get("id")}
-    devs = await db.pd_developments.find(
-        {"tenant_id": tenant_id, "pd_request_id": {"$in": list(req_map.keys())}},
-        {"_id": 0},
-    ).to_list(500)
+    req_ids = list(req_map.keys())
+    devs_rows = await pg_db.fetch_all(
+        "SELECT * FROM pd_developments WHERE tenant_id=$1 AND pd_request_id = ANY($2::text[])",
+        tenant_id, req_ids,
+    )
+    devs = [_row(r) for r in devs_rows]
     if not devs:
         raise HTTPException(
             status_code=400,
@@ -383,16 +392,17 @@ async def _resolve_registered_formula_for_project(project_id: str, tenant_id: st
         )
 
     dev_map = {dev["id"]: dev for dev in devs if dev.get("id")}
-    approvals = await db.pd_approvals.find(
-        {"development_id": {"$in": list(dev_map.keys())}},
-        {"_id": 0},
-    ).to_list(500)
-    approvals_map = {doc["development_id"]: doc for doc in approvals if doc.get("development_id")}
+    dev_ids = list(dev_map.keys())
+    approvals_rows = await pg_db.fetch_all(
+        "SELECT * FROM pd_approvals WHERE development_id = ANY($1::text[])", dev_ids
+    )
+    approvals_map = {doc["development_id"]: _row(doc) for doc in approvals_rows if doc.get("development_id")}
 
-    formulas = await db.pd_formulas.find(
-        {"tenant_id": tenant_id, "development_id": {"$in": list(dev_map.keys())}},
-        {"_id": 0},
-    ).sort([("version", -1), ("created_at", -1)]).to_list(1000)
+    formulas_rows = await pg_db.fetch_all(
+        "SELECT * FROM pd_formulas WHERE tenant_id=$1 AND development_id = ANY($2::text[]) ORDER BY version DESC, created_at DESC",
+        tenant_id, dev_ids,
+    )
+    formulas = [_row(r) for r in formulas_rows]
 
     selected = None
     for formula in formulas:
@@ -418,27 +428,31 @@ async def _resolve_registered_formula_for_project(project_id: str, tenant_id: st
 async def _approved_sample_payload(project: dict, pd_request: Optional[dict]) -> Dict[str, Any]:
     sample = None
     variation = None
+    tid = project["tenant_id"]
+
     if pd_request and pd_request.get("linked_amostra_id"):
-        sample = await db.crm_samples.find_one(
-            {"id": pd_request["linked_amostra_id"], "tenant_id": project["tenant_id"]},
-            {"_id": 0},
-        )
-    if sample and pd_request.get("linked_variacao_id"):
-        variation = next(
-            (item for item in sample.get("variacoes", []) if item.get("id") == pd_request.get("linked_variacao_id")),
-            None,
-        )
+        sample = _row(await pg_db.fetch_one(
+            "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
+            pd_request["linked_amostra_id"], tid,
+        ))
+
+    if sample and pd_request and pd_request.get("linked_variacao_id"):
+        variation = _row(await pg_db.fetch_one(
+            "SELECT * FROM crm_sample_variacoes WHERE sample_id=$1 AND id=$2",
+            sample["id"], pd_request["linked_variacao_id"],
+        ))
+
     if not sample:
-        sample = await db.crm_samples.find_one(
-            {"projeto_id": project["id"], "tenant_id": project["tenant_id"]},
-            {"_id": 0},
-            sort=[("updated_at", -1)],
-        )
+        sample = _row(await pg_db.fetch_one(
+            "SELECT * FROM crm_samples WHERE projeto_id=$1 AND tenant_id=$2 ORDER BY updated_at DESC LIMIT 1",
+            project["id"], tid,
+        ))
         if sample:
-            variation = next(
-                (item for item in sample.get("variacoes", []) if item.get("status") == "aprovada" or item.get("gera_sku")),
-                None,
-            )
+            variation = _row(await pg_db.fetch_one(
+                "SELECT * FROM crm_sample_variacoes WHERE sample_id=$1 AND (status='aprovada' OR gera_sku=TRUE) LIMIT 1",
+                sample["id"],
+            ))
+
     approved_code = ""
     feedback = ""
     if variation:
@@ -479,25 +493,31 @@ async def _build_kickoff_auto_block(project: dict, client: dict, formula_ctx: di
 
 
 async def _ensure_project_and_client(project_id: str, tenant_id: str) -> Tuple[dict, dict]:
-    project = await db.crm_projects.find_one({"id": project_id, "tenant_id": tenant_id}, {"_id": 0})
+    project = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_projects WHERE id=$1 AND tenant_id=$2", project_id, tenant_id
+    ))
     if not project:
         raise HTTPException(status_code=404, detail="Projeto nao encontrado")
-    client = await db.crm_clients.find_one({"id": project.get("cliente_id"), "tenant_id": tenant_id}, {"_id": 0})
+    client = _row(await pg_db.fetch_one(
+        "SELECT * FROM crm_clients WHERE id=$1 AND tenant_id=$2",
+        project.get("cliente_id"), tenant_id,
+    ))
     if not client:
         raise HTTPException(status_code=404, detail="Cliente do projeto nao encontrado")
     return project, client
 
 
 async def _get_latest_kickoff_by_group(group_id: str, tenant_id: str) -> Optional[dict]:
-    return await db.kickoffs.find_one(
-        {"tenant_id": tenant_id, "kickoff_group_id": group_id},
-        {"_id": 0},
-        sort=[("versao_numero", -1)],
-    )
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM kickoffs WHERE kickoff_group_id=$1 AND tenant_id=$2 ORDER BY versao_numero DESC LIMIT 1",
+        group_id, tenant_id,
+    ))
 
 
 async def _get_kickoff_or_404(kickoff_id: str, tenant_id: str) -> dict:
-    doc = await db.kickoffs.find_one({"id": kickoff_id, "tenant_id": tenant_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one(
+        "SELECT * FROM kickoffs WHERE id=$1 AND tenant_id=$2", kickoff_id, tenant_id
+    ))
     if not doc:
         raise HTTPException(status_code=404, detail="Kickoff nao encontrado")
     return doc
@@ -511,17 +531,13 @@ def _current_approval_step(kickoff: dict) -> Optional[Dict[str, Any]]:
 
 
 async def _sync_project_kickoff_summary(kickoff: dict):
-    updates = {
-        "kickoff_id": kickoff["id"],
-        "kickoff_numero": kickoff["numero_kickoff"],
-        "kickoff_status": kickoff["status"],
-        "kickoff_versao": kickoff["versao"],
-        "kickoff_group_id": kickoff["kickoff_group_id"],
-        "updated_at": now_iso(),
-    }
-    await db.crm_projects.update_one(
-        {"id": kickoff["projeto_id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": updates},
+    await pg_db.execute(
+        """UPDATE crm_projects SET kickoff_id=$1, kickoff_numero=$2, kickoff_status=$3,
+           kickoff_versao=$4, kickoff_group_id=$5, updated_at=$6
+           WHERE id=$7 AND tenant_id=$8""",
+        kickoff["id"], kickoff["numero_kickoff"], kickoff["status"],
+        kickoff["versao"], kickoff["kickoff_group_id"], now_iso(),
+        kickoff["projeto_id"], kickoff["tenant_id"],
     )
 
 
@@ -537,16 +553,16 @@ async def _create_or_reuse_task(
     description: str = "",
     blocking: bool = False,
 ) -> Optional[dict]:
-    existing = await db.workflow_tasks.find_one(
-        {
-            "tenant_id": kickoff["tenant_id"],
-            "entity_type": "kickoff",
-            "entity_id": kickoff["id"],
-            "status": {"$in": ["pendente", "em_andamento", "em_atraso"]},
-            "metadata.kickoff_task_code": task_code,
-        },
-        {"_id": 0},
-    )
+    existing = _row(await pg_db.fetch_one(
+        """SELECT * FROM workflow_tasks
+           WHERE tenant_id=$1 AND entity_type='kickoff' AND entity_id=$2
+           AND status = ANY($3::text[])
+           AND metadata->>'kickoff_task_code' = $4
+           LIMIT 1""",
+        kickoff["tenant_id"], kickoff["id"],
+        ["pendente", "em_andamento", "em_atraso"],
+        task_code,
+    ))
     if existing:
         return existing
     responsible = await _get_user_for_roles(kickoff["tenant_id"], responsible_roles)
@@ -662,16 +678,21 @@ async def _enqueue_revision_task(kickoff: dict, user: dict, etapa: str):
 async def _get_supplier_doc(supplier_id: Optional[str], tenant_id: str) -> Optional[dict]:
     if not supplier_id:
         return None
-    return await db.homologacao_fornecedores.find_one(
-        {"id": supplier_id, "tenant_id": tenant_id},
-        {"_id": 0},
-    )
+    return _row(await pg_db.fetch_one(
+        """SELECT hf.*, cf.nome_fantasia, cf.razao_social
+           FROM homologacao_fornecedores hf
+           LEFT JOIN compras_fornecedores cf ON cf.id = hf.fornecedor_id AND cf.tenant_id = hf.tenant_id
+           WHERE hf.id=$1 AND hf.tenant_id=$2""",
+        supplier_id, tenant_id,
+    ))
 
 
 async def _find_mp_doc(tenant_id: str, ingredient_name: str, catalog_id: Optional[str] = None) -> Optional[dict]:
     keys = []
     if catalog_id:
-        catalog = await db.pd_catalog.find_one({"id": catalog_id, "tenant_id": tenant_id}, {"_id": 0})
+        catalog = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_catalog WHERE id=$1 AND tenant_id=$2", catalog_id, tenant_id
+        ))
         if catalog:
             for key in (catalog.get("nome"), catalog.get("inci"), catalog.get("codigo_interno")):
                 if key:
@@ -680,18 +701,27 @@ async def _find_mp_doc(tenant_id: str, ingredient_name: str, catalog_id: Optiona
         keys.append(str(ingredient_name).strip().lower())
     if not keys:
         return None
-    docs = await db.homologacao_mps.find({"tenant_id": tenant_id}, {"_id": 0}).to_list(5000)
-    normalized = {key for key in keys if key}
-    for doc in docs:
-        for candidate in (doc.get("nome"), doc.get("inci"), doc.get("codigo_interno")):
-            if candidate and str(candidate).strip().lower() in normalized:
-                return doc
-    return None
+    return _row(await pg_db.fetch_one(
+        """SELECT * FROM homologacao_mps
+           WHERE tenant_id=$1 AND (
+             LOWER(nome) = ANY($2::text[])
+             OR LOWER(inci) = ANY($2::text[])
+             OR LOWER(codigo_interno) = ANY($2::text[])
+           )
+           LIMIT 1""",
+        tenant_id, keys,
+    ))
 
 
 async def _build_bom_lines(kickoff: dict) -> List[Dict[str, Any]]:
-    formula = await db.pd_formulas.find_one({"id": kickoff["formula_id"], "tenant_id": kickoff["tenant_id"]}, {"_id": 0})
-    items = await db.pd_formula_items.find({"formula_id": kickoff["formula_id"]}, {"_id": 0}).to_list(2000)
+    _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_formulas WHERE id=$1 AND tenant_id=$2",
+        kickoff["formula_id"], kickoff["tenant_id"],
+    ))
+    items_rows = await pg_db.fetch_all(
+        "SELECT * FROM pd_formula_items WHERE formula_id=$1", kickoff["formula_id"]
+    )
+    items = [_row(r) for r in items_rows]
     bloco3 = kickoff.get("bloco3") or {}
     bloco4 = kickoff.get("bloco4") or {}
     bloco2 = kickoff.get("bloco2") or {}
@@ -800,9 +830,9 @@ async def _refresh_bom(kickoff: dict) -> dict:
         kickoff["bom"] = []
         return kickoff
     bom_lines = await _build_bom_lines(kickoff)
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"bom": bom_lines, "updated_at": now_iso()}},
+    await pg_db.execute(
+        "UPDATE kickoffs SET bom=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        bom_lines, now_iso(), kickoff["id"], kickoff["tenant_id"],
     )
     kickoff["bom"] = bom_lines
     return kickoff
@@ -842,6 +872,30 @@ def _validate_kickoff_editable(kickoff: dict):
         raise HTTPException(status_code=409, detail="Kickoff arquivado nao pode ser alterado.")
 
 
+async def _insert_kickoff(kf: dict):
+    await pg_db.execute(
+        """INSERT INTO kickoffs (
+            id, tenant_id, kickoff_group_id, parent_kickoff_id, projeto_id, formula_id,
+            numero_kickoff, data_abertura, versao, versao_numero, status,
+            bloco1, bloco2, bloco3, bloco4, bom, aprovacoes, log_auditoria,
+            created_at, updated_at, created_by, created_by_name,
+            approved_at, approved_by, approved_by_name
+        ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+            $12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
+        )""",
+        kf["id"], kf["tenant_id"], kf.get("kickoff_group_id"), kf.get("parent_kickoff_id"),
+        kf["projeto_id"], kf.get("formula_id"),
+        kf["numero_kickoff"], kf.get("data_abertura"), kf["versao"], kf["versao_numero"],
+        kf["status"],
+        kf.get("bloco1") or {}, kf.get("bloco2") or {}, kf.get("bloco3") or {},
+        kf.get("bloco4") or {}, kf.get("bom") or [], kf.get("aprovacoes") or [],
+        kf.get("log_auditoria") or [],
+        kf["created_at"], kf["updated_at"], kf["created_by"], kf.get("created_by_name", ""),
+        kf.get("approved_at"), kf.get("approved_by"), kf.get("approved_by_name", ""),
+    )
+
+
 async def _create_revision_version(kickoff: dict, user: dict, reason: str) -> dict:
     latest = await _get_latest_kickoff_by_group(kickoff["kickoff_group_id"], kickoff["tenant_id"])
     if latest and latest.get("id") != kickoff["id"]:
@@ -873,10 +927,10 @@ async def _create_revision_version(kickoff: dict, user: dict, reason: str) -> di
             "motivo": reason,
         }
     )
-    await db.kickoffs.insert_one(revision)
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"status": "substituida", "updated_at": now_iso()}},
+    await _insert_kickoff(revision)
+    await pg_db.execute(
+        "UPDATE kickoffs SET status='substituida', updated_at=$1 WHERE id=$2 AND tenant_id=$3",
+        now_iso(), kickoff["id"], kickoff["tenant_id"],
     )
     await _sync_project_kickoff_summary(revision)
     await audit_log(
@@ -936,7 +990,6 @@ async def _validate_kickoff_ready_for_approval(kickoff: dict):
         raise HTTPException(status_code=400, detail=f"Bloco 3 incompleto: {', '.join(block3_missing)}")
     if not block4_ok:
         raise HTTPException(status_code=400, detail=f"Bloco 4 incompleto: {', '.join(block4_missing)}")
-    pass
 
 
 async def _mark_pd_request_kickoff_complete(kickoff: dict, user: dict) -> List[Dict[str, Any]]:
@@ -945,9 +998,9 @@ async def _mark_pd_request_kickoff_complete(kickoff: dict, user: dict) -> List[D
     pd_request = (formula_ctx or {}).get("pd_request") or {}
     if not pd_request:
         return generated
-    await db.pd_requests.update_one(
-        {"id": pd_request["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"kickoff_completed": True, "updated_at": now_iso()}},
+    await pg_db.execute(
+        "UPDATE pd_requests SET updated_at=$1 WHERE id=$2 AND tenant_id=$3",
+        now_iso(), pd_request["id"], kickoff["tenant_id"],
     )
     try:
         from pd_routes import _generate_live_document_version
@@ -978,15 +1031,12 @@ async def create_kickoff_for_project(project_id: str, user: dict, explicit_formu
     if project.get("stage") != "pedido_aprovado":
         raise HTTPException(status_code=400, detail="O Kickoff so pode ser aberto quando o projeto estiver em Pedido Aprovado.")
 
-    existing = await db.kickoffs.find_one(
-        {
-            "tenant_id": user["tenant_id"],
-            "projeto_id": project_id,
-            "status": {"$in": ["em_preenchimento", "aguardando_aprovacao", "aprovado", "em_revisao"]},
-        },
-        {"_id": 0},
-        sort=[("versao_numero", -1)],
-    )
+    existing = _row(await pg_db.fetch_one(
+        """SELECT * FROM kickoffs WHERE tenant_id=$1 AND projeto_id=$2
+           AND status = ANY($3::text[]) ORDER BY versao_numero DESC LIMIT 1""",
+        user["tenant_id"], project_id,
+        ["em_preenchimento", "aguardando_aprovacao", "aprovado", "em_revisao"],
+    ))
     if existing:
         return await _decorate_kickoff(existing)
 
@@ -1020,7 +1070,7 @@ async def create_kickoff_for_project(project_id: str, user: dict, explicit_formu
         "approved_by": None,
         "approved_by_name": "",
     }
-    await db.kickoffs.insert_one(kickoff)
+    await _insert_kickoff(kickoff)
     await _sync_project_kickoff_summary(kickoff)
     await _enqueue_block_tasks_after_create(kickoff, user)
     await audit_log(
@@ -1058,11 +1108,11 @@ async def get_kickoff(kickoff_id: str, request: Request):
 async def kickoff_history(kickoff_id: str, request: Request):
     user = await get_current_user(request)
     kickoff = await _get_kickoff_or_404(kickoff_id, user["tenant_id"])
-    history = await db.kickoffs.find(
-        {"tenant_id": user["tenant_id"], "kickoff_group_id": kickoff["kickoff_group_id"]},
-        {"_id": 0},
-    ).sort("versao_numero", -1).to_list(100)
-    return history
+    rows = await pg_db.fetch_all(
+        "SELECT * FROM kickoffs WHERE kickoff_group_id=$1 AND tenant_id=$2 ORDER BY versao_numero DESC LIMIT 100",
+        kickoff["kickoff_group_id"], user["tenant_id"],
+    )
+    return [_row(r) for r in rows]
 
 
 @kickoff_router.get("/kickoffs")
@@ -1074,10 +1124,18 @@ async def list_kickoffs(
     periodo_ate: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals: list = [user["tenant_id"]]
+    i = 2
     if status:
-        query["status"] = status
-    docs = await db.kickoffs.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+        clauses.append(f"status=${i}")
+        vals.append(status)
+        i += 1
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM kickoffs WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1000",
+        *vals,
+    )
+    docs = [_row(r) for r in rows]
     filtered: List[Dict[str, Any]] = []
     start_dt = _parse_iso(periodo_de)
     end_dt = _parse_iso(periodo_ate)
@@ -1119,9 +1177,11 @@ async def update_kickoff_bloco2(kickoff_id: str, data: KickoffBloco2Input, reque
     new_status = kickoff["status"]
     if new_status == "em_revisao":
         new_status = "em_preenchimento"
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"bloco2": merged, "status": new_status, "updated_at": now_iso()}, "$push": {"log_auditoria": {"$each": changes}}},
+    await pg_db.execute(
+        """UPDATE kickoffs SET bloco2=$1, status=$2,
+           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $3::jsonb,
+           updated_at=$4 WHERE id=$5 AND tenant_id=$6""",
+        merged, new_status, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     block2_ok, _ = _block2_ready(merged)
@@ -1147,7 +1207,6 @@ async def update_kickoff_bloco3(kickoff_id: str, data: KickoffBloco3Input, reque
     kickoff = await _get_kickoff_or_404(kickoff_id, user["tenant_id"])
     _validate_kickoff_editable(kickoff)
     kickoff = await _ensure_mutable_version(kickoff, user, "Alteracao no Bloco 3 apos aprovacao")
-    block2_ok, _ = _block2_ready(kickoff.get("bloco2") or {})
     existing = kickoff.get("bloco3") or {}
     updates = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not updates:
@@ -1160,9 +1219,11 @@ async def update_kickoff_bloco3(kickoff_id: str, data: KickoffBloco3Input, reque
     new_status = kickoff["status"]
     if new_status == "em_revisao":
         new_status = "em_preenchimento"
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"bloco3": merged, "status": new_status, "updated_at": now_iso()}, "$push": {"log_auditoria": {"$each": changes}}},
+    await pg_db.execute(
+        """UPDATE kickoffs SET bloco3=$1, status=$2,
+           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $3::jsonb,
+           updated_at=$4 WHERE id=$5 AND tenant_id=$6""",
+        merged, new_status, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     block3_ok, _ = _block3_ready(merged)
@@ -1195,9 +1256,11 @@ async def update_kickoff_bloco4(kickoff_id: str, data: KickoffBloco4Input, reque
     merged = {**existing, **updates}
     _validate_block3_vs_block4(kickoff.get("bloco3") or {}, merged)
     changes = _diff_entries("bloco4", existing, merged, user)
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {"$set": {"bloco4": merged, "status": "aguardando_aprovacao", "updated_at": now_iso()}, "$push": {"log_auditoria": {"$each": changes}}},
+    await pg_db.execute(
+        """UPDATE kickoffs SET bloco4=$1, status='aguardando_aprovacao',
+           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $2::jsonb,
+           updated_at=$3 WHERE id=$4 AND tenant_id=$5""",
+        merged, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     kickoff = await _refresh_bom(kickoff)
@@ -1357,30 +1420,27 @@ async def approve_kickoff(kickoff_id: str, data: KickoffApprovalInput, request: 
         else:
             status = "aguardando_aprovacao"
 
-    await db.kickoffs.update_one(
-        {"id": kickoff["id"], "tenant_id": kickoff["tenant_id"]},
-        {
-            "$set": {
-                "aprovacoes": updated_steps,
-                "status": status,
-                "updated_at": now_iso(),
-                "approved_at": now_iso() if status == "aprovado" else kickoff.get("approved_at"),
-                "approved_by": user["id"] if status == "aprovado" else kickoff.get("approved_by"),
-                "approved_by_name": user.get("name", "") if status == "aprovado" else kickoff.get("approved_by_name", ""),
-            },
-            "$push": {
-                "log_auditoria": {
-                    "campo": f"aprovacao.{data.etapa}",
-                    "valor_anterior": "pendente",
-                    "valor_novo": data.decisao,
-                    "usuario_id": user["id"],
-                    "usuario_nome": user.get("name", ""),
-                    "datetime": now_iso(),
-                    "observacoes": data.observacoes or "",
-                    "justificativa": data.justificativa or "",
-                }
-            },
-        },
+    now = now_iso()
+    log_entry = {
+        "campo": f"aprovacao.{data.etapa}",
+        "valor_anterior": "pendente",
+        "valor_novo": data.decisao,
+        "usuario_id": user["id"],
+        "usuario_nome": user.get("name", ""),
+        "datetime": now,
+        "observacoes": data.observacoes or "",
+        "justificativa": data.justificativa or "",
+    }
+    await pg_db.execute(
+        """UPDATE kickoffs SET aprovacoes=$1, status=$2, updated_at=$3,
+           approved_at=$4, approved_by=$5, approved_by_name=$6,
+           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $7::jsonb
+           WHERE id=$8 AND tenant_id=$9""",
+        updated_steps, status, now,
+        now if status == "aprovado" else kickoff.get("approved_at"),
+        user["id"] if status == "aprovado" else kickoff.get("approved_by"),
+        user.get("name", "") if status == "aprovado" else kickoff.get("approved_by_name", ""),
+        [log_entry], kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     await _sync_project_kickoff_summary(kickoff)

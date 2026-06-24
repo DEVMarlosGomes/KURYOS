@@ -6,9 +6,11 @@ Setores: MANIPULACAO (MP FORMULACAO), ROTULAGEM (MP ROTULO), LOGISTICA (MP EMBAL
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
+import re
 
+import database as pg_db
 from cq_routes import cq_verificar_lote_aprovado, cq_verificar_liberacao_palete
 
 logger = logging.getLogger(__name__)
@@ -16,19 +18,21 @@ logger = logging.getLogger(__name__)
 estoque_router = APIRouter(prefix="/api/estoque")
 
 # ============ MODULE STATE ============
-db = None
 _get_current_user = None
 _new_id = None
 _now_iso = None
 
 
 def init_estoque(database, get_user_fn, new_id_fn, now_iso_fn):
-    global db, _get_current_user, _new_id, _now_iso
-    db = database
+    global _get_current_user, _new_id, _now_iso
     _get_current_user = get_user_fn
     _new_id = new_id_fn
     _now_iso = now_iso_fn
     logger.info("Estoque module initialized")
+
+
+def _row(r):
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} if r else None
 
 
 # ============ CONSTANTS ============
@@ -43,27 +47,23 @@ SETOR_LABELS = {
     "DEVOLUCAO": "Devoluções / Quarentena Especial",
 }
 
-# Tipos de MP vinculados a cada setor (para validação semântica)
 SETOR_TIPO_MP = {
     "MANIPULACAO": "FORMULACAO",
     "ROTULAGEM": "ROTULO",
     "LOGISTICA": "EMBALAGEM",
-    # FABRICA e DEVOLUCAO aceitam ambos os tipos
 }
 
-# Regex pattern for structured address GAL-B-04-1
-import re
 _LOC_PATTERN = re.compile(r"^[A-Z]{2,5}-[A-Z]-\d{2}-\d+$", re.IGNORECASE)
 
 TIPOS_MOVIMENTO = [
-    "ENTRADA_RECEBIMENTO",    # ↑  Entrada por aprovação de lote (CQ)
-    "SAIDA_CONSUMO_OP",       # ↓  Saída por consumo em Ordem de Produção
-    "SAIDA_EXPEDICAO",        # ↓  Saída por expedição de carga
-    "AJUSTE_ENTRADA",         # ↑  Ajuste manual (recontagem, devolução interna)
-    "AJUSTE_SAIDA",           # ↓  Ajuste manual (descarte, quebra, amostra)
-    "AMOSTRA",                # ↓  Coleta de amostra para análise CQ
-    "TRANSFERENCIA_ENTRADA",  # ↑  Transferência entre setores (entrada)
-    "TRANSFERENCIA_SAIDA",    # ↓  Transferência entre setores (saída)
+    "ENTRADA_RECEBIMENTO",
+    "SAIDA_CONSUMO_OP",
+    "SAIDA_EXPEDICAO",
+    "AJUSTE_ENTRADA",
+    "AJUSTE_SAIDA",
+    "AMOSTRA",
+    "TRANSFERENCIA_ENTRADA",
+    "TRANSFERENCIA_SAIDA",
 ]
 
 MOVIMENTOS_ENTRADA = {"ENTRADA_RECEBIMENTO", "AJUSTE_ENTRADA", "TRANSFERENCIA_ENTRADA"}
@@ -78,16 +78,16 @@ TIPO_ITEM_VALORES = ["mp", "produto_acabado"]
 POSICOES_CQ = ["livre", "quarentena", "aprovado", "reprovado"]
 
 class EstoqueItemCreate(BaseModel):
-    tipo_item: str  # "mp" | "produto_acabado"
-    setor: str      # MANIPULACAO | ROTULAGEM | LOGISTICA | FABRICA | DEVOLUCAO
+    tipo_item: str
+    setor: str
     nome: str
     codigo: str = ""
     mp_id: Optional[str] = None
     produto_id: Optional[str] = None
     unidade: str = "un"
     estoque_minimo: float = 0
-    localizacao: str = ""              # Free text fallback
-    localizacao_estruturada: str = ""  # Format: GAL-B-04-1 (galeria-corredor-prateleira-posição)
+    localizacao: str = ""
+    localizacao_estruturada: str = ""
     lote: str = ""
     validade: Optional[str] = None
     observacoes: str = ""
@@ -109,11 +109,11 @@ class EstoqueItemUpdate(BaseModel):
 
 class MovimentoCreate(BaseModel):
     item_id: str
-    tipo: str                           # ver TIPOS_MOVIMENTO
+    tipo: str
     quantidade: float
     motivo: str = ""
-    referencia: str = ""                # ID da OP, lote, etc
-    documento: str = ""                 # NF, requisição, etc
+    referencia: str = ""
+    documento: str = ""
 
 
 class TransferenciaCreate(BaseModel):
@@ -121,53 +121,46 @@ class TransferenciaCreate(BaseModel):
     setor_destino: str
     quantidade: float
     motivo: str = ""
-    # Se item destino não existir, será criado automaticamente espelhando origem
 
 
 # ============ HELPERS ============
 
-def _serialize(doc: dict) -> dict:
-    if doc:
-        doc.pop("_id", None)
-    return doc
-
-
 async def _log_movimento(
     item: dict, tipo: str, quantidade: float,
     motivo: str, referencia: str, documento: str,
-    user: dict, quantidade_antes: float, quantidade_depois: float
-):
-    """Registra movimento imutável no Kardex"""
-    mov = {
-        "id": _new_id(),
-        "tenant_id": item["tenant_id"],
-        "item_id": item["id"],
-        "setor": item["setor"],
-        "tipo_item": item["tipo_item"],
-        "nome_item": item["nome"],
-        "codigo_item": item.get("codigo", ""),
-        "lote": item.get("lote", ""),
-        "tipo": tipo,
+    user: dict, quantidade_antes: float, quantidade_depois: float,
+) -> dict:
+    mov_id = _new_id()
+    now = _now_iso()
+    await pg_db.execute(
+        """INSERT INTO estoque_movimentos
+           (id, tenant_id, item_id, setor, tipo_item, nome_item, codigo_item, lote,
+            tipo, direcao, quantidade, unidade, quantidade_antes, quantidade_depois,
+            motivo, referencia, documento, usuario, usuario_id, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)""",
+        mov_id, item["tenant_id"], item["id"], item["setor"], item["tipo_item"],
+        item["nome"], item.get("codigo", ""), item.get("lote", ""),
+        tipo, "entrada" if tipo in MOVIMENTOS_ENTRADA else "saida",
+        quantidade, item.get("unidade", "un"), quantidade_antes, quantidade_depois,
+        motivo, referencia, documento, user["name"], user["id"], now,
+    )
+    return {
+        "id": mov_id, "tenant_id": item["tenant_id"], "item_id": item["id"],
+        "setor": item["setor"], "tipo_item": item["tipo_item"],
+        "nome_item": item["nome"], "codigo_item": item.get("codigo", ""),
+        "lote": item.get("lote", ""), "tipo": tipo,
         "direcao": "entrada" if tipo in MOVIMENTOS_ENTRADA else "saida",
-        "quantidade": quantidade,
-        "unidade": item.get("unidade", "un"),
-        "quantidade_antes": quantidade_antes,
-        "quantidade_depois": quantidade_depois,
-        "motivo": motivo,
-        "referencia": referencia,
-        "documento": documento,
-        "usuario": user["name"],
-        "usuario_id": user["id"],
-        "created_at": _now_iso(),
+        "quantidade": quantidade, "unidade": item.get("unidade", "un"),
+        "quantidade_antes": quantidade_antes, "quantidade_depois": quantidade_depois,
+        "motivo": motivo, "referencia": referencia, "documento": documento,
+        "usuario": user["name"], "usuario_id": user["id"], "created_at": now,
     }
-    await db.estoque_movimentos.insert_one(mov)
-    return _serialize(mov)
 
 
 async def _get_item_or_404(item_id: str, tenant_id: str) -> dict:
-    item = await db.estoque_items.find_one(
-        {"id": item_id, "tenant_id": tenant_id}, {"_id": 0}
-    )
+    item = _row(await pg_db.fetch_one(
+        "SELECT * FROM estoque_items WHERE id=$1 AND tenant_id=$2", item_id, tenant_id
+    ))
     if not item:
         raise HTTPException(status_code=404, detail="Item de estoque não encontrado")
     return item
@@ -177,7 +170,6 @@ async def _get_item_or_404(item_id: str, tenant_id: str) -> dict:
 
 @estoque_router.post("/items")
 async def create_item(data: EstoqueItemCreate, request: Request):
-    """Cria novo item de estoque. Único por (mp_id|produto_id) + setor."""
     user = await _get_current_user(request)
 
     if data.setor not in SETORES:
@@ -185,66 +177,56 @@ async def create_item(data: EstoqueItemCreate, request: Request):
     if data.tipo_item not in TIPO_ITEM_VALORES:
         raise HTTPException(status_code=400, detail=f"tipo_item inválido: {data.tipo_item}")
 
-    # Validação semântica: tipo_item por setor
     if data.setor == "FABRICA" and data.tipo_item != "produto_acabado":
         raise HTTPException(status_code=400, detail="Setor FABRICA só aceita produto_acabado")
     if data.setor not in ("FABRICA", "DEVOLUCAO") and data.tipo_item != "mp":
         raise HTTPException(status_code=400, detail=f"Setor {data.setor} só aceita MPs (tipo_item=mp)")
 
-    # Validate structured location format if provided
     if data.localizacao_estruturada and not _LOC_PATTERN.match(data.localizacao_estruturada):
         raise HTTPException(
             status_code=400,
-            detail="Formato de localização inválido. Use: GAL-B-04-1 (sigla-corredor-prateleira-posição)"
+            detail="Formato de localização inválido. Use: GAL-B-04-1 (sigla-corredor-prateleira-posição)",
         )
 
-    # Unicidade: um item por (mp_id|produto_id) + setor
-    dup_query = {"tenant_id": user["tenant_id"], "setor": data.setor}
+    tid = user["tenant_id"]
     if data.mp_id:
-        dup_query["mp_id"] = data.mp_id
+        existing = _row(await pg_db.fetch_one(
+            "SELECT id FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND mp_id=$3",
+            tid, data.setor, data.mp_id,
+        ))
     elif data.produto_id:
-        dup_query["produto_id"] = data.produto_id
+        existing = _row(await pg_db.fetch_one(
+            "SELECT id FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND produto_id=$3",
+            tid, data.setor, data.produto_id,
+        ))
     else:
-        # Sem ref — permitir mas alertar por nome
-        dup_query["nome"] = data.nome
-        dup_query["mp_id"] = None
-        dup_query["produto_id"] = None
+        existing = _row(await pg_db.fetch_one(
+            "SELECT id FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND nome=$3 AND mp_id IS NULL AND produto_id IS NULL",
+            tid, data.setor, data.nome,
+        ))
 
-    existing = await db.estoque_items.find_one(dup_query)
     if existing:
         raise HTTPException(
             status_code=400,
-            detail=f"Já existe um item deste tipo no setor {SETOR_LABELS[data.setor]}. Use movimentação de entrada."
+            detail=f"Já existe um item deste tipo no setor {SETOR_LABELS[data.setor]}. Use movimentação de entrada.",
         )
 
     now = _now_iso()
     item_id = _new_id()
-    item = {
-        "id": item_id,
-        "tenant_id": user["tenant_id"],
-        "tipo_item": data.tipo_item,
-        "setor": data.setor,
-        "nome": data.nome,
-        "codigo": data.codigo,
-        "mp_id": data.mp_id,
-        "produto_id": data.produto_id,
-        "unidade": data.unidade,
-        "quantidade_atual": 0,
-        "estoque_minimo": data.estoque_minimo,
-        "localizacao": data.localizacao,
-        "lote": data.lote,
-        "validade": data.validade,
-        "observacoes": data.observacoes,
-        "posicao_cq": data.posicao_cq if data.posicao_cq in POSICOES_CQ else "livre",
-        "localizacao_estruturada": data.localizacao_estruturada,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.estoque_items.insert_one(item)
+    await pg_db.execute(
+        """INSERT INTO estoque_items
+           (id, tenant_id, tipo_item, setor, nome, codigo, mp_id, produto_id,
+            unidade, quantidade_atual, estoque_minimo, localizacao, lote, validade,
+            observacoes, posicao_cq, localizacao_estruturada, created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+        item_id, tid, data.tipo_item, data.setor, data.nome, data.codigo,
+        data.mp_id, data.produto_id, data.unidade, 0, data.estoque_minimo,
+        data.localizacao, data.lote, data.validade, data.observacoes,
+        data.posicao_cq if data.posicao_cq in POSICOES_CQ else "livre",
+        data.localizacao_estruturada, user["id"], user.get("name", ""), now, now,
+    )
     logger.info(f"Created estoque_item {item_id} setor={data.setor} nome={data.nome}")
-    return _serialize(item)
+    return _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", item_id))
 
 
 @estoque_router.get("/items")
@@ -257,23 +239,30 @@ async def list_items(
     posicao_cq: Optional[str] = None,
 ):
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if setor:
-        query["setor"] = setor
+        clauses.append(f"setor=${i}"); vals.append(setor); i += 1
     if tipo_item:
-        query["tipo_item"] = tipo_item
+        clauses.append(f"tipo_item=${i}"); vals.append(tipo_item); i += 1
     if search:
-        query["$or"] = [
-            {"nome": {"$regex": search, "$options": "i"}},
-            {"codigo": {"$regex": search, "$options": "i"}},
-            {"lote": {"$regex": search, "$options": "i"}},
-        ]
-
+        clauses.append(f"(nome ILIKE ${i} OR codigo ILIKE ${i} OR lote ILIKE ${i})")
+        vals.append(f"%{search}%"); i += 1
     if posicao_cq:
-        query["posicao_cq"] = posicao_cq
-    items = await db.estoque_items.find(query, {"_id": 0}).sort("nome", 1).to_list(5000)
+        clauses.append(f"posicao_cq=${i}"); vals.append(posicao_cq); i += 1
+
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM estoque_items WHERE {' AND '.join(clauses)} ORDER BY nome",
+        *vals,
+    )
+    items = [_row(r) for r in rows]
     if only_low_stock:
-        items = [i for i in items if i.get("quantidade_atual", 0) <= i.get("estoque_minimo", 0) and i.get("estoque_minimo", 0) > 0]
+        items = [
+            it for it in items
+            if it.get("quantidade_atual", 0) <= it.get("estoque_minimo", 0)
+            and it.get("estoque_minimo", 0) > 0
+        ]
     return items
 
 
@@ -286,135 +275,115 @@ async def get_item(item_id: str, request: Request):
 @estoque_router.put("/items/{item_id}")
 async def update_item(item_id: str, data: EstoqueItemUpdate, request: Request):
     user = await _get_current_user(request)
-    item = await _get_item_or_404(item_id, user["tenant_id"])
+    await _get_item_or_404(item_id, user["tenant_id"])
 
     update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
     update_fields["updated_at"] = _now_iso()
 
-    await db.estoque_items.update_one({"id": item_id}, {"$set": update_fields})
-    updated = await db.estoque_items.find_one({"id": item_id}, {"_id": 0})
-    return updated
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in update_fields.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE estoque_items SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, item_id, user["tenant_id"],
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", item_id))
 
 
 @estoque_router.delete("/items/{item_id}")
 async def delete_item(item_id: str, request: Request):
-    """Deleta item apenas se quantidade_atual = 0 (integridade do kardex)"""
     user = await _get_current_user(request)
     item = await _get_item_or_404(item_id, user["tenant_id"])
 
-    if item.get("quantidade_atual", 0) > 0:
+    if float(item.get("quantidade_atual") or 0) > 0:
         raise HTTPException(
             status_code=400,
-            detail=f"Não é possível excluir: saldo = {item['quantidade_atual']} {item.get('unidade', '')}. Zere o saldo antes."
+            detail=f"Não é possível excluir: saldo = {item['quantidade_atual']} {item.get('unidade', '')}. Zere o saldo antes.",
         )
 
-    await db.estoque_items.delete_one({"id": item_id, "tenant_id": user["tenant_id"]})
-    # Movimentos são preservados (kardex imutável)
+    await pg_db.execute(
+        "DELETE FROM estoque_items WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]
+    )
     logger.info(f"Deleted estoque_item {item_id}")
     return {"deleted": item_id}
 
 
 @estoque_router.patch("/items/{item_id}/posicao")
 async def update_posicao_cq(item_id: str, request: Request):
-    """Atualiza posição CQ do item: quarentena → aprovado | reprovado."""
     user = await _get_current_user(request)
     body = await request.json()
     nova_posicao = body.get("posicao_cq")
     if nova_posicao not in POSICOES_CQ:
         raise HTTPException(status_code=400, detail=f"Posição inválida. Permitidas: {POSICOES_CQ}")
-    item = await _get_item_or_404(item_id, user["tenant_id"])
-    await db.estoque_items.update_one(
-        {"id": item_id},
-        {"$set": {"posicao_cq": nova_posicao, "updated_at": _now_iso()}}
+    await _get_item_or_404(item_id, user["tenant_id"])
+    await pg_db.execute(
+        "UPDATE estoque_items SET posicao_cq=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        nova_posicao, _now_iso(), item_id, user["tenant_id"],
     )
-    updated = await db.estoque_items.find_one({"id": item_id}, {"_id": 0})
-    return updated
-
+    return _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", item_id))
 
 
 # ============ MOVIMENTOS (KARDEX - APPEND ONLY) ============
 
 @estoque_router.post("/movimentos")
 async def create_movimento(data: MovimentoCreate, request: Request):
-    """Cria movimento no kardex. Saldo nunca pode ficar negativo."""
     user = await _get_current_user(request)
 
     if data.tipo not in TIPOS_MOVIMENTO:
         raise HTTPException(status_code=400, detail=f"Tipo de movimento inválido. Valores: {TIPOS_MOVIMENTO}")
-
     if data.quantidade <= 0:
         raise HTTPException(status_code=400, detail="Quantidade deve ser > 0")
-
-    # Motivo obrigatório para ajustes
     if data.tipo in MOVIMENTOS_COM_MOTIVO_OBRIGATORIO and not data.motivo.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Motivo é obrigatório para ajustes manuais (rastreabilidade)"
-        )
-
-    # Transferências só via endpoint próprio
+        raise HTTPException(status_code=400, detail="Motivo é obrigatório para ajustes manuais (rastreabilidade)")
     if data.tipo in ("TRANSFERENCIA_ENTRADA", "TRANSFERENCIA_SAIDA"):
         raise HTTPException(
             status_code=400,
-            detail="Transferências devem ser registradas via POST /api/estoque/transferencias"
+            detail="Transferências devem ser registradas via POST /api/estoque/transferencias",
         )
 
     item = await _get_item_or_404(data.item_id, user["tenant_id"])
 
-    # CQ hard stops — check lote status before any movement
     if data.referencia:
-        await cq_verificar_lote_aprovado(db, user["tenant_id"], data.referencia)
+        await cq_verificar_lote_aprovado(None, user["tenant_id"], data.referencia)
     if data.tipo == "SAIDA_EXPEDICAO" and data.referencia:
-        await cq_verificar_liberacao_palete(db, user["tenant_id"], data.referencia)
+        await cq_verificar_liberacao_palete(None, user["tenant_id"], data.referencia)
 
-    quantidade_antes = item.get("quantidade_atual", 0)
+    quantidade_antes = float(item.get("quantidade_atual") or 0)
     delta = data.quantidade if data.tipo in MOVIMENTOS_ENTRADA else -data.quantidade
     quantidade_depois = quantidade_antes + delta
 
-    # Saldo nunca negativo
     if quantidade_depois < 0:
         raise HTTPException(
             status_code=400,
-            detail=f"Saldo insuficiente: atual={quantidade_antes} {item.get('unidade')}, tentativa de saída={data.quantidade}"
+            detail=f"Saldo insuficiente: atual={quantidade_antes} {item.get('unidade')}, tentativa de saída={data.quantidade}",
         )
 
-    # Atualizar item
-    await db.estoque_items.update_one(
-        {"id": data.item_id},
-        {"$set": {"quantidade_atual": quantidade_depois, "updated_at": _now_iso()}}
+    await pg_db.execute(
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
+        quantidade_depois, _now_iso(), data.item_id,
     )
 
-    # Registrar movimento (imutável)
     mov = await _log_movimento(
-        item=item,
-        tipo=data.tipo,
-        quantidade=data.quantidade,
-        motivo=data.motivo,
-        referencia=data.referencia,
-        documento=data.documento,
-        user=user,
-        quantidade_antes=quantidade_antes,
-        quantidade_depois=quantidade_depois,
+        item=item, tipo=data.tipo, quantidade=data.quantidade,
+        motivo=data.motivo, referencia=data.referencia, documento=data.documento,
+        user=user, quantidade_antes=quantidade_antes, quantidade_depois=quantidade_depois,
     )
 
-    updated_item = await db.estoque_items.find_one({"id": data.item_id}, {"_id": 0})
-    return {
-        "movimento": mov,
-        "item": updated_item,
-    }
+    updated_item = _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", data.item_id))
+    return {"movimento": mov, "item": updated_item}
 
 
 @estoque_router.post("/transferencias")
 async def create_transferencia(data: TransferenciaCreate, request: Request):
-    """Transfere quantidade entre setores (2 movimentos: SAIDA + ENTRADA).
-    Se não existir item destino no setor destino, cria um espelho do origem."""
     user = await _get_current_user(request)
 
     if data.setor_destino not in SETORES:
-        raise HTTPException(status_code=400, detail=f"Setor destino inválido")
-
+        raise HTTPException(status_code=400, detail="Setor destino inválido")
     if data.quantidade <= 0:
         raise HTTPException(status_code=400, detail="Quantidade deve ser > 0")
 
@@ -422,105 +391,100 @@ async def create_transferencia(data: TransferenciaCreate, request: Request):
     if origem["setor"] == data.setor_destino:
         raise HTTPException(status_code=400, detail="Setor destino é igual ao origem")
 
-    # Validação semântica: setor de destino precisa aceitar este tipo_item
     if data.setor_destino == "FABRICA" and origem["tipo_item"] != "produto_acabado":
         raise HTTPException(status_code=400, detail="Setor FABRICA só aceita produto_acabado")
     if data.setor_destino != "FABRICA" and origem["tipo_item"] != "mp":
         raise HTTPException(status_code=400, detail=f"Setor {data.setor_destino} só aceita MPs")
 
-    qty_origem_antes = origem.get("quantidade_atual", 0)
+    qty_origem_antes = float(origem.get("quantidade_atual") or 0)
     if data.quantidade > qty_origem_antes:
         raise HTTPException(
             status_code=400,
-            detail=f"Saldo insuficiente no origem: {qty_origem_antes} {origem.get('unidade')}"
+            detail=f"Saldo insuficiente no origem: {qty_origem_antes} {origem.get('unidade')}",
         )
 
-    # Buscar item destino (mesmo mp_id ou produto_id no setor destino)
-    dest_query = {"tenant_id": user["tenant_id"], "setor": data.setor_destino}
+    tid = user["tenant_id"]
     if origem.get("mp_id"):
-        dest_query["mp_id"] = origem["mp_id"]
+        destino = _row(await pg_db.fetch_one(
+            "SELECT * FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND mp_id=$3",
+            tid, data.setor_destino, origem["mp_id"],
+        ))
     elif origem.get("produto_id"):
-        dest_query["produto_id"] = origem["produto_id"]
+        destino = _row(await pg_db.fetch_one(
+            "SELECT * FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND produto_id=$3",
+            tid, data.setor_destino, origem["produto_id"],
+        ))
     else:
-        dest_query["nome"] = origem["nome"]
+        destino = _row(await pg_db.fetch_one(
+            "SELECT * FROM estoque_items WHERE tenant_id=$1 AND setor=$2 AND nome=$3",
+            tid, data.setor_destino, origem["nome"],
+        ))
 
-    destino = await db.estoque_items.find_one(dest_query, {"_id": 0})
     now = _now_iso()
 
-    # Criar item destino se não existir
     if not destino:
         dest_id = _new_id()
-        destino = {
-            "id": dest_id,
-            "tenant_id": user["tenant_id"],
-            "tipo_item": origem["tipo_item"],
-            "setor": data.setor_destino,
-            "nome": origem["nome"],
-            "codigo": origem.get("codigo", ""),
-            "mp_id": origem.get("mp_id"),
-            "produto_id": origem.get("produto_id"),
-            "unidade": origem.get("unidade", "un"),
-            "quantidade_atual": 0,
-            "estoque_minimo": 0,
-            "localizacao": "",
-            "lote": origem.get("lote", ""),
-            "validade": origem.get("validade"),
-            "observacoes": f"Criado automaticamente por transferência de {SETOR_LABELS.get(origem['setor'], origem['setor'])}",
-            "created_by": user["id"],
-            "created_by_name": user["name"],
-            "created_at": now,
-            "updated_at": now,
-        }
-        await db.estoque_items.insert_one(destino)
-        destino.pop("_id", None)
+        await pg_db.execute(
+            """INSERT INTO estoque_items
+               (id, tenant_id, tipo_item, setor, nome, codigo, mp_id, produto_id,
+                unidade, quantidade_atual, estoque_minimo, localizacao, lote, validade,
+                observacoes, posicao_cq, localizacao_estruturada, created_by, created_by_name, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+            dest_id, tid, origem["tipo_item"], data.setor_destino,
+            origem["nome"], origem.get("codigo", ""), origem.get("mp_id"), origem.get("produto_id"),
+            origem.get("unidade", "un"), 0, 0, "", origem.get("lote", ""), origem.get("validade"),
+            f"Criado automaticamente por transferência de {SETOR_LABELS.get(origem['setor'], origem['setor'])}",
+            "livre", "", user["id"], user.get("name", ""), now, now,
+        )
+        destino = _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", dest_id))
 
-    # Atualizar quantidades
     qty_origem_depois = qty_origem_antes - data.quantidade
-    qty_dest_antes = destino.get("quantidade_atual", 0)
+    qty_dest_antes = float(destino.get("quantidade_atual") or 0)
     qty_dest_depois = qty_dest_antes + data.quantidade
 
-    await db.estoque_items.update_one(
-        {"id": origem["id"]},
-        {"$set": {"quantidade_atual": qty_origem_depois, "updated_at": now}}
+    await pg_db.execute(
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
+        qty_origem_depois, now, origem["id"],
     )
-    await db.estoque_items.update_one(
-        {"id": destino["id"]},
-        {"$set": {"quantidade_atual": qty_dest_depois, "updated_at": now}}
+    await pg_db.execute(
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
+        qty_dest_depois, now, destino["id"],
     )
 
-    # Registrar 2 movimentos (pares)
     ref = f"TRANSF-{_new_id()[:8]}"
     mov_saida = await _log_movimento(
         item=origem, tipo="TRANSFERENCIA_SAIDA",
-        quantidade=data.quantidade, motivo=data.motivo or f"Transferência para {SETOR_LABELS.get(data.setor_destino)}",
+        quantidade=data.quantidade,
+        motivo=data.motivo or f"Transferência para {SETOR_LABELS.get(data.setor_destino)}",
         referencia=ref, documento=destino["id"], user=user,
-        quantidade_antes=qty_origem_antes, quantidade_depois=qty_origem_depois
+        quantidade_antes=qty_origem_antes, quantidade_depois=qty_origem_depois,
     )
     mov_entrada = await _log_movimento(
         item=destino, tipo="TRANSFERENCIA_ENTRADA",
-        quantidade=data.quantidade, motivo=data.motivo or f"Transferência de {SETOR_LABELS.get(origem['setor'])}",
+        quantidade=data.quantidade,
+        motivo=data.motivo or f"Transferência de {SETOR_LABELS.get(origem['setor'])}",
         referencia=ref, documento=origem["id"], user=user,
-        quantidade_antes=qty_dest_antes, quantidade_depois=qty_dest_depois
+        quantidade_antes=qty_dest_antes, quantidade_depois=qty_dest_depois,
     )
 
     return {
         "referencia": ref,
         "mov_saida": mov_saida,
         "mov_entrada": mov_entrada,
-        "item_origem": await db.estoque_items.find_one({"id": origem["id"]}, {"_id": 0}),
-        "item_destino": await db.estoque_items.find_one({"id": destino["id"]}, {"_id": 0}),
+        "item_origem": _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", origem["id"])),
+        "item_destino": _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", destino["id"])),
     }
 
 
 @estoque_router.get("/kardex/{item_id}")
 async def get_kardex(item_id: str, request: Request, limit: int = 500):
-    """Retorna histórico imutável de movimentos de um item"""
     user = await _get_current_user(request)
     await _get_item_or_404(item_id, user["tenant_id"])
-    movs = await db.estoque_movimentos.find(
-        {"item_id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(limit)
-    return movs
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM estoque_movimentos WHERE item_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT {limit}",
+        item_id, user["tenant_id"],
+    )
+    return [_row(r) for r in rows]
 
 
 @estoque_router.get("/movimentos")
@@ -532,76 +496,76 @@ async def list_movimentos(
     data_fim: Optional[str] = None,
     limit: int = 500,
 ):
-    """Lista geral de movimentos com filtros (para relatórios)"""
     user = await _get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if setor:
-        query["setor"] = setor
+        clauses.append(f"setor=${i}"); vals.append(setor); i += 1
     if tipo:
-        query["tipo"] = tipo
-    if data_inicio or data_fim:
-        dt = {}
-        if data_inicio:
-            dt["$gte"] = data_inicio
-        if data_fim:
-            dt["$lte"] = data_fim
-        query["created_at"] = dt
+        clauses.append(f"tipo=${i}"); vals.append(tipo); i += 1
+    if data_inicio:
+        clauses.append(f"created_at::date >= ${i}::date"); vals.append(data_inicio); i += 1
+    if data_fim:
+        clauses.append(f"created_at::date <= ${i}::date"); vals.append(data_fim); i += 1
 
-    movs = await db.estoque_movimentos.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
-    return movs
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM estoque_movimentos WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT {limit}",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 # ============ DASHBOARD ============
 
 @estoque_router.get("/dashboard")
 async def estoque_dashboard(request: Request):
-    """Resumo por setor + alertas de estoque mínimo"""
     user = await _get_current_user(request)
     t_id = user["tenant_id"]
 
-    items_all = await db.estoque_items.find({"tenant_id": t_id}, {"_id": 0}).to_list(10000)
+    items_all = [_row(r) for r in await pg_db.fetch_all(
+        "SELECT * FROM estoque_items WHERE tenant_id=$1", t_id
+    )]
 
-    by_setor = {}
+    by_setor: Dict[str, Any] = {}
     low_stock = []
     expiring_soon = []
     today = datetime.now(timezone.utc).date()
+
     for item in items_all:
         setor = item.get("setor", "?")
         by_setor.setdefault(setor, {"total_items": 0, "total_quantidade": 0})
         by_setor[setor]["total_items"] += 1
-        by_setor[setor]["total_quantidade"] += item.get("quantidade_atual", 0)
+        by_setor[setor]["total_quantidade"] += float(item.get("quantidade_atual") or 0)
 
-        # Alerta de baixo estoque
-        if item.get("estoque_minimo", 0) > 0 and item.get("quantidade_atual", 0) <= item["estoque_minimo"]:
+        if item.get("estoque_minimo", 0) > 0 and float(item.get("quantidade_atual") or 0) <= float(item["estoque_minimo"]):
             low_stock.append(item)
 
-        # Alerta de validade próxima (30 dias)
         validade = item.get("validade")
         if validade:
             try:
-                val_date = datetime.fromisoformat(validade).date() if "T" not in validade else datetime.fromisoformat(validade.replace("Z", "+00:00")).date()
+                val_str = validade if isinstance(validade, str) else validade.isoformat()
+                val_date = datetime.fromisoformat(val_str.replace("Z", "+00:00")).date()
                 days_left = (val_date - today).days
                 if 0 <= days_left <= 30:
                     expiring_soon.append({**item, "days_left": days_left})
             except Exception:
                 pass
 
-    # Movimentos das últimas 24h
-    last_24h = await db.estoque_movimentos.count_documents({
-        "tenant_id": t_id,
-        "created_at": {"$gte": (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)).isoformat()}
-    })
-
-    # Obsolescência: itens sem movimento nos últimos 90 dias
-    cutoff_90 = (datetime.now(timezone.utc).replace(tzinfo=None) - __import__("datetime").timedelta(days=90)).isoformat()
-    itens_ids_com_mov = await db.estoque_movimentos.distinct(
-        "item_id",
-        {"tenant_id": t_id, "created_at": {"$gte": cutoff_90}}
+    last_24h = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM estoque_movimentos WHERE tenant_id=$1 AND created_at >= CURRENT_DATE::timestamptz",
+        t_id,
     )
+
+    cutoff_90 = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    active_rows = await pg_db.fetch_all(
+        "SELECT DISTINCT item_id FROM estoque_movimentos WHERE tenant_id=$1 AND created_at >= $2::timestamptz",
+        t_id, cutoff_90,
+    )
+    itens_ativos_ids = {r["item_id"] for r in active_rows}
     obsoletos = [
-        i for i in items_all
-        if i.get("quantidade_atual", 0) > 0
-        and i["id"] not in itens_ids_com_mov
+        it for it in items_all
+        if float(it.get("quantidade_atual") or 0) > 0 and it["id"] not in itens_ativos_ids
     ]
 
     return {
@@ -611,7 +575,8 @@ async def estoque_dashboard(request: Request):
                 "label": SETOR_LABELS.get(s, s),
                 "total_items": by_setor.get(s, {}).get("total_items", 0),
                 "total_quantidade": by_setor.get(s, {}).get("total_quantidade", 0),
-            } for s in SETORES
+            }
+            for s in SETORES
         ],
         "alertas": {
             "baixo_estoque": low_stock,
@@ -637,39 +602,34 @@ async def get_options():
 
 @estoque_router.get("/alertas/obsolescencia")
 async def alertas_obsolescencia(request: Request, dias: int = 90):
-    """Items with saldo > 0 but no movement in the last N days."""
     user = await _get_current_user(request)
     t_id = user["tenant_id"]
-    from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
-    itens_ativos_ids = await db.estoque_movimentos.distinct(
-        "item_id",
-        {"tenant_id": t_id, "created_at": {"$gte": cutoff}}
+    active_rows = await pg_db.fetch_all(
+        "SELECT DISTINCT item_id FROM estoque_movimentos WHERE tenant_id=$1 AND created_at >= $2::timestamptz",
+        t_id, cutoff,
     )
-    items = await db.estoque_items.find(
-        {"tenant_id": t_id, "quantidade_atual": {"$gt": 0}},
-        {"_id": 0}
-    ).to_list(10000)
-    obsoletos = [i for i in items if i["id"] not in itens_ativos_ids]
+    itens_ativos_ids = {r["item_id"] for r in active_rows}
+    items = [_row(r) for r in await pg_db.fetch_all(
+        "SELECT * FROM estoque_items WHERE tenant_id=$1 AND quantidade_atual > 0", t_id
+    )]
+    obsoletos = [it for it in items if it["id"] not in itens_ativos_ids]
     return {"dias_sem_movimento": dias, "total": len(obsoletos), "items": obsoletos}
 
 
 @estoque_router.get("/fifo-sugestao")
 async def fifo_sugestao(request: Request, nome: str, setor: Optional[str] = None):
-    """
-    Returns all lots of an item sorted by validade ASC (FIFO).
-    Operator should consume from top of list first.
-    """
     user = await _get_current_user(request)
-    query: Dict[str, Any] = {
-        "tenant_id": user["tenant_id"],
-        "nome": {"$regex": nome, "$options": "i"},
-        "quantidade_atual": {"$gt": 0},
-        "posicao_cq": "aprovado",
-    }
+    clauses = ["tenant_id=$1", "nome ILIKE $2", "quantidade_atual > 0", "posicao_cq='aprovado'"]
+    vals = [user["tenant_id"], f"%{nome}%"]
+    i = 3
     if setor:
-        query["setor"] = setor
-    items = await db.estoque_items.find(query, {"_id": 0}).to_list(100)
-    # Sort by validade (None = infinite = last)
+        clauses.append(f"setor=${i}"); vals.append(setor); i += 1
+
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM estoque_items WHERE {' AND '.join(clauses)}",
+        *vals,
+    )
+    items = [_row(r) for r in rows]
     items.sort(key=lambda x: x.get("validade") or "9999-99-99")
     return {"fifo_order": items, "total_lotes": len(items)}

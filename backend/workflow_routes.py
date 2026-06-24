@@ -14,11 +14,13 @@ Public API for the workflow engine:
 - /api/workflow/admin/reset-data               (admin: wipe operational data — KEEPS users/tenants/configs)
 """
 
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
 
+import database as pg_db
 from workflow_engine import (
     audit_log,
     list_audit_logs,
@@ -36,6 +38,16 @@ from workflow_engine import (
 logger = logging.getLogger(__name__)
 
 workflow_router = APIRouter(prefix="/api/workflow")
+
+
+def _row(row) -> dict | None:
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+    return d
 
 # Module state
 db = None
@@ -132,9 +144,10 @@ async def tasks_by_entity(entity_type: str, entity_id: str, request: Request):
 @workflow_router.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
     user = await _get_current_user(request)
-    task = await db.workflow_tasks.find_one(
-        {"id": task_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    task = _row(await pg_db.fetch_one(
+        "SELECT * FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, user["tenant_id"],
+    ))
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     return task
@@ -167,9 +180,10 @@ async def create_task(data: TaskCreateInput, request: Request):
 @workflow_router.put("/tasks/{task_id}")
 async def update_task(task_id: str, data: TaskUpdateInput, request: Request):
     user = await _get_current_user(request)
-    existing = await db.workflow_tasks.find_one(
-        {"id": task_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT * FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, user["tenant_id"],
+    ))
     if not existing:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
 
@@ -181,26 +195,25 @@ async def update_task(task_id: str, data: TaskUpdateInput, request: Request):
         raise HTTPException(status_code=400, detail="Registro de conclusao e imutavel. Tarefas concluidas nao podem ser alteradas.")
     if "status" in updates and updates["status"] == "concluida":
         raise HTTPException(status_code=400, detail="Use o endpoint de conclusao ou decisao formal para fechar a tarefa.")
-
     if "status" in updates and updates["status"] not in TASK_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status inválido: {updates['status']}")
 
     if "responsible_id" in updates:
-        u = await db.users.find_one(
-            {"id": updates["responsible_id"], "tenant_id": user["tenant_id"]},
-            {"_id": 0, "name": 1, "role": 1},
-        )
+        u = _row(await pg_db.fetch_one(
+            "SELECT id, name, role FROM users WHERE id=$1 AND tenant_id=$2",
+            updates["responsible_id"], user["tenant_id"],
+        ))
         updates["responsible_name"] = (u or {}).get("name", "")
         if updates["responsible_id"] != existing.get("responsible_id"):
             if not assignment_reason:
                 raise HTTPException(status_code=400, detail="Informe o motivo do repasse da tarefa.")
             current_role = None
             if existing.get("responsible_id"):
-                current_user = await db.users.find_one(
-                    {"id": existing["responsible_id"], "tenant_id": user["tenant_id"]},
-                    {"_id": 0, "role": 1},
-                )
-                current_role = (current_user or {}).get("role")
+                cur = _row(await pg_db.fetch_one(
+                    "SELECT role FROM users WHERE id=$1 AND tenant_id=$2",
+                    existing["responsible_id"], user["tenant_id"],
+                ))
+                current_role = (cur or {}).get("role")
             new_role = (u or {}).get("role")
             if current_role and new_role and current_role != new_role:
                 raise HTTPException(status_code=400, detail="O repasse de tarefa so pode ocorrer entre usuarios do mesmo perfil.")
@@ -216,8 +229,24 @@ async def update_task(task_id: str, data: TaskUpdateInput, request: Request):
             updates["assignment_history"] = history
 
     updates["updated_at"] = _now_iso()
-    await db.workflow_tasks.update_one(
-        {"id": task_id, "tenant_id": user["tenant_id"]}, {"$set": updates}
+    ALLOWED = {"title", "description", "due_date", "responsible_id", "responsible_name",
+               "assignment_history", "status", "blocking"}
+    set_parts = []
+    params: list = []
+    idx = 1
+    for k, v in updates.items():
+        if k not in ALLOWED:
+            continue
+        set_parts.append(f"{k}=${idx}")
+        params.append(v)
+        idx += 1
+    set_parts.append(f"updated_at=${idx}")
+    params.append(updates["updated_at"])
+    idx += 1
+    params.extend([task_id, user["tenant_id"]])
+    await pg_db.execute(
+        f"UPDATE workflow_tasks SET {', '.join(set_parts)} WHERE id=${idx} AND tenant_id=${idx+1}",
+        *params,
     )
 
     if "responsible_id" in updates and updates["responsible_id"] != existing.get("responsible_id"):
@@ -226,6 +255,8 @@ async def update_task(task_id: str, data: TaskUpdateInput, request: Request):
             user_id=updates["responsible_id"],
             title=f"Tarefa repassada: {existing.get('title', '')}",
             message=f"{user.get('name', '')} atribuiu esta tarefa para voce.",
+            entity_type=existing.get("entity_type", ""),
+            entity_id=existing.get("entity_id", ""),
             metadata={"task_id": task_id, "entity_type": existing.get("entity_type"), "entity_id": existing.get("entity_id")},
         )
 
@@ -239,7 +270,7 @@ async def update_task(task_id: str, data: TaskUpdateInput, request: Request):
         before={k: existing.get(k) for k in updates if k != "updated_at"},
         after=updates,
     )
-    return await db.workflow_tasks.find_one({"id": task_id}, {"_id": 0})
+    return _row(await pg_db.fetch_one("SELECT * FROM workflow_tasks WHERE id=$1", task_id))
 
 
 @workflow_router.put("/tasks/{task_id}/complete")
@@ -267,12 +298,16 @@ async def delete_task(task_id: str, request: Request):
     user = await _get_current_user(request)
     if user.get("role") not in ("admin", "gestor", "lider_pd", "sales_ops"):
         raise HTTPException(status_code=403, detail="Apenas admin/lider_pd/sales_ops podem excluir tarefas")
-    existing = await db.workflow_tasks.find_one(
-        {"id": task_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT * FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, user["tenant_id"],
+    ))
     if not existing:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada")
-    await db.workflow_tasks.delete_one({"id": task_id, "tenant_id": user["tenant_id"]})
+    await pg_db.execute(
+        "DELETE FROM workflow_tasks WHERE id=$1 AND tenant_id=$2",
+        task_id, user["tenant_id"],
+    )
     await audit_log(
         tenant_id=user["tenant_id"],
         user_id=user["id"],
@@ -329,19 +364,20 @@ async def get_entity_audit(entity_type: str, entity_id: str, request: Request):
 @workflow_router.post("/tasks/check-reminders")
 async def check_task_reminders(request: Request):
     """Checks for D-1 reminders and auto-escalation for overdue blocking tasks."""
-    from datetime import datetime, timezone, timedelta
     user = await _get_current_user(request)
     now = datetime.now(timezone.utc)
     tomorrow_start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow_end = (now + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     # D-1: tasks due tomorrow not yet reminded
-    d1_tasks = await db.workflow_tasks.find({
-        "tenant_id": user["tenant_id"],
-        "status": {"$in": ["pendente", "em_andamento"]},
-        "due_date": {"$gte": tomorrow_start.isoformat(), "$lt": tomorrow_end.isoformat()},
-        "d1_notified": {"$ne": True},
-    }, {"_id": 0}).to_list(500)
+    d1_tasks = [dict(r) for r in await pg_db.fetch_all(
+        """SELECT id, title, due_date, entity_type, entity_id, responsible_id
+           FROM workflow_tasks
+           WHERE tenant_id=$1 AND status IN ('pendente', 'em_andamento')
+             AND due_date >= $2 AND due_date < $3
+             AND (d1_notified IS NULL OR d1_notified = FALSE)""",
+        user["tenant_id"], tomorrow_start.isoformat(), tomorrow_end.isoformat(),
+    )]
 
     notified_count = 0
     for task in d1_tasks:
@@ -350,29 +386,33 @@ async def check_task_reminders(request: Request):
                 tenant_id=user["tenant_id"],
                 user_id=task["responsible_id"],
                 title=f"Lembrete D-1: {task['title']}",
-                message=f"Vence amanhã ({task.get('due_date','')[:10]}). Entidade: {task.get('entity_type','')}/{task.get('entity_id','')[:8]}",
+                message=f"Vence amanhã ({(task.get('due_date') or '')[:10]}). Entidade: {task.get('entity_type','')}/{(task.get('entity_id') or '')[:8]}",
                 notif_type="d1_reminder",
                 entity_type=task.get("entity_type", ""),
                 entity_id=task.get("entity_id", ""),
             )
-        await db.workflow_tasks.update_one({"id": task["id"]}, {"$set": {"d1_notified": True}})
+        await pg_db.execute(
+            "UPDATE workflow_tasks SET d1_notified=TRUE WHERE id=$1",
+            task["id"],
+        )
         notified_count += 1
 
     # Escalation: blocking tasks overdue > 3 days, not yet escalated
     cutoff_3d = (now - timedelta(days=3)).isoformat()
-    overdue_tasks = await db.workflow_tasks.find({
-        "tenant_id": user["tenant_id"],
-        "status": {"$in": ["pendente", "em_andamento"]},
-        "due_date": {"$lt": cutoff_3d},
-        "escalated": {"$ne": True},
-        "blocking": True,
-    }, {"_id": 0}).to_list(500)
+    overdue_tasks = [dict(r) for r in await pg_db.fetch_all(
+        """SELECT id FROM workflow_tasks
+           WHERE tenant_id=$1 AND status IN ('pendente', 'em_andamento')
+             AND due_date < $2
+             AND (escalated IS NULL OR escalated = FALSE)
+             AND blocking = TRUE""",
+        user["tenant_id"], cutoff_3d,
+    )]
 
     escalated_count = 0
     for task in overdue_tasks:
-        await db.workflow_tasks.update_one(
-            {"id": task["id"]},
-            {"$set": {"escalated": True, "escalated_at": now.isoformat()}}
+        await pg_db.execute(
+            "UPDATE workflow_tasks SET escalated=TRUE, escalated_at=$1, updated_at=NOW() WHERE id=$2",
+            now.isoformat(), task["id"],
         )
         escalated_count += 1
 
@@ -397,31 +437,50 @@ async def reset_operational_data(request: Request):
 
     tid = user["tenant_id"]
     deletions = {}
-    collections = [
-        "crm_clients", "crm_projects", "crm_samples", "skus",
-        "pd_cards", "crm_alerts",
-        "workflow_tasks", "audit_logs",
-        "tasks", "messages", "notifications", "card_history", "card_products",
-        "field_values", "cards",
-        "pd_requests", "pd_request_status_history", "pd_developments",
-        "pd_formulas", "pd_formula_items", "pd_tests", "pd_samples",
-        "pd_approvals", "pd_costs", "pd_documents", "pd_stability_studies",
-        "pd_stability_readings",
-        "pd_updates", "pd_pending_items",
-        "estoque_items", "estoque_movimentos",
-        "homologacao_mps", "homologacao_fornecedores",
-        "files", "email_logs",
+
+    # PostgreSQL tables (migrated)
+    pg_tables = [
+        "crm_clients", "crm_projects", "crm_samples", "skus", "crm_alerts",
+        "crm_column_configs", "crm_field_configs", "lead_sources",
+        "workflow_tasks", "audit_logs", "notifications",
+        "contratos", "order_material_requirements",
+        "pd_cards", "pd_requests", "pd_document_versions",
+        # 7.2 migrated:
+        "retrabalho_ordens", "recebimentos", "recebimento_sla_config",
+        "estoque_movimentos", "estoque_items",
+        "expedicao_ordens", "propostas_comerciais",
+        # 7.3 migrated:
+        "faturamento_notas", "faturamento_duplicatas",
+        "pcp_lotes", "pcp_programacao", "pcp_calendario", "pcp_linhas",
+        "produtos_pai", "bom_items",
     ]
-    for col in collections:
+    for tbl in pg_tables:
+        try:
+            await pg_db.execute(f"DELETE FROM {tbl} WHERE tenant_id=$1", tid)
+            deletions[f"pg_{tbl}"] = "ok"
+        except Exception as e:
+            deletions[f"pg_{tbl}"] = f"err: {e}"
+
+    await pg_db.execute(
+        "DELETE FROM counters WHERE id LIKE $1",
+        f"%:{tid}",
+    )
+    deletions["pg_counters"] = "ok"
+
+    # MongoDB collections not yet migrated
+    mongo_collections = [
+        "tasks", "messages", "card_history", "card_products",
+        "field_values", "cards",
+        "homologacao_mps", "homologacao_fornecedores",
+        "files", "email_logs", "orders",
+        "kickoffs", "pd_ficha_tecnica",
+    ]
+    for col in mongo_collections:
         try:
             res = await db[col].delete_many({"tenant_id": tid})
             deletions[col] = res.deleted_count
         except Exception as e:  # pragma: no cover
             deletions[col] = f"err: {e}"
-
-    # Counters use _id like "name:tenant_id"
-    counters_res = await db.counters.delete_many({"_id": {"$regex": f":{tid}$"}})
-    deletions["counters"] = counters_res.deleted_count
 
     await audit_log(
         tenant_id=tid,

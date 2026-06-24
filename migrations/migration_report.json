@@ -1,0 +1,44 @@
+{
+  "executado_em": "2026-06-22T15:53:19.590337+00:00",
+  "total": 9,
+  "migrados": [],
+  "ja_migrados": [
+    {
+      "email": "admin@kuryos.com",
+      "id": "4fb64562-9778-48eb-9065-5cfa9a689a72"
+    },
+    {
+      "email": "vendedor@kuryos.com",
+      "id": "ac49c3b8-5c92-4a89-911a-aa562bad1885"
+    },
+    {
+      "email": "salesops@kuryos.com",
+      "id": "4f8a3ae3-2c87-4735-b623-112b9ad9db8b"
+    },
+    {
+      "email": "formulador@kuryos.com",
+      "id": "fb0458ed-523a-4a95-b0a2-b3c05ff830e4"
+    },
+    {
+      "email": "qa@kuryos.com",
+      "id": "92bc8840-9aff-4ea7-8df9-e533adb8bb89"
+    },
+    {
+      "email": "liderpd@kuryos.com",
+      "id": "df608454-9759-463d-b29f-90ce3669215a"
+    },
+    {
+      "email": "engenharia@kuryos.com",
+      "id": "57f81a96-1d5f-4229-b749-7d5aab51f552"
+    },
+    {
+      "email": "sucesso@kuryos.com",
+      "id": "131fc610-56cb-4434-9998-893f83bb514d"
+    },
+    {
+      "email": "test_vendedor_e2e@kuryos.test",
+      "id": "385e4d9d-1cb0-4f48-af0a-929871625247"
+    }
+  ],
+  "erros": []
+}

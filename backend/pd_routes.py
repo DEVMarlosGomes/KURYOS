@@ -15,7 +15,8 @@ import io
 import logging
 import asyncio
 from validation_utils import clean_text, normalize_cnpj, normalize_email, normalize_phone, is_valid_cnpj, is_valid_email, is_valid_phone
-from workflow_engine import create_workflow_task, audit_log, get_blocking_tasks
+from workflow_engine import create_workflow_task, audit_log, get_blocking_tasks, next_sequence_pg
+import database as pg_db
 from rbac import (
     require_roles,
     has_role,
@@ -59,6 +60,34 @@ def new_id():
 
 def now_iso():
     return now_iso_func()
+
+
+def _row(row) -> dict:
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in list(d.items()):
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def _rows(rows) -> list:
+    return [_row(r) for r in (rows or [])]
+
+
+_PD_CARD_DIRECT_COLS = {
+    "id", "tenant_id", "amostra_id", "amostra_variacao_id", "pd_request_id",
+    "status_pd", "executor_id", "executor_name", "atribuido_em", "atribuido_por",
+    "atribuido_por_nome", "extra", "created_at", "updated_at",
+}
+
+
+def _flatten_pd_card(d: dict) -> dict:
+    if not d:
+        return d
+    extra = d.pop("extra", {}) or {}
+    return {**extra, **d}
 
 
 def _validate_supplier_payload(payload: dict) -> dict:
@@ -396,7 +425,7 @@ def _summarize_stability_conditions(study: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _recalculate_stability_study(study_id: str) -> Dict[str, Any]:
-    study = await db.pd_stability_studies.find_one({"id": study_id}, {"_id": 0})
+    study = _row(await pg_db.fetch_one("SELECT * FROM pd_stability_studies WHERE id=$1", study_id))
     if not study:
         raise HTTPException(status_code=404, detail="Estudo de estabilidade nao encontrado")
 
@@ -405,25 +434,18 @@ async def _recalculate_stability_study(study_id: str) -> Dict[str, Any]:
     if recalculated["summary"]["overall_status"] == "concluido":
         status = "concluido"
 
-    await db.pd_stability_studies.update_one(
-        {"id": study_id},
-        {
-            "$set": {
-                "conditions": recalculated["conditions"],
-                "summary": recalculated["summary"],
-                "status": status,
-                "updated_at": now_iso(),
-            }
-        },
+    await pg_db.execute(
+        "UPDATE pd_stability_studies SET conditions=$1, summary=$2, status=$3, updated_at=NOW() WHERE id=$4",
+        recalculated["conditions"], recalculated["summary"], status, study_id,
     )
-    return await db.pd_stability_studies.find_one({"id": study_id}, {"_id": 0})
+    return _row(await pg_db.fetch_one("SELECT * FROM pd_stability_studies WHERE id=$1", study_id))
 
 
 async def _ensure_stability_study_for_pd_card(card: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
-    existing = await db.pd_stability_studies.find_one(
-        {"tenant_id": user["tenant_id"], "pd_card_id": card["id"]},
-        {"_id": 0},
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_stability_studies WHERE tenant_id=$1 AND pd_card_id=$2",
+        user["tenant_id"], card["id"],
+    ))
     if existing:
         return existing
 
@@ -454,8 +476,21 @@ async def _ensure_stability_study_for_pd_card(card: Dict[str, Any], user: Dict[s
     summary = _summarize_stability_conditions(study)
     study["conditions"] = summary["conditions"]
     study["summary"] = summary["summary"]
-    await db.pd_stability_studies.insert_one(study)
-    study.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_stability_studies
+           (id, tenant_id, pd_card_id, amostra_id, amostra_variacao_id, amostra_numero,
+            numero_completo, produto, cliente, cliente_id, projeto_id, projeto_nome,
+            status, d0_completed, started_at, conditions, summary, created_at, created_by,
+            created_by_name, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+        study["id"], study["tenant_id"], study["pd_card_id"], study.get("amostra_id"),
+        study.get("amostra_variacao_id"), study.get("amostra_numero", ""),
+        study.get("numero_completo", ""), study.get("produto", ""), study.get("cliente", ""),
+        study.get("cliente_id"), study.get("projeto_id"), study.get("projeto_nome", ""),
+        study["status"], study["d0_completed"], study["started_at"],
+        study["conditions"], study["summary"], study["created_at"], study["created_by"],
+        study.get("created_by_name", ""), study["updated_at"],
+    )
 
     await audit_log(
         tenant_id=user["tenant_id"],
@@ -530,10 +565,11 @@ async def _create_stability_alert_task(
 
 
 async def check_stability_alerts_for_tenant(tenant_id: str) -> int:
-    studies = await db.pd_stability_studies.find(
-        {"tenant_id": tenant_id, "status": {"$in": list(STABILITY_OPEN_STATUSES)}},
-        {"_id": 0},
-    ).to_list(2000)
+    statuses = list(STABILITY_OPEN_STATUSES)
+    studies = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_stability_studies WHERE tenant_id=$1 AND status = ANY($2::text[])",
+        tenant_id, statuses,
+    ))
     created = 0
     now = datetime.now(timezone.utc)
 
@@ -557,7 +593,7 @@ async def run_stability_scheduler():
     await asyncio.sleep(60)
     while True:
         try:
-            tenants = await db.tenants.find({}, {"_id": 0, "id": 1}).to_list(500)
+            tenants = await pg_db.fetch_all("SELECT id FROM tenants")
             for tenant in tenants:
                 created = await check_stability_alerts_for_tenant(tenant["id"])
                 # Persist last-run for UI visibility
@@ -599,25 +635,23 @@ def _document_version_code(doc_type: str, version_number: int) -> str:
 
 
 async def _get_pd_request_context(req_id: str, tenant_id: str) -> Dict[str, Any]:
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": tenant_id}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, tenant_id))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
 
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id, "tenant_id": tenant_id}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1 AND tenant_id=$2", req_id, tenant_id))
     approval = None
     lab_results = {}
     latest_formula = None
     formula_items = []
     if dev:
-        approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
-        lab_results = await db.pd_lab_results.find_one({"development_id": dev["id"]}, {"_id": 0}) or {}
-        latest_formula = await db.pd_formulas.find_one(
-            {"development_id": dev["id"]},
-            {"_id": 0},
-            sort=[("version", -1)]
-        )
+        approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev["id"]))
+        lab_results = _row(await pg_db.fetch_one("SELECT * FROM pd_lab_results WHERE development_id=$1", dev["id"])) or {}
+        latest_formula = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev["id"]
+        ))
         if latest_formula:
-            formula_items = await db.pd_formula_items.find({"formula_id": latest_formula["id"]}, {"_id": 0}).to_list(500)
+            formula_items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", latest_formula["id"]))
 
     return {
         "request": pd_req,
@@ -633,10 +667,10 @@ async def _enrich_formula_items(tenant_id: str, formula_items: List[Dict[str, An
     catalog_ids = [item.get("catalog_id") for item in formula_items if item.get("catalog_id")]
     catalog_map: Dict[str, Dict[str, Any]] = {}
     if catalog_ids:
-        catalog_docs = await db.pd_catalog.find(
-            {"tenant_id": tenant_id, "id": {"$in": catalog_ids}},
-            {"_id": 0}
-        ).to_list(1000)
+        catalog_docs = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_catalog WHERE tenant_id=$1 AND id = ANY($2::text[])",
+            tenant_id, catalog_ids,
+        ))
         catalog_map = {doc["id"]: doc for doc in catalog_docs if doc.get("id")}
 
     base_volume = (formula or {}).get("volume", 0) or 0
@@ -873,14 +907,15 @@ async def _generate_live_document_version(
 
     changed_fields = changed_fields or []
     snapshot = await _build_live_document_snapshot(req_id, doc_type, user["tenant_id"])
-    current_versions = await db.pd_document_versions.find(
-        {"tenant_id": user["tenant_id"], "pd_request_id": req_id, "doc_type": doc_type},
-        {"_id": 0, "version_number": 1}
-    ).sort("version_number", -1).to_list(1)
-    next_version = (current_versions[0]["version_number"] + 1) if current_versions else 1
+    last_ver = _row(await pg_db.fetch_one(
+        "SELECT version_number FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 ORDER BY version_number DESC LIMIT 1",
+        user["tenant_id"], req_id, doc_type,
+    ))
+    next_version = (last_ver["version_number"] + 1) if last_ver else 1
 
+    dv_id = new_id()
     doc_version = {
-        "id": new_id(),
+        "id": dv_id,
         "tenant_id": user["tenant_id"],
         "pd_request_id": req_id,
         "doc_type": doc_type,
@@ -899,11 +934,22 @@ async def _generate_live_document_version(
         "approved_at": None,
         "approval_task_ids": [],
     }
-    await db.pd_document_versions.insert_one(doc_version)
+    await pg_db.execute(
+        """INSERT INTO pd_document_versions
+           (id, tenant_id, pd_request_id, doc_type, version_number, version_code, status,
+            active_for_operation, snapshot, reason, changed_fields, source_trigger,
+            created_by, created_by_name, created_at, updated_at, approved_at, approval_task_ids)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)""",
+        dv_id, user["tenant_id"], req_id, doc_type, next_version,
+        doc_version["version_code"], "em_revisao", False, snapshot,
+        doc_version["reason"], changed_fields, trigger,
+        user["id"], user["name"], doc_version["created_at"], doc_version["updated_at"],
+        None, [],
+    )
     approval_task_ids = await _create_document_approval_tasks(doc_version, user, reason, changed_fields, source_changes)
-    await db.pd_document_versions.update_one(
-        {"id": doc_version["id"]},
-        {"$set": {"approval_task_ids": approval_task_ids}}
+    await pg_db.execute(
+        "UPDATE pd_document_versions SET approval_task_ids=$1 WHERE id=$2",
+        approval_task_ids, dv_id,
     )
     doc_version["approval_task_ids"] = approval_task_ids
     return doc_version
@@ -1006,7 +1052,7 @@ async def _auto_generate_documents_for_development(
     epa_changed_fields: Optional[List[str]] = None,
     source_changes: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0, "pd_request_id": 1})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev or not dev.get("pd_request_id"):
         return []
     return await _auto_generate_documents_for_request(
@@ -1022,17 +1068,16 @@ async def _auto_generate_documents_for_development(
 async def _request_ids_from_formula_ids(formula_ids: List[str], tenant_id: str) -> List[str]:
     if not formula_ids:
         return []
-    formulas = await db.pd_formulas.find(
-        {"id": {"$in": formula_ids}},
-        {"_id": 0, "development_id": 1}
-    ).to_list(1000)
-    dev_ids = [formula.get("development_id") for formula in formulas if formula.get("development_id")]
+    formulas = _rows(await pg_db.fetch_all(
+        "SELECT development_id FROM pd_formulas WHERE id = ANY($1::text[])", formula_ids,
+    ))
+    dev_ids = [f.get("development_id") for f in formulas if f.get("development_id")]
     if not dev_ids:
         return []
-    devs = await db.pd_developments.find(
-        {"tenant_id": tenant_id, "id": {"$in": dev_ids}},
-        {"_id": 0, "pd_request_id": 1}
-    ).to_list(1000)
+    devs = _rows(await pg_db.fetch_all(
+        "SELECT pd_request_id FROM pd_developments WHERE tenant_id=$1 AND id = ANY($2::text[])",
+        tenant_id, dev_ids,
+    ))
     return list({dev.get("pd_request_id") for dev in devs if dev.get("pd_request_id")})
 
 
@@ -1047,10 +1092,9 @@ async def _auto_generate_documents_for_catalog_items(
 ) -> List[Dict[str, Any]]:
     if not catalog_ids:
         return []
-    formula_items = await db.pd_formula_items.find(
-        {"catalog_id": {"$in": catalog_ids}},
-        {"_id": 0, "formula_id": 1}
-    ).to_list(5000)
+    formula_items = _rows(await pg_db.fetch_all(
+        "SELECT formula_id FROM pd_formula_items WHERE catalog_id = ANY($1::text[])", catalog_ids,
+    ))
     formula_ids = list({item.get("formula_id") for item in formula_items if item.get("formula_id")})
     request_ids = await _request_ids_from_formula_ids(formula_ids, user["tenant_id"])
     generated: List[Dict[str, Any]] = []
@@ -1067,11 +1111,16 @@ async def _auto_generate_documents_for_catalog_items(
 
 
 async def _get_live_document_version(version_id: str, user: dict) -> Dict[str, Any]:
-    query = {"id": version_id, "tenant_id": user["tenant_id"]}
     if not _user_can_review_live_documents(user):
-        query["status"] = "aprovado"
-        query["active_for_operation"] = True
-    doc_version = await db.pd_document_versions.find_one(query, {"_id": 0})
+        doc_version = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_document_versions WHERE id=$1 AND tenant_id=$2 AND status='aprovado' AND active_for_operation=TRUE",
+            version_id, user["tenant_id"],
+        ))
+    else:
+        doc_version = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_document_versions WHERE id=$1 AND tenant_id=$2",
+            version_id, user["tenant_id"],
+        ))
     if not doc_version:
         raise HTTPException(status_code=404, detail="Versao de documento nao encontrada")
     approval_tasks = await db.workflow_tasks.find(
@@ -1127,20 +1176,32 @@ async def create_pd_request(data: PDRequestCreate, request: Request):
         "updated_at": now_iso(),
     }
     
-    await db.pd_requests.insert_one(pd_request)
-    pd_request.pop("_id", None)
-    
+    await pg_db.execute(
+        """INSERT INTO pd_requests
+           (id, tenant_id, client_card_id, client_name, project_name, technical_name,
+            commercial_name, internal_code, request_type, category, description,
+            references, restrictions, volume, packaging, priority, deadline, status,
+            is_internal_research, kickoff_completed, created_by, created_by_name,
+            created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)""",
+        pd_request["id"], pd_request["tenant_id"], pd_request.get("client_card_id"),
+        pd_request["client_name"], pd_request["project_name"], pd_request["technical_name"],
+        pd_request["commercial_name"], pd_request["internal_code"], pd_request["request_type"],
+        pd_request["category"], pd_request["description"], pd_request.get("references",""),
+        pd_request.get("restrictions",""), pd_request.get("volume",""), pd_request.get("packaging",""),
+        pd_request["priority"], pd_request.get("deadline"), pd_request["status"],
+        pd_request["is_internal_research"], pd_request["kickoff_completed"],
+        pd_request["created_by"], pd_request["created_by_name"],
+        pd_request["created_at"], pd_request["updated_at"],
+    )
+
     # Log initial status
-    await db.pd_request_status_history.insert_one({
-        "id": new_id(),
-        "pd_request_id": req_id,
-        "from_status": None,
-        "to_status": "OPEN",
-        "changed_by": user["id"],
-        "changed_by_name": user["name"],
-        "comment": "Solicitação criada",
-        "created_at": now_iso(),
-    })
+    await pg_db.execute(
+        """INSERT INTO pd_request_status_history
+           (id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+        new_id(), req_id, None, "OPEN", user["id"], user["name"], "Solicitação criada", now_iso(),
+    )
     
     return pd_request
 
@@ -1148,18 +1209,23 @@ async def create_pd_request(data: PDRequestCreate, request: Request):
 async def list_pd_requests(request: Request, status: Optional[str] = None):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    query = {"tenant_id": user["tenant_id"]}
     if status:
-        query["status"] = status
-    
-    requests_list = await db.pd_requests.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+        requests_list = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_requests WHERE tenant_id=$1 AND status=$2 ORDER BY created_at DESC",
+            user["tenant_id"], status,
+        ))
+    else:
+        requests_list = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_requests WHERE tenant_id=$1 ORDER BY created_at DESC",
+            user["tenant_id"],
+        ))
     return requests_list
 
 @pd_router.get("/requests/{req_id}")
 async def get_pd_request(req_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     return pd_req
@@ -1168,7 +1234,7 @@ async def get_pd_request(req_id: str, request: Request):
 async def update_pd_request(req_id: str, data: PDRequestUpdate, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    existing = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not existing:
         raise HTTPException(status_code=404, detail="Solicitacao nao encontrada")
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
@@ -1188,14 +1254,16 @@ async def update_pd_request(req_id: str, data: PDRequestUpdate, request: Request
     )
 
     update_fields["updated_at"] = now_iso()
-    result = await db.pd_requests.update_one(
-        {"id": req_id, "tenant_id": user["tenant_id"]},
-        {"$set": update_fields}
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    vals = list(update_fields.values()) + [req_id, user["tenant_id"]]
+    updated_row = await pg_db.fetch_one(
+        f"UPDATE pd_requests SET {set_parts} WHERE id=${len(vals)-1} AND tenant_id=${len(vals)} RETURNING id",
+        *vals,
     )
-    if result.matched_count == 0:
+    if not updated_row:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    
-    pd_req = await db.pd_requests.find_one({"id": req_id}, {"_id": 0})
+
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1", req_id))
     ficha_changed_fields: List[str] = []
     epa_changed_fields: List[str] = []
     if any(field in update_fields for field in ("technical_name", "commercial_name", "internal_code", "client_name")):
@@ -1221,24 +1289,25 @@ async def update_pd_request(req_id: str, data: PDRequestUpdate, request: Request
 async def delete_pd_request(req_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    result = await db.pd_requests.delete_one({"id": req_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_one("DELETE FROM pd_requests WHERE id=$1 AND tenant_id=$2 RETURNING id", req_id, user["tenant_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     # Clean up related data
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
     if dev:
         dev_id = dev["id"]
-        formula_ids = [f["id"] for f in await db.pd_formulas.find({"development_id": dev_id}, {"id": 1, "_id": 0}).to_list(100)]
+        formula_rows = await pg_db.fetch_all("SELECT id FROM pd_formulas WHERE development_id=$1", dev_id)
+        formula_ids = [f["id"] for f in formula_rows]
         if formula_ids:
-            await db.pd_formula_items.delete_many({"formula_id": {"$in": formula_ids}})
-        await db.pd_formulas.delete_many({"development_id": dev_id})
-        await db.pd_tests.delete_many({"development_id": dev_id})
-        await db.pd_samples.delete_many({"development_id": dev_id})
-        await db.pd_approvals.delete_many({"development_id": dev_id})
-        await db.pd_costs.delete_many({"development_id": dev_id})
-        await db.pd_documents.delete_many({"development_id": dev_id})
-        await db.pd_developments.delete_one({"id": dev_id})
-    await db.pd_request_status_history.delete_many({"pd_request_id": req_id})
+            await pg_db.execute("DELETE FROM pd_formula_items WHERE formula_id = ANY($1::text[])", formula_ids)
+        await pg_db.execute("DELETE FROM pd_formulas WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_tests WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_samples WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_approvals WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_costs WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_documents WHERE development_id=$1", dev_id)
+        await pg_db.execute("DELETE FROM pd_developments WHERE id=$1", dev_id)
+    await pg_db.execute("DELETE FROM pd_request_status_history WHERE pd_request_id=$1", req_id)
     return {"message": "Solicitação removida"}
 
 # ============ STATUS TRANSITIONS ============
@@ -1246,7 +1315,7 @@ async def delete_pd_request(req_id: str, request: Request):
 @pd_router.put("/requests/{req_id}/status")
 async def transition_status(req_id: str, data: StatusTransition, request: Request):
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
 
@@ -1277,15 +1346,15 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
 
     # RN-PD-02: Block IN_TESTS if formula without ingredients
     if new_status == "IN_TESTS":
-        dev_check = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
+        dev_check = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
         if not dev_check:
             raise HTTPException(status_code=400, detail="Inicie o desenvolvimento antes de avançar para Em Testes.")
-        formula_check = await db.pd_formulas.find_one(
-            {"development_id": dev_check["id"]}, {"_id": 0}, sort=[("version", -1)]
-        )
+        formula_check = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev_check["id"]
+        ))
         if not formula_check:
             raise HTTPException(status_code=400, detail="Registre a fórmula antes de avançar para Em Testes (RN-PD-02).")
-        items_check = await db.pd_formula_items.find({"formula_id": formula_check["id"]}, {"_id": 0}).to_list(200)
+        items_check = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", formula_check["id"]))
         if not items_check:
             raise HTTPException(status_code=400, detail="Adicione ingredientes à fórmula antes de avançar para Em Testes (RN-PD-02).")
         total_pct = sum(it.get("percentage", 0) for it in items_check)
@@ -1295,9 +1364,9 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
                 detail=f"O total da fórmula deve ser 100% (atual: {total_pct:.2f}%). Ajuste os ingredientes antes de avançar (RN-PD-02)."
             )
         # RN-BF-01: Auto-lock formula on transition to IN_TESTS
-        await db.pd_formulas.update_one(
-            {"id": formula_check["id"]},
-            {"$set": {"locked": True, "locked_at": now_iso(), "locked_by": user["id"], "locked_by_name": user.get("name", "")}}
+        await pg_db.execute(
+            "UPDATE pd_formulas SET locked=TRUE, locked_at=$1, locked_by=$2, locked_by_name=$3 WHERE id=$4",
+            now_iso(), user["id"], user.get("name", ""), formula_check["id"],
         )
 
     # Check blocking workflow tasks
@@ -1314,47 +1383,38 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
 
     # Check / auto-register approval for APPROVED status
     if new_status == "APPROVED":
-        dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
+        dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
         if dev:
-            tests = await db.pd_tests.find({"development_id": dev["id"]}, {"_id": 0}).to_list(100)
+            tests = _rows(await pg_db.fetch_all("SELECT * FROM pd_tests WHERE development_id=$1", dev["id"]))
             failed_tests = [t for t in tests if t["status"] == "FAILED"]
             if failed_tests:
                 raise HTTPException(status_code=400, detail="Existem testes com falha. Corrija antes de aprovar.")
 
-            approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
+            approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev["id"]))
 
             if is_comercial_action:
                 # Comercial clicking "Aprovar" IS the approval — upsert the record automatically
                 now = now_iso()
                 if approval:
-                    await db.pd_approvals.update_one(
-                        {"development_id": dev["id"]},
-                        {"$set": {
-                            "approved_by_internal": True,
-                            "approved_by_client": True,
-                            "approved_by_comercial": True,
-                            "approved_by_comercial_id": user["id"],
-                            "approved_by_comercial_name": user.get("name", ""),
-                            "approved_at": now,
-                            "updated_at": now,
-                        }}
+                    await pg_db.execute(
+                        """UPDATE pd_approvals SET approved_by_internal=TRUE, approved_by_client=TRUE,
+                           approved_by_comercial=TRUE, approved_by_comercial_id=$1,
+                           approved_by_comercial_name=$2, approved_at=$3, updated_at=$3
+                           WHERE development_id=$4""",
+                        user["id"], user.get("name", ""), now, dev["id"],
                     )
                 else:
-                    await db.pd_approvals.insert_one({
-                        "id": new_id(),
-                        "development_id": dev["id"],
-                        "pd_request_id": req_id,
-                        "tenant_id": user["tenant_id"],
-                        "approved_by_internal": True,
-                        "approved_by_client": True,
-                        "approved_by_comercial": True,
-                        "approved_by_comercial_id": user["id"],
-                        "approved_by_comercial_name": user.get("name", ""),
-                        "notes": f"Aprovado comercialmente por {user.get('name', '')}",
-                        "approved_at": now,
-                        "created_at": now,
-                        "updated_at": now,
-                    })
+                    await pg_db.execute(
+                        """INSERT INTO pd_approvals
+                           (id, development_id, pd_request_id, tenant_id, approved_by_internal,
+                            approved_by_client, approved_by_comercial, approved_by_comercial_id,
+                            approved_by_comercial_name, notes, approved_at, created_at, updated_at)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
+                        new_id(), dev["id"], req_id, user["tenant_id"], True, True, True,
+                        user["id"], user.get("name", ""),
+                        f"Aprovado comercialmente por {user.get('name', '')}",
+                        now, now, now,
+                    )
             else:
                 # P&D team approval — enforce existing checklist
                 if not approval:
@@ -1370,9 +1430,9 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
                         detail="Aprovação do cliente pendente. Registre a confirmação do cliente antes de marcar como APROVADO.",
                     )
     
-    await db.pd_requests.update_one(
-        {"id": req_id},
-        {"$set": {"status": new_status, "updated_at": now_iso()}}
+    await pg_db.execute(
+        "UPDATE pd_requests SET status=$1, updated_at=NOW() WHERE id=$2",
+        new_status, req_id,
     )
 
     # Sync kanban pipeline card so the column position reflects the new status
@@ -1387,16 +1447,16 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
     }
     kanban_status = _PD_STATUS_TO_KANBAN.get(new_status)
     if kanban_status:
-        await db.pd_cards.update_one(
-            {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
-            {"$set": {"status_pd": kanban_status, "updated_at": now_iso()}}
+        await pg_db.execute(
+            "UPDATE pd_cards SET status_pd=$1, updated_at=NOW() WHERE pd_request_id=$2 AND tenant_id=$3",
+            kanban_status, req_id, user["tenant_id"],
         )
         # Reverse-sync: push the new stage label back into the CRM sample variation
         try:
-            pd_card = await db.pd_cards.find_one(
-                {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
-                {"_id": 0, "amostra_id": 1, "amostra_variacao_id": 1}
-            )
+            pd_card = _flatten_pd_card(_row(await pg_db.fetch_one(
+                "SELECT * FROM pd_cards WHERE pd_request_id=$1 AND tenant_id=$2",
+                req_id, user["tenant_id"],
+            )))
             if pd_card and pd_card.get("amostra_variacao_id"):
                 amostra_id = pd_card["amostra_id"]
                 variacao_id = pd_card["amostra_variacao_id"]
@@ -1435,39 +1495,33 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
         except Exception as exc:
             logger.warning(f"PD→CRM reverse sync failed for req {req_id}: {exc}")
 
-    await db.pd_request_status_history.insert_one({
-        "id": new_id(),
-        "pd_request_id": req_id,
-        "from_status": current,
-        "to_status": new_status,
-        "changed_by": user["id"],
-        "changed_by_name": user["name"],
-        "comment": data.comment or f"Status alterado de {STATUS_LABELS.get(current, current)} para {STATUS_LABELS.get(new_status, new_status)}",
-        "created_at": now_iso(),
-    })
-    
+    await pg_db.execute(
+        """INSERT INTO pd_request_status_history
+           (id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+        new_id(), req_id, current, new_status, user["id"], user["name"],
+        data.comment or f"Status alterado de {STATUS_LABELS.get(current, current)} para {STATUS_LABELS.get(new_status, new_status)}",
+        now_iso(),
+    )
+
     # Auto-create development when moving to IN_PROGRESS
     if new_status == "IN_PROGRESS":
-        existing_dev = await db.pd_developments.find_one({"pd_request_id": req_id})
+        existing_dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE pd_request_id=$1", req_id))
         if not existing_dev:
             dev_id = new_id()
-            await db.pd_developments.insert_one({
-                "id": dev_id,
-                "pd_request_id": req_id,
-                "tenant_id": user["tenant_id"],
-                "assigned_to": user["id"],
-                "assigned_to_name": user["name"],
-                "lab_responsible": None,
-                "current_version": 0,
-                "status": "active",
-                "started_at": now_iso(),
-                "completed_at": None,
-            })
-    
+            await pg_db.execute(
+                """INSERT INTO pd_developments
+                   (id, pd_request_id, tenant_id, assigned_to, assigned_to_name,
+                    lab_responsible, current_version, status, started_at, completed_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                dev_id, req_id, user["tenant_id"], user["id"], user["name"],
+                None, 0, "active", now_iso(), None,
+            )
+
     if new_status == "COMPLETED":
-        await db.pd_developments.update_one(
-            {"pd_request_id": req_id},
-            {"$set": {"status": "completed", "completed_at": now_iso()}}
+        await pg_db.execute(
+            "UPDATE pd_developments SET status='completed', completed_at=$1 WHERE pd_request_id=$2",
+            now_iso(), req_id,
         )
 
     # Auto-create order when PD is APPROVED
@@ -1477,21 +1531,22 @@ async def transition_status(req_id: str, data: StatusTransition, request: Reques
             await auto_create_order_on_pd_approval(req_id, user)
         except Exception as exc:
             logger.error(f"Failed to auto-create order for PD {req_id}: {exc}")
-    
-    updated = await db.pd_requests.find_one({"id": req_id}, {"_id": 0})
+
+    updated = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1", req_id))
     return updated
 
 @pd_router.get("/requests/{req_id}/history")
 async def get_status_history(req_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]})
+    pd_req = _row(await pg_db.fetch_one("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    
-    history = await db.pd_request_status_history.find(
-        {"pd_request_id": req_id}, {"_id": 0}
-    ).sort("created_at", -1).to_list(100)
+
+    history = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_request_status_history WHERE pd_request_id=$1 ORDER BY created_at DESC",
+        req_id,
+    ))
     return history
 
 # ============ DEVELOPMENTS ============
@@ -1500,11 +1555,11 @@ async def get_status_history(req_id: str, request: Request):
 async def get_development(req_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]})
+    pd_req = _row(await pg_db.fetch_one("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
+
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento ainda não iniciado")
     return dev
@@ -1514,15 +1569,15 @@ async def get_development(req_id: str, request: Request):
 @pd_router.post("/developments/{dev_id}/formulas")
 async def create_formula(dev_id: str, data: FormulaCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
-    last_formula = await db.pd_formulas.find(
-        {"development_id": dev_id}
-    ).sort("version", -1).to_list(1)
-    next_version = (last_formula[0]["version"] + 1) if last_formula else 1
-    
+
+    last_formula = _row(await pg_db.fetch_one(
+        "SELECT version FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev_id
+    ))
+    next_version = (last_formula["version"] + 1) if last_formula else 1
+
     formula_id = new_id()
     formula = {
         "id": formula_id,
@@ -1539,12 +1594,19 @@ async def create_formula(dev_id: str, data: FormulaCreate, request: Request):
         "created_by_name": user["name"],
         "created_at": now_iso(),
     }
-    await db.pd_formulas.insert_one(formula)
-    formula.pop("_id", None)
-    
-    await db.pd_developments.update_one(
-        {"id": dev_id},
-        {"$set": {"current_version": next_version}}
+    await pg_db.execute(
+        """INSERT INTO pd_formulas
+           (id, tenant_id, development_id, version, name, notes, volume, volume_unit,
+            indice_perdas, cotacao_usd, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
+        formula_id, user["tenant_id"], dev_id, next_version, data.name, data.notes or "",
+        data.volume or 0, data.volume_unit or "mL", data.indice_perdas or 0,
+        data.cotacao_usd or 6.00, user["id"], user["name"], formula["created_at"],
+    )
+
+    await pg_db.execute(
+        "UPDATE pd_developments SET current_version=$1 WHERE id=$2",
+        next_version, dev_id,
     )
 
     await _auto_generate_documents_for_request(
@@ -1566,7 +1628,7 @@ async def create_formula(dev_id: str, data: FormulaCreate, request: Request):
 @pd_router.put("/formulas/{formula_id}")
 async def update_formula(formula_id: str, data: FormulaUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", formula_id))
     if not existing:
         raise HTTPException(status_code=404, detail="Formula nao encontrada")
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
@@ -1586,15 +1648,19 @@ async def update_formula(formula_id: str, data: FormulaUpdate, request: Request)
         },
     )
 
-    result = await db.pd_formulas.update_one({"id": formula_id}, {"$set": update_fields})
-    if result.matched_count == 0:
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    vals = list(update_fields.values()) + [formula_id]
+    updated_row = await pg_db.fetch_one(
+        f"UPDATE pd_formulas SET {set_parts} WHERE id=${len(vals)} RETURNING id", *vals
+    )
+    if not updated_row:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
-    
+
     # If cotacao_usd changed, recalculate all items
     if "cotacao_usd" in update_fields:
-        formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+        formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", formula_id))
         cotacao = formula.get("cotacao_usd", 6.00)
-        items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+        items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", formula_id))
         for item in items:
             cost_brl, cost_kg_usd, cost_brl_via_cambio = calc_item_costs(
                 item.get("percentage", 0),
@@ -1602,15 +1668,18 @@ async def update_formula(formula_id: str, data: FormulaUpdate, request: Request)
                 cotacao,
                 item.get("price_usd")
             )
-            set_fields = {"cost_brl": cost_brl, "cost_kg_usd": cost_kg_usd}
             if cost_brl_via_cambio is not None:
-                set_fields["cost_brl_via_cambio"] = cost_brl_via_cambio
-            await db.pd_formula_items.update_one(
-                {"id": item["id"]},
-                {"$set": set_fields}
-            )
-    
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+                await pg_db.execute(
+                    "UPDATE pd_formula_items SET cost_brl=$1, cost_kg_usd=$2, cost_brl_via_cambio=$3 WHERE id=$4",
+                    cost_brl, cost_kg_usd, cost_brl_via_cambio, item["id"],
+                )
+            else:
+                await pg_db.execute(
+                    "UPDATE pd_formula_items SET cost_brl=$1, cost_kg_usd=$2 WHERE id=$3",
+                    cost_brl, cost_kg_usd, item["id"],
+                )
+
+    formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", formula_id))
     ficha_changed_fields: List[str] = []
     epa_changed_fields: List[str] = []
     if "name" in update_fields:
@@ -1635,13 +1704,15 @@ async def update_formula(formula_id: str, data: FormulaUpdate, request: Request)
 @pd_router.get("/developments/{dev_id}/formulas")
 async def list_formulas(dev_id: str, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
-    formulas = await db.pd_formulas.find({"development_id": dev_id}, {"_id": 0}).sort("version", -1).to_list(100)
+
+    formulas = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC", dev_id
+    ))
     for f in formulas:
-        items = await db.pd_formula_items.find({"formula_id": f["id"]}, {"_id": 0}).to_list(200)
+        items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", f["id"]))
         # Calculate cost_percentage for each item based on total
         total_cost = sum(it.get("cost_brl", 0) for it in items)
         for it in items:
@@ -1674,10 +1745,9 @@ async def formula_bank(
     show_full = can_view_formula_composition(user)
     tenant_id = user["tenant_id"]
 
-    developments = await db.pd_developments.find(
-        {"tenant_id": tenant_id},
-        {"_id": 0, "id": 1, "pd_request_id": 1}
-    ).to_list(5000)
+    developments = _rows(await pg_db.fetch_all(
+        "SELECT id, pd_request_id FROM pd_developments WHERE tenant_id=$1", tenant_id
+    ))
     if not developments:
         return []
 
@@ -1685,45 +1755,29 @@ async def formula_bank(
     req_ids = [d["pd_request_id"] for d in developments if d.get("pd_request_id")]
     dev_map = {d["id"]: d for d in developments if d.get("id")}
 
-    requests_docs = await db.pd_requests.find(
-        {"tenant_id": tenant_id, "id": {"$in": req_ids}},
-        {
-            "_id": 0,
-            "id": 1,
-            "project_name": 1,
-            "client_name": 1,
-            "status": 1,
-            "is_internal_research": 1,
-            "created_at": 1,
-            "updated_at": 1,
-        }
-    ).to_list(5000)
+    requests_docs = _rows(await pg_db.fetch_all(
+        "SELECT id, project_name, client_name, status, is_internal_research, created_at, updated_at FROM pd_requests WHERE tenant_id=$1 AND id = ANY($2::text[])",
+        tenant_id, req_ids,
+    ))
     requests_map = {r["id"]: r for r in requests_docs if r.get("id")}
 
-    approvals = await db.pd_approvals.find(
-        {"development_id": {"$in": dev_ids}},
-        {
-            "_id": 0,
-            "development_id": 1,
-            "approved_by_client": 1,
-            "approved_by_internal": 1,
-            "notes": 1,
-        }
-    ).to_list(5000)
+    approvals = _rows(await pg_db.fetch_all(
+        "SELECT development_id, approved_by_client, approved_by_internal, notes FROM pd_approvals WHERE development_id = ANY($1::text[])",
+        dev_ids,
+    ))
     approvals_map = {a["development_id"]: a for a in approvals if a.get("development_id")}
 
-    formulas = await db.pd_formulas.find(
-        {"development_id": {"$in": dev_ids}},
-        {"_id": 0}
-    ).sort("created_at", -1).to_list(10000)
+    formulas = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_formulas WHERE development_id = ANY($1::text[]) ORDER BY created_at DESC",
+        dev_ids,
+    ))
     if not formulas:
         return []
 
     formula_ids = [f["id"] for f in formulas if f.get("id")]
-    items = await db.pd_formula_items.find(
-        {"formula_id": {"$in": formula_ids}},
-        {"_id": 0}
-    ).to_list(20000)
+    items = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_formula_items WHERE formula_id = ANY($1::text[])", formula_ids,
+    ))
     items_by_formula: Dict[str, List[Dict[str, Any]]] = {}
     for item in items:
         items_by_formula.setdefault(item.get("formula_id"), []).append(item)
@@ -1826,12 +1880,12 @@ async def formula_bank(
 @pd_router.post("/formulas/{formula_id}/items")
 async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Request):
     user = await get_current_user(request)
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", formula_id))
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
     if formula.get("locked"):
         raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
-    
+
     cotacao = formula.get("cotacao_usd", 6.00) or 6.00
     cost_brl, cost_kg_usd, cost_brl_via_cambio = calc_item_costs(
         data.percentage, data.price_per_kg, cotacao, data.price_usd
@@ -1844,17 +1898,24 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
         "ingredient_name": data.ingredient_name,
         "percentage": data.percentage,
         "price_per_kg": data.price_per_kg,
-        "price_usd": data.price_usd,          # R04
+        "price_usd": data.price_usd,
         "cost_brl": cost_brl,
         "cost_kg_usd": cost_kg_usd,
-        "cost_brl_via_cambio": cost_brl_via_cambio,   # R04
+        "cost_brl_via_cambio": cost_brl_via_cambio,
         "fornecedor": data.fornecedor or "",
         "phase": data.phase or "",
         "function": data.function or "",
         "catalog_id": data.catalog_id or None,
     }
-    await db.pd_formula_items.insert_one(item)
-    item.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_formula_items
+           (id, formula_id, ingredient_name, percentage, price_per_kg, price_usd,
+            cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, function, catalog_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
+        item_id, formula_id, data.ingredient_name, data.percentage, data.price_per_kg,
+        data.price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio,
+        data.fornecedor or "", data.phase or "", data.function or "", data.catalog_id or None,
+    )
     await _auto_generate_documents_for_development(
         formula["development_id"],
         user,
@@ -1877,20 +1938,20 @@ async def add_formula_item(formula_id: str, data: FormulaItemCreate, request: Re
 @pd_router.put("/formula-items/{item_id}")
 async def update_formula_item(item_id: str, data: FormulaItemUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_formula_items.find_one({"id": item_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_formula_items WHERE id=$1", item_id))
     if not existing:
         raise HTTPException(status_code=404, detail="Item não encontrado")
-    
+
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
-    
+
     # Recalculate costs if percentage or price changed
     pct = update_fields.get("percentage", existing.get("percentage", 0))
     ppk = update_fields.get("price_per_kg", existing.get("price_per_kg", 0))
-    p_usd = update_fields.get("price_usd", existing.get("price_usd"))  # R04
+    p_usd = update_fields.get("price_usd", existing.get("price_usd"))
 
-    formula = await db.pd_formulas.find_one({"id": existing["formula_id"]}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", existing["formula_id"]))
     if formula and formula.get("locked"):
         raise HTTPException(status_code=409, detail=f"Fórmula v{formula.get('version',1)} está registrada e bloqueada (RN-BF-01). Crie uma nova versão para editar.")
     cotacao = formula.get("cotacao_usd", 6.00) if formula else 6.00
@@ -1913,8 +1974,9 @@ async def update_formula_item(item_id: str, data: FormulaItemUpdate, request: Re
         },
         ignored_fields=["cost_brl", "cost_kg_usd"],
     )
-    await db.pd_formula_items.update_one({"id": item_id}, {"$set": update_fields})
-    item = await db.pd_formula_items.find_one({"id": item_id}, {"_id": 0})
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    await pg_db.execute(f"UPDATE pd_formula_items SET {set_parts} WHERE id=${len(update_fields)+1}", *list(update_fields.values()), item_id)
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_formula_items WHERE id=$1", item_id))
     if any(field in update_fields for field in ("ingredient_name", "percentage", "phase", "function", "catalog_id")):
         await _auto_generate_documents_for_development(
             formula["development_id"],
@@ -1929,13 +1991,13 @@ async def update_formula_item(item_id: str, data: FormulaItemUpdate, request: Re
 @pd_router.delete("/formula-items/{item_id}")
 async def delete_formula_item(item_id: str, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_formula_items.find_one({"id": item_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_formula_items WHERE id=$1", item_id))
     if not existing:
         raise HTTPException(status_code=404, detail="Item nao encontrado")
-    result = await db.pd_formula_items.delete_one({"id": item_id})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_one("DELETE FROM pd_formula_items WHERE id=$1 RETURNING id", item_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Item não encontrado")
-    formula = await db.pd_formulas.find_one({"id": existing["formula_id"]}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", existing["formula_id"]))
     if formula:
         await _auto_generate_documents_for_development(
             formula["development_id"],
@@ -1959,7 +2021,7 @@ async def delete_formula_item(item_id: str, request: Request):
 @pd_router.get("/formulas/{formula_id}/items")
 async def list_formula_items(formula_id: str, request: Request):
     user = await get_current_user(request)
-    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+    items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", formula_id))
     return items
 
 # ============ FORMULA COST REPORT ============
@@ -1968,12 +2030,12 @@ async def list_formula_items(formula_id: str, request: Request):
 async def formula_cost_report(formula_id: str, request: Request):
     """Returns full cost breakdown for a formula - Relatório de Custo Acabado"""
     user = await get_current_user(request)
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1", formula_id))
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
-    
-    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
-    
+
+    items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", formula_id))
+
     total_percentage = sum(it.get("percentage", 0) for it in items)
     total_cost_per_kg = sum(it.get("cost_brl", 0) for it in items)
     total_price_sum = sum(it.get("price_per_kg", 0) for it in items)
@@ -2012,11 +2074,12 @@ async def formula_cost_report(formula_id: str, request: Request):
 @pd_router.post("/developments/{dev_id}/tests")
 async def create_test(dev_id: str, data: TestCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     test_id = new_id()
+    ts = now_iso()
     test = {
         "id": test_id,
         "development_id": dev_id,
@@ -2025,17 +2088,19 @@ async def create_test(dev_id: str, data: TestCreate, request: Request):
         "status": data.status,
         "created_by": user["id"],
         "created_by_name": user["name"],
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
+        "created_at": ts,
+        "updated_at": ts,
     }
-    await db.pd_tests.insert_one(test)
-    test.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_tests (id, development_id, test_type, dados, status, created_by, created_by_name, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        test_id, dev_id, data.test_type, data.dados or {}, data.status, user["id"], user["name"], ts, ts,
+    )
     return test
 
 @pd_router.get("/developments/{dev_id}/tests")
 async def list_tests(dev_id: str, request: Request):
     user = await get_current_user(request)
-    tests = await db.pd_tests.find({"development_id": dev_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    tests = _rows(await pg_db.fetch_all("SELECT * FROM pd_tests WHERE development_id=$1 ORDER BY created_at DESC", dev_id))
     return tests
 
 @pd_router.put("/tests/{test_id}")
@@ -2051,18 +2116,22 @@ async def update_test(test_id: str, data: TestUpdate, request: Request):
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
     
     update_fields["updated_at"] = now_iso()
-    result = await db.pd_tests.update_one({"id": test_id}, {"$set": update_fields})
-    if result.matched_count == 0:
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    updated_row = await pg_db.fetch_one(
+        f"UPDATE pd_tests SET {set_parts} WHERE id=${len(update_fields)+1} RETURNING id",
+        *list(update_fields.values()), test_id,
+    )
+    if not updated_row:
         raise HTTPException(status_code=404, detail="Teste não encontrado")
-    
-    test = await db.pd_tests.find_one({"id": test_id}, {"_id": 0})
+
+    test = _row(await pg_db.fetch_one("SELECT * FROM pd_tests WHERE id=$1", test_id))
     return test
 
 @pd_router.delete("/tests/{test_id}")
 async def delete_test(test_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_tests.delete_one({"id": test_id})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_one("DELETE FROM pd_tests WHERE id=$1 RETURNING id", test_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Teste não encontrado")
     return {"message": "Teste removido"}
 
@@ -2078,11 +2147,11 @@ class LabResultsUpdate(BaseModel):
 @pd_router.get("/developments/{dev_id}/lab-results")
 async def get_lab_results(dev_id: str, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
-    results = await db.pd_lab_results.find_one({"development_id": dev_id}, {"_id": 0})
+
+    results = _row(await pg_db.fetch_one("SELECT * FROM pd_lab_results WHERE development_id=$1", dev_id))
     if not results:
         return {
             "development_id": dev_id,
@@ -2097,10 +2166,10 @@ async def get_lab_results(dev_id: str, request: Request):
 @pd_router.put("/developments/{dev_id}/lab-results")
 async def save_lab_results(dev_id: str, data: LabResultsUpdate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id, tenant_id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     update_data = {}
     if data.estabilidade is not None:
         update_data["estabilidade"] = data.estabilidade
@@ -2117,7 +2186,7 @@ async def save_lab_results(dev_id: str, data: LabResultsUpdate, request: Request
     update_data["updated_by"] = user["id"]
     update_data["updated_by_name"] = user["name"]
 
-    existing = await db.pd_lab_results.find_one({"development_id": dev_id})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_lab_results WHERE development_id=$1", dev_id))
     source_changes = _build_source_changes(
         existing or {},
         update_data,
@@ -2130,28 +2199,30 @@ async def save_lab_results(dev_id: str, data: LabResultsUpdate, request: Request
         },
         ignored_fields=["updated_at", "updated_by", "updated_by_name"],
     )
+    estab = update_data.get("estabilidade", existing.get("estabilidade") if existing else {}) or {}
+    ph    = update_data.get("ph",          existing.get("ph")          if existing else {}) or {}
+    visc  = update_data.get("viscosidade", existing.get("viscosidade") if existing else {}) or {}
+    sens  = update_data.get("sensorial",   existing.get("sensorial")   if existing else {}) or {}
+    compat= update_data.get("compatibilidade", existing.get("compatibilidade") if existing else {}) or {}
+    upd_by = update_data.get("updated_by", user["id"])
+    upd_name = update_data.get("updated_by_name", user.get("name", ""))
     if existing:
-        await db.pd_lab_results.update_one(
-            {"development_id": dev_id},
-            {"$set": update_data}
+        await pg_db.execute(
+            """UPDATE pd_lab_results SET estabilidade=$1, ph=$2, viscosidade=$3, sensorial=$4,
+               compatibilidade=$5, updated_at=NOW(), updated_by=$6, updated_by_name=$7
+               WHERE development_id=$8""",
+            estab, ph, visc, sens, compat, upd_by, upd_name, dev_id,
         )
     else:
-        doc = {
-            "id": new_id(),
-            "development_id": dev_id,
-            "estabilidade": data.estabilidade or {},
-            "ph": data.ph or {},
-            "viscosidade": data.viscosidade or {},
-            "sensorial": data.sensorial or {},
-            "compatibilidade": data.compatibilidade or {},
-            "updated_at": now_iso(),
-            "updated_by": user["id"],
-            "updated_by_name": user["name"],
-            "created_at": now_iso(),
-        }
-        await db.pd_lab_results.insert_one(doc)
-    
-    results = await db.pd_lab_results.find_one({"development_id": dev_id}, {"_id": 0})
+        await pg_db.execute(
+            """INSERT INTO pd_lab_results
+               (id, development_id, tenant_id, estabilidade, ph, viscosidade, sensorial,
+                compatibilidade, updated_by, updated_by_name, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())""",
+            new_id(), dev_id, user["tenant_id"], estab, ph, visc, sens, compat, upd_by, upd_name,
+        )
+
+    results = _row(await pg_db.fetch_one("SELECT * FROM pd_lab_results WHERE development_id=$1", dev_id))
     ficha_changed_fields: List[str] = []
     epa_changed_fields: List[str] = []
     if any(field in update_data for field in ("ph", "viscosidade", "estabilidade", "compatibilidade")):
@@ -2202,17 +2273,27 @@ async def list_stability_studies(
     if variacao_id:
         query["amostra_variacao_id"] = variacao_id
 
-    studies = await db.pd_stability_studies.find(query, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    clauses = ["tenant_id=$1"]
+    params: list = [user["tenant_id"]]
+    if status:
+        params.append(status); clauses.append(f"status=${len(params)}")
+    if pd_card_id:
+        params.append(pd_card_id); clauses.append(f"pd_card_id=${len(params)}")
+    if sample_id:
+        params.append(sample_id); clauses.append(f"amostra_id=${len(params)}")
+    if variacao_id:
+        params.append(variacao_id); clauses.append(f"amostra_variacao_id=${len(params)}")
+    sql = "SELECT * FROM pd_stability_studies WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC"
+    studies = _rows(await pg_db.fetch_all(sql, *params))
     return studies
 
 
 @pd_router.get("/stability/studies/{study_id}")
 async def get_stability_study(study_id: str, request: Request):
     user = await get_current_user(request)
-    study = await db.pd_stability_studies.find_one(
-        {"id": study_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0},
-    )
+    study = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_stability_studies WHERE id=$1 AND tenant_id=$2", study_id, user["tenant_id"]
+    ))
     if not study:
         raise HTTPException(status_code=404, detail="Estudo de estabilidade nao encontrado")
     return study
@@ -2221,26 +2302,24 @@ async def get_stability_study(study_id: str, request: Request):
 @pd_router.get("/stability/studies/{study_id}/readings")
 async def list_stability_readings(study_id: str, request: Request):
     user = await get_current_user(request)
-    study = await db.pd_stability_studies.find_one(
-        {"id": study_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0, "id": 1},
-    )
+    study = _row(await pg_db.fetch_one(
+        "SELECT id FROM pd_stability_studies WHERE id=$1 AND tenant_id=$2", study_id, user["tenant_id"]
+    ))
     if not study:
         raise HTTPException(status_code=404, detail="Estudo de estabilidade nao encontrado")
-    readings = await db.pd_stability_readings.find(
-        {"study_id": study_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0},
-    ).sort([("day_offset", 1), ("created_at", 1)]).to_list(5000)
+    readings = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_stability_readings WHERE study_id=$1 AND tenant_id=$2 ORDER BY day_offset ASC, created_at ASC",
+        study_id, user["tenant_id"],
+    ))
     return readings
 
 
 @pd_router.post("/stability/studies/{study_id}/readings")
 async def create_stability_reading(study_id: str, data: StabilityReadingCreate, request: Request):
     user = await get_current_user(request)
-    study = await db.pd_stability_studies.find_one(
-        {"id": study_id, "tenant_id": user["tenant_id"]},
-        {"_id": 0},
-    )
+    study = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_stability_studies WHERE id=$1 AND tenant_id=$2", study_id, user["tenant_id"]
+    ))
     if not study:
         raise HTTPException(status_code=404, detail="Estudo de estabilidade nao encontrado")
     if study.get("status") == "concluido":
@@ -2258,15 +2337,10 @@ async def create_stability_reading(study_id: str, data: StabilityReadingCreate, 
     if data.day_offset != 0 and not study.get("d0_completed"):
         raise HTTPException(status_code=400, detail="D0 obrigatorio antes de registrar leituras posteriores")
 
-    existing = await db.pd_stability_readings.find_one(
-        {
-            "study_id": study_id,
-            "tenant_id": user["tenant_id"],
-            "condition_code": data.condition_code,
-            "day_offset": data.day_offset,
-        },
-        {"_id": 0},
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT id FROM pd_stability_readings WHERE study_id=$1 AND tenant_id=$2 AND condition_code=$3 AND day_offset=$4",
+        study_id, user["tenant_id"], data.condition_code, data.day_offset,
+    ))
     if existing:
         raise HTTPException(status_code=409, detail="Ja existe leitura registrada para esta condicao e checkpoint")
 
@@ -2289,8 +2363,19 @@ async def create_stability_reading(study_id: str, data: StabilityReadingCreate, 
         "created_by": user["id"],
         "created_by_name": user.get("name", ""),
     }
-    await db.pd_stability_readings.insert_one(reading)
-    reading.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_stability_readings
+           (id, tenant_id, study_id, pd_card_id, amostra_id, amostra_variacao_id,
+            condition_code, condition_label, day_offset, reading_at, parameters,
+            notes, photo_urls, created_at, created_by, created_by_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+        reading["id"], user["tenant_id"], study_id, study.get("pd_card_id"),
+        study.get("amostra_id"), study.get("amostra_variacao_id"),
+        data.condition_code, condition_template["label"], data.day_offset, reading_at,
+        parameters, clean_text(data.notes),
+        [clean_text(url) for url in data.photo_urls if clean_text(url)],
+        reading["created_at"], user["id"], user.get("name", ""),
+    )
 
     updated_conditions: List[Dict[str, Any]] = []
     for condition in study.get("conditions", []):
@@ -2308,15 +2393,9 @@ async def create_stability_reading(study_id: str, data: StabilityReadingCreate, 
             "last_reading_at": reading_at,
         })
 
-    await db.pd_stability_studies.update_one(
-        {"id": study_id, "tenant_id": user["tenant_id"]},
-        {
-            "$set": {
-                "conditions": updated_conditions,
-                "d0_completed": study.get("d0_completed") or data.day_offset == 0,
-                "updated_at": now_iso(),
-            }
-        },
+    await pg_db.execute(
+        "UPDATE pd_stability_studies SET conditions=$1, d0_completed=$2, updated_at=NOW() WHERE id=$3 AND tenant_id=$4",
+        updated_conditions, study.get("d0_completed") or data.day_offset == 0, study_id, user["tenant_id"],
     )
     refreshed = await _recalculate_stability_study(study_id)
 
@@ -2342,10 +2421,10 @@ async def create_stability_reading(study_id: str, data: StabilityReadingCreate, 
 @pd_router.get("/stability/dashboard")
 async def get_stability_dashboard(request: Request):
     user = await get_current_user(request)
-    studies = await db.pd_stability_studies.find(
-        {"tenant_id": user["tenant_id"]},
-        {"_id": 0},
-    ).sort("created_at", -1).to_list(2000)
+    studies = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_stability_studies WHERE tenant_id=$1 ORDER BY created_at DESC",
+        user["tenant_id"],
+    ))
 
     counts = {"critico": 0, "atencao": 0, "em_dia": 0, "pendente_d0": 0, "concluido": 0}
     for study in studies:
@@ -2371,44 +2450,50 @@ async def trigger_stability_alert_check(request: Request):
 @pd_router.post("/developments/{dev_id}/samples")
 async def create_sample(dev_id: str, data: SampleCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     sample_id = new_id()
+    sent_at = now_iso() if data.sent_to_client else None
+    ts = now_iso()
     sample = {
         "id": sample_id,
         "development_id": dev_id,
         "formula_version": data.formula_version,
         "sent_to_client": data.sent_to_client,
-        "sent_at": now_iso() if data.sent_to_client else None,
+        "sent_at": sent_at,
         "feedback": data.feedback or "",
-        "created_at": now_iso(),
+        "created_at": ts,
     }
-    await db.pd_samples.insert_one(sample)
-    sample.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_samples (id, development_id, formula_version, sent_to_client, sent_at, feedback, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        sample_id, dev_id, data.formula_version, data.sent_to_client, sent_at, data.feedback or "", ts,
+    )
     return sample
 
 @pd_router.get("/developments/{dev_id}/samples")
 async def list_samples(dev_id: str, request: Request):
     user = await get_current_user(request)
-    samples = await db.pd_samples.find({"development_id": dev_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    samples = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_samples WHERE development_id=$1 ORDER BY created_at DESC", dev_id
+    ))
     return samples
 
 @pd_router.put("/samples/{sample_id}")
 async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_samples.find_one({"id": sample_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_samples WHERE id=$1", sample_id))
     if not existing:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
-    
+
     if update_fields.get("sent_to_client") == True:
         update_fields["sent_at"] = now_iso()
         update_fields.setdefault("internal_approved", True)
-    
+
     sent_to_client = bool(update_fields.get("sent_to_client", existing.get("sent_to_client")))
 
     if "client_approved" in update_fields:
@@ -2417,12 +2502,16 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
                 status_code=409,
                 detail="Amostra precisa ser enviada ao cliente antes de registrar aprovação externa.",
             )
-    
-    result = await db.pd_samples.update_one({"id": sample_id}, {"$set": update_fields})
-    if result.matched_count == 0:
+
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    updated_row = await pg_db.fetch_one(
+        f"UPDATE pd_samples SET {set_parts} WHERE id=${len(update_fields)+1} RETURNING id",
+        *list(update_fields.values()), sample_id,
+    )
+    if not updated_row:
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
-    
-    sample = await db.pd_samples.find_one({"id": sample_id}, {"_id": 0})
+
+    sample = _row(await pg_db.fetch_one("SELECT * FROM pd_samples WHERE id=$1", sample_id))
     return sample
 
 # ============ APPROVALS ============
@@ -2430,11 +2519,11 @@ async def update_sample(sample_id: str, data: SampleUpdate, request: Request):
 @pd_router.post("/developments/{dev_id}/approval")
 async def create_approval(dev_id: str, data: ApprovalCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
-    existing = await db.pd_approvals.find_one({"development_id": dev_id})
+
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev_id))
     source_changes = _build_source_changes(
         existing or {},
         {
@@ -2448,33 +2537,28 @@ async def create_approval(dev_id: str, data: ApprovalCreate, request: Request):
             "notes": "Observacoes da aprovacao",
         },
     )
+    now = now_iso()
     if existing:
-        await db.pd_approvals.update_one(
-            {"development_id": dev_id},
-            {"$set": {
-                "approved_by_client": data.approved_by_client,
-                "approved_by_internal": data.approved_by_internal,
-                "notes": data.notes or "",
-                "approval_date": now_iso(),
-                "approved_by_user": user["id"],
-                "approved_by_user_name": user["name"],
-            }}
+        await pg_db.execute(
+            """UPDATE pd_approvals SET approved_by_client=$1, approved_by_internal=$2, notes=$3,
+               approval_date=$4, approved_by_user=$5, approved_by_user_name=$6 WHERE development_id=$7""",
+            data.approved_by_client, data.approved_by_internal, data.notes or "",
+            now, user["id"], user["name"], dev_id,
         )
-        approval = await db.pd_approvals.find_one({"development_id": dev_id}, {"_id": 0})
+        approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev_id))
     else:
         approval_id = new_id()
-        approval = {
-            "id": approval_id,
-            "development_id": dev_id,
-            "approved_by_client": data.approved_by_client,
-            "approved_by_internal": data.approved_by_internal,
-            "approval_date": now_iso(),
-            "notes": data.notes or "",
-            "approved_by_user": user["id"],
-            "approved_by_user_name": user["name"],
-        }
-        await db.pd_approvals.insert_one(approval)
-        approval.pop("_id", None)
+        await pg_db.execute(
+            """INSERT INTO pd_approvals
+               (id, development_id, pd_request_id, tenant_id, approved_by_client,
+                approved_by_internal, approval_date, notes, approved_by_user,
+                approved_by_user_name, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
+            approval_id, dev_id, dev.get("pd_request_id"), user["tenant_id"],
+            data.approved_by_client, data.approved_by_internal, now, data.notes or "",
+            user["id"], user["name"], now, now,
+        )
+        approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE id=$1", approval_id))
     
     if data.approved_by_client:
         await _auto_generate_documents_for_request(
@@ -2490,7 +2574,7 @@ async def create_approval(dev_id: str, data: ApprovalCreate, request: Request):
 @pd_router.get("/developments/{dev_id}/approval")
 async def get_approval(dev_id: str, request: Request):
     user = await get_current_user(request)
-    approval = await db.pd_approvals.find_one({"development_id": dev_id}, {"_id": 0})
+    approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev_id))
     if not approval:
         return None
     return approval
@@ -2500,45 +2584,34 @@ async def get_approval(dev_id: str, request: Request):
 @pd_router.post("/developments/{dev_id}/costs")
 async def save_costs(dev_id: str, data: CostCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     total = data.ingredient_cost + data.packaging_cost + data.labor_cost
-    
-    existing = await db.pd_costs.find_one({"development_id": dev_id})
+    ts = now_iso()
+
+    existing = _row(await pg_db.fetch_one("SELECT id FROM pd_costs WHERE development_id=$1", dev_id))
     if existing:
-        await db.pd_costs.update_one(
-            {"development_id": dev_id},
-            {"$set": {
-                "ingredient_cost": data.ingredient_cost,
-                "packaging_cost": data.packaging_cost,
-                "labor_cost": data.labor_cost,
-                "total_cost": total,
-                "updated_at": now_iso(),
-            }}
+        await pg_db.execute(
+            "UPDATE pd_costs SET ingredient_cost=$1, packaging_cost=$2, labor_cost=$3, total_cost=$4, updated_at=$5 WHERE development_id=$6",
+            data.ingredient_cost, data.packaging_cost, data.labor_cost, total, ts, dev_id,
         )
-        cost = await db.pd_costs.find_one({"development_id": dev_id}, {"_id": 0})
+        cost = _row(await pg_db.fetch_one("SELECT * FROM pd_costs WHERE development_id=$1", dev_id))
     else:
         cost_id = new_id()
-        cost = {
-            "id": cost_id,
-            "development_id": dev_id,
-            "ingredient_cost": data.ingredient_cost,
-            "packaging_cost": data.packaging_cost,
-            "labor_cost": data.labor_cost,
-            "total_cost": total,
-            "updated_at": now_iso(),
-        }
-        await db.pd_costs.insert_one(cost)
-        cost.pop("_id", None)
-    
+        await pg_db.execute(
+            "INSERT INTO pd_costs (id, development_id, tenant_id, ingredient_cost, packaging_cost, labor_cost, total_cost, updated_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)",
+            cost_id, dev_id, user["tenant_id"], data.ingredient_cost, data.packaging_cost, data.labor_cost, total, ts,
+        )
+        cost = _row(await pg_db.fetch_one("SELECT * FROM pd_costs WHERE id=$1", cost_id))
+
     return cost
 
 @pd_router.get("/developments/{dev_id}/costs")
 async def get_costs(dev_id: str, request: Request):
     user = await get_current_user(request)
-    cost = await db.pd_costs.find_one({"development_id": dev_id}, {"_id": 0})
+    cost = _row(await pg_db.fetch_one("SELECT * FROM pd_costs WHERE development_id=$1", dev_id))
     if not cost:
         return {"ingredient_cost": 0, "packaging_cost": 0, "labor_cost": 0, "total_cost": 0}
     return cost
@@ -2615,22 +2688,20 @@ def _build_cost_versions_response(doc: dict, user: dict, formula_cost_auto: floa
 @pd_router.get("/developments/{dev_id}/cost-versions")
 async def get_cost_versions(dev_id: str, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     require_roles(user, PD_READ)
 
-    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
 
     # Derive auto ingredient cost from latest formula
     formula_cost_auto = 0.0
-    latest_formula = await db.pd_formulas.find(
-        {"development_id": dev_id}, {"_id": 0}
-    ).sort("version", -1).to_list(1)
+    latest_formula = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev_id
+    ))
     if latest_formula:
-        items = await db.pd_formula_items.find(
-            {"formula_id": latest_formula[0]["id"]}, {"_id": 0}
-        ).to_list(200)
+        items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", latest_formula["id"]))
         formula_cost_auto = round(sum(it.get("cost_brl", 0) for it in items), 4)
 
     return _build_cost_versions_response(doc, user, formula_cost_auto)
@@ -2640,50 +2711,47 @@ async def get_cost_versions(dev_id: str, request: Request):
 async def upsert_cost_v1(dev_id: str, data: PDCostV1Upsert, request: Request):
     """P&D saves or updates their cost draft (v1). Only allowed while status is 'rascunho'."""
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     require_roles(user, PD_WRITE)
 
-    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     if existing and (existing.get("v1") or {}).get("status") == "enviado":
         raise HTTPException(status_code=409, detail="Custo v1 já enviado para Compras. Não é possível editar.")
 
     # Derive ingredient_cost_auto from latest formula
     formula_cost_auto = 0.0
-    latest_formula = await db.pd_formulas.find(
-        {"development_id": dev_id}, {"_id": 0}
-    ).sort("version", -1).to_list(1)
+    latest_formula = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev_id
+    ))
     if latest_formula:
-        items = await db.pd_formula_items.find(
-            {"formula_id": latest_formula[0]["id"]}, {"_id": 0}
-        ).to_list(200)
+        items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", latest_formula["id"]))
         formula_cost_auto = round(sum(it.get("cost_brl", 0) for it in items), 4)
 
     v1_total = round(formula_cost_auto + (data.ingredient_cost_manual or 0.0), 4)
-    v1_patch = {
-        "v1.ingredient_cost_auto": formula_cost_auto,
-        "v1.ingredient_cost_manual": data.ingredient_cost_manual or 0.0,
-        "v1.total": v1_total,
-        "v1.notes": data.notes or "",
-        "v1.status": "rascunho",
-        "updated_at": now_iso(),
+    v1_data = {
+        "ingredient_cost_auto": formula_cost_auto,
+        "ingredient_cost_manual": data.ingredient_cost_manual or 0.0,
+        "total": v1_total,
+        "notes": data.notes or "",
+        "status": "rascunho",
+        "submitted_at": (existing.get("v1") or {}).get("submitted_at") if existing else None,
+        "submitted_by_name": (existing.get("v1") or {}).get("submitted_by_name") if existing else None,
     }
 
     if existing:
-        await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": v1_patch})
+        await pg_db.execute(
+            "UPDATE pd_cost_versions SET v1 = v1 || $1::jsonb, updated_at=NOW() WHERE development_id=$2",
+            v1_data, dev_id,
+        )
     else:
-        doc = _default_cost_versions_doc(dev_id, user["tenant_id"])
-        doc["v1"].update({
-            "ingredient_cost_auto": formula_cost_auto,
-            "ingredient_cost_manual": data.ingredient_cost_manual or 0.0,
-            "total": v1_total,
-            "notes": data.notes or "",
-        })
-        doc["updated_at"] = now_iso()
-        await db.pd_cost_versions.insert_one(doc)
+        await pg_db.execute(
+            "INSERT INTO pd_cost_versions (id, tenant_id, development_id, v1, v2, total_final, updated_at) VALUES ($1,$2,$3,$4,$5,$6,NOW())",
+            new_id(), user["tenant_id"], dev_id, v1_data, None, 0.0,
+        )
 
-    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="cost_v1_saved", entity_type="pd_cost_versions", entity_id=dev_id,
                     after={"v1_total": v1_total})
@@ -2694,26 +2762,28 @@ async def upsert_cost_v1(dev_id: str, data: PDCostV1Upsert, request: Request):
 async def submit_cost_v1(dev_id: str, request: Request):
     """P&D freezes v1 and sends it to Compras for commercial cost addition."""
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     require_roles(user, PD_WRITE)
 
-    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     if not existing:
         raise HTTPException(status_code=400, detail="Salve um rascunho de custo antes de enviar.")
     if (existing.get("v1") or {}).get("status") == "enviado":
         raise HTTPException(status_code=409, detail="Custo v1 já foi enviado para Compras.")
 
-    patch = {
-        "v1.status": "enviado",
-        "v1.submitted_at": now_iso(),
-        "v1.submitted_by_name": user.get("name", ""),
-        "updated_at": now_iso(),
+    v1_patch = {
+        "status": "enviado",
+        "submitted_at": now_iso(),
+        "submitted_by_name": user.get("name", ""),
     }
-    await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": patch})
+    await pg_db.execute(
+        "UPDATE pd_cost_versions SET v1 = v1 || $1::jsonb, updated_at=NOW() WHERE development_id=$2",
+        v1_patch, dev_id,
+    )
 
-    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="cost_v1_submitted", entity_type="pd_cost_versions", entity_id=dev_id,
                     before={"v1_status": "rascunho"}, after={"v1_status": "enviado"})
@@ -2724,12 +2794,12 @@ async def submit_cost_v1(dev_id: str, request: Request):
 async def upsert_cost_v2(dev_id: str, data: ComprasCostUpsert, request: Request):
     """Compras fills in the commercial cost breakdown (v2). Requires v1 to be submitted."""
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     require_roles(user, COMPRAS_FULL)
 
-    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     if not existing or (existing.get("v1") or {}).get("status") != "enviado":
         raise HTTPException(status_code=400, detail="Aguardando envio do custo v1 pelo P&D.")
     if (existing.get("v2") or {}).get("status") == "finalizado":
@@ -2754,12 +2824,12 @@ async def upsert_cost_v2(dev_id: str, data: ComprasCostUpsert, request: Request)
         "finalized_by_name": (existing.get("v2") or {}).get("finalized_by_name"),
     }
 
-    await db.pd_cost_versions.update_one(
-        {"development_id": dev_id},
-        {"$set": {"v2": v2_doc, "total_final": total_final, "updated_at": now_iso()}}
+    await pg_db.execute(
+        "UPDATE pd_cost_versions SET v2=$1, total_final=$2, updated_at=NOW() WHERE development_id=$3",
+        v2_doc, total_final, dev_id,
     )
 
-    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="cost_v2_saved", entity_type="pd_cost_versions", entity_id=dev_id,
                     after={"v2_total": v2_total, "total_final": total_final})
@@ -2770,26 +2840,28 @@ async def upsert_cost_v2(dev_id: str, data: ComprasCostUpsert, request: Request)
 async def finalize_cost_v2(dev_id: str, request: Request):
     """Compras finalizes the commercial cost. After this, costs are locked."""
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     require_roles(user, COMPRAS_FULL)
 
-    existing = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     if not existing or not existing.get("v2"):
         raise HTTPException(status_code=400, detail="Salve os dados de custo comercial antes de finalizar.")
     if (existing.get("v2") or {}).get("status") == "finalizado":
         raise HTTPException(status_code=409, detail="Custo v2 já está finalizado.")
 
-    patch = {
-        "v2.status": "finalizado",
-        "v2.finalized_at": now_iso(),
-        "v2.finalized_by_name": user.get("name", ""),
-        "updated_at": now_iso(),
+    v2_patch = {
+        "status": "finalizado",
+        "finalized_at": now_iso(),
+        "finalized_by_name": user.get("name", ""),
     }
-    await db.pd_cost_versions.update_one({"development_id": dev_id}, {"$set": patch})
+    await pg_db.execute(
+        "UPDATE pd_cost_versions SET v2 = v2 || $1::jsonb, updated_at=NOW() WHERE development_id=$2",
+        v2_patch, dev_id,
+    )
 
-    doc = await db.pd_cost_versions.find_one({"development_id": dev_id}, {"_id": 0})
+    doc = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev_id))
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="cost_v2_finalized", entity_type="pd_cost_versions", entity_id=dev_id,
                     before={"v2_status": "rascunho"},
@@ -2802,17 +2874,18 @@ async def finalize_cost_v2(dev_id: str, request: Request):
 async def get_formula_costs(dev_id: str, request: Request):
     """Auto-calculate costs from the latest formula"""
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     # Get latest formula
-    formulas = await db.pd_formulas.find({"development_id": dev_id}, {"_id": 0}).sort("version", -1).to_list(1)
-    if not formulas:
+    formula = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev_id
+    ))
+    if not formula:
         return {"formula": None, "items": [], "totals": None}
-    
-    formula = formulas[0]
-    items = await db.pd_formula_items.find({"formula_id": formula["id"]}, {"_id": 0}).to_list(200)
+
+    items = _rows(await pg_db.fetch_all("SELECT * FROM pd_formula_items WHERE formula_id=$1", formula["id"]))
     
     total_percentage = sum(it.get("percentage", 0) for it in items)
     total_cost_per_kg = sum(it.get("cost_brl", 0) for it in items)
@@ -2872,19 +2945,24 @@ class SampleBatchCreate(BaseModel):
 async def list_sample_batches(dev_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    batches = await db.pd_sample_batches.find(
-        {"development_id": dev_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(100)
+    rows = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_sample_batches WHERE development_id=$1 AND tenant_id=$2 ORDER BY created_at DESC",
+        dev_id, user["tenant_id"],
+    ))
+    batches = []
+    for r in rows:
+        conteudo = r.pop("conteudo", {}) or {}
+        batches.append({**conteudo, **r})
     return batches
 
 @pd_router.post("/developments/{dev_id}/sample-batches")
 async def create_sample_batch(dev_id: str, data: SampleBatchCreate, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
     batch_id = new_id()
@@ -2899,21 +2977,20 @@ async def create_sample_batch(dev_id: str, data: SampleBatchCreate, request: Req
             "overrides": [o.dict() for o in v.overrides],
             "notas": v.notas,
         })
-    doc = {
-        "id": batch_id,
-        "development_id": dev_id,
-        "tenant_id": user["tenant_id"],
+    conteudo = {
         "nome": data.nome,
         "formula_base_id": data.formula_base_id,
         "volume_base_ml": data.volume_base_ml,
         "variantes": variantes,
         "notas": data.notas,
-        "created_at": now,
         "created_by": user["id"],
         "created_by_name": user["name"],
-        "updated_at": now,
     }
-    await db.pd_sample_batches.insert_one({**doc, "_id": batch_id})
+    doc = {"id": batch_id, "development_id": dev_id, "tenant_id": user["tenant_id"], "created_at": now, "updated_at": now, **conteudo}
+    await pg_db.execute(
+        "INSERT INTO pd_sample_batches (id, tenant_id, development_id, conteudo, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6)",
+        batch_id, user["tenant_id"], dev_id, conteudo, now, now,
+    )
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="created", entity_type="pd_sample_batches", entity_id=batch_id, after=doc)
     return doc
@@ -2922,12 +2999,13 @@ async def create_sample_batch(dev_id: str, data: SampleBatchCreate, request: Req
 async def update_sample_batch(dev_id: str, batch_id: str, data: SampleBatchCreate, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    existing = await db.pd_sample_batches.find_one({"id": batch_id, "development_id": dev_id})
-    if not existing:
+    existing_row = _row(await pg_db.fetch_one("SELECT * FROM pd_sample_batches WHERE id=$1 AND development_id=$2", batch_id, dev_id))
+    if not existing_row:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
+    existing = {**(existing_row.get("conteudo") or {}), **existing_row}
     variantes = []
     for v in data.variantes:
         vid = v.id if v.id else new_id()
@@ -2938,30 +3016,34 @@ async def update_sample_batch(dev_id: str, batch_id: str, data: SampleBatchCreat
             "overrides": [o.dict() for o in v.overrides],
             "notas": v.notas,
         })
-    updates = {
+    new_conteudo = {
+        **(existing_row.get("conteudo") or {}),
         "nome": data.nome,
         "formula_base_id": data.formula_base_id,
         "volume_base_ml": data.volume_base_ml,
         "variantes": variantes,
         "notas": data.notas,
-        "updated_at": now_iso(),
     }
-    await db.pd_sample_batches.update_one({"id": batch_id}, {"$set": updates})
+    await pg_db.execute(
+        "UPDATE pd_sample_batches SET conteudo=$1, updated_at=NOW() WHERE id=$2",
+        new_conteudo, batch_id,
+    )
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="updated", entity_type="pd_sample_batches", entity_id=batch_id,
-                    before={"nome": existing.get("nome")}, after=updates)
-    return {**{k: v for k, v in existing.items() if k != "_id"}, **updates}
+                    before={"nome": existing.get("nome")}, after=new_conteudo)
+    return {**existing, **new_conteudo, "updated_at": now_iso()}
 
 @pd_router.delete("/developments/{dev_id}/sample-batches/{batch_id}")
 async def delete_sample_batch(dev_id: str, batch_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    existing = await db.pd_sample_batches.find_one(
-        {"id": batch_id, "development_id": dev_id, "tenant_id": user["tenant_id"]}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_sample_batches WHERE id=$1 AND development_id=$2 AND tenant_id=$3",
+        batch_id, dev_id, user["tenant_id"],
+    ))
     if not existing:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
-    await db.pd_sample_batches.delete_one({"id": batch_id})
+    await pg_db.execute("DELETE FROM pd_sample_batches WHERE id=$1", batch_id)
     await audit_log(tenant_id=user["tenant_id"], user_id=user["id"], user_name=user.get("name", ""),
                     action="deleted", entity_type="pd_sample_batches", entity_id=batch_id,
                     before={"nome": existing.get("nome")})
@@ -2972,11 +3054,12 @@ async def delete_sample_batch(dev_id: str, batch_id: str, request: Request):
 @pd_router.post("/developments/{dev_id}/documents")
 async def add_document(dev_id: str, data: DocumentCreate, request: Request):
     user = await get_current_user(request)
-    dev = await db.pd_developments.find_one({"id": dev_id, "tenant_id": user["tenant_id"]})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE id=$1 AND tenant_id=$2", dev_id, user["tenant_id"]))
     if not dev:
         raise HTTPException(status_code=404, detail="Desenvolvimento não encontrado")
-    
+
     doc_id = new_id()
+    ts = now_iso()
     doc = {
         "id": doc_id,
         "development_id": dev_id,
@@ -2985,23 +3068,27 @@ async def add_document(dev_id: str, data: DocumentCreate, request: Request):
         "file_name": data.file_name or "",
         "uploaded_by": user["id"],
         "uploaded_by_name": user["name"],
-        "uploaded_at": now_iso(),
+        "uploaded_at": ts,
     }
-    await db.pd_documents.insert_one(doc)
-    doc.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_documents (id, tenant_id, development_id, doc_type, file_url, file_name, uploaded_by, uploaded_by_name, uploaded_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        doc_id, user["tenant_id"], dev_id, data.doc_type, data.file_url, data.file_name or "", user["id"], user["name"], ts,
+    )
     return doc
 
 @pd_router.get("/developments/{dev_id}/documents")
 async def list_documents(dev_id: str, request: Request):
     user = await get_current_user(request)
-    docs = await db.pd_documents.find({"development_id": dev_id}, {"_id": 0}).sort("uploaded_at", -1).to_list(100)
+    docs = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_documents WHERE development_id=$1 ORDER BY uploaded_at DESC", dev_id
+    ))
     return docs
 
 @pd_router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_documents.delete_one({"id": doc_id})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_one("DELETE FROM pd_documents WHERE id=$1 RETURNING id", doc_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Documento não encontrado")
     return {"message": "Documento removido"}
 
@@ -3029,9 +3116,16 @@ async def list_live_document_versions(req_id: str, doc_type: str, request: Reque
         raise HTTPException(status_code=400, detail="Tipo de documento vivo invalido")
     query = {"tenant_id": user["tenant_id"], "pd_request_id": req_id, "doc_type": doc_type}
     if not _user_can_review_live_documents(user):
-        query["status"] = "aprovado"
-        query["active_for_operation"] = True
-    return await db.pd_document_versions.find(query, {"_id": 0}).sort("version_number", -1).to_list(100)
+        versions = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 AND status='aprovado' AND active_for_operation=TRUE ORDER BY version_number DESC",
+            user["tenant_id"], req_id, doc_type,
+        ))
+    else:
+        versions = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 ORDER BY version_number DESC",
+            user["tenant_id"], req_id, doc_type,
+        ))
+    return versions
 
 
 @pd_router.get("/requests/{req_id}/live-documents/{doc_type}/current")
@@ -3044,9 +3138,21 @@ async def get_current_live_document(req_id: str, doc_type: str, request: Request
     if not _user_can_review_live_documents(user):
         query["status"] = "aprovado"
         query["active_for_operation"] = True
-    doc_version = await db.pd_document_versions.find_one(query, {"_id": 0}, sort=[("version_number", -1)])
-    if not doc_version and _user_can_review_live_documents(user):
-        doc_version = await db.pd_document_versions.find_one(base_query, {"_id": 0}, sort=[("version_number", -1)])
+    if not _user_can_review_live_documents(user):
+        doc_version = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 AND status='aprovado' AND active_for_operation=TRUE ORDER BY version_number DESC LIMIT 1",
+            user["tenant_id"], req_id, doc_type,
+        ))
+    else:
+        doc_version = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 ORDER BY version_number DESC LIMIT 1",
+            user["tenant_id"], req_id, doc_type,
+        ))
+    if not doc_version:
+        doc_version = _row(await pg_db.fetch_one(
+            "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 ORDER BY version_number DESC LIMIT 1",
+            user["tenant_id"], req_id, doc_type,
+        ))
     if not doc_version:
         raise HTTPException(status_code=404, detail="Documento vivo nao encontrado")
     return await _get_live_document_version(doc_version["id"], user)
@@ -3205,18 +3311,18 @@ async def list_pending_live_documents(request: Request):
     if not _user_can_review_live_documents(user):
         raise HTTPException(status_code=403, detail="Sua funcao nao tem acesso ao inbox de documentos vivos.")
 
-    versions = await db.pd_document_versions.find(
-        {"tenant_id": user["tenant_id"], "status": "em_revisao"},
-        {"_id": 0},
-    ).sort("created_at", -1).to_list(500)
+    versions = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND status='em_revisao' ORDER BY created_at DESC LIMIT 500",
+        user["tenant_id"]
+    ))
 
     pd_request_ids = list({v.get("pd_request_id") for v in versions if v.get("pd_request_id")})
     pd_requests = []
     if pd_request_ids:
-        pd_requests = await db.pd_requests.find(
-            {"id": {"$in": pd_request_ids}, "tenant_id": user["tenant_id"]},
-            {"_id": 0, "id": 1, "project_name": 1, "client_name": 1, "sku": 1},
-        ).to_list(1000)
+        pd_requests = _rows(await pg_db.fetch_all(
+            "SELECT id, project_name, client_name, sku FROM pd_requests WHERE tenant_id=$1 AND id = ANY($2::text[]) LIMIT 1000",
+            user["tenant_id"], pd_request_ids
+        ))
     pd_map = {p["id"]: p for p in pd_requests}
 
     result = []
@@ -3262,17 +3368,10 @@ async def diff_live_document_version(version_id: str, request: Request):
     current = await _get_live_document_version(version_id, user)
 
     # find previous version (any status except rejeitado/reprovado, lower version_number)
-    previous = await db.pd_document_versions.find_one(
-        {
-            "tenant_id": user["tenant_id"],
-            "pd_request_id": current["pd_request_id"],
-            "doc_type": current["doc_type"],
-            "version_number": {"$lt": current["version_number"]},
-            "status": {"$ne": "reprovado"},
-        },
-        {"_id": 0},
-        sort=[("version_number", -1)],
-    )
+    previous = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_document_versions WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 AND version_number < $4 AND status != 'reprovado' ORDER BY version_number DESC LIMIT 1",
+        user["tenant_id"], current["pd_request_id"], current["doc_type"], current["version_number"]
+    ))
 
     flat_current = _flatten_snapshot(current.get("snapshot") or {})
     flat_previous = _flatten_snapshot((previous or {}).get("snapshot") or {})
@@ -3366,16 +3465,16 @@ async def get_pd_full_detail(req_id: str, request: Request):
     """Get complete P&D request with all related data"""
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    
-    history = await db.pd_request_status_history.find(
-        {"pd_request_id": req_id}, {"_id": 0}
-    ).sort("created_at", -1).to_list(100)
-    
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
-    
+
+    history = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_request_status_history WHERE pd_request_id=$1 ORDER BY created_at DESC LIMIT 100", req_id
+    ))
+
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
+
     formulas = []
     tests = []
     samples = []
@@ -3387,9 +3486,14 @@ async def get_pd_full_detail(req_id: str, request: Request):
     lab_results_doc = None
 
     if dev:
-        formulas = await db.pd_formulas.find({"development_id": dev["id"]}, {"_id": 0}).sort("version", -1).to_list(100)
+        formulas = _rows(await pg_db.fetch_all(
+            'SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 100', dev["id"]
+        ))
         for f in formulas:
-            items = await db.pd_formula_items.find({"formula_id": f["id"]}, {"_id": 0}).to_list(200)
+            items = _rows(await pg_db.fetch_all(
+                'SELECT id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id FROM pd_formula_items WHERE formula_id=$1 LIMIT 200',
+                f["id"]
+            ))
             total_cost = sum(it.get("cost_brl", 0) for it in items)
             for it in items:
                 it["cost_percentage"] = round((it.get("cost_brl", 0) / total_cost * 100), 2) if total_cost > 0 else 0
@@ -3399,20 +3503,26 @@ async def get_pd_full_detail(req_id: str, request: Request):
             volume_kg = volume / 1000.0 if volume_unit == "mL" else volume
             f["custo_unitario"] = round(total_cost * volume_kg, 2) if volume_kg > 0 else round(total_cost, 2)
             f["total_cost_per_kg"] = round(total_cost, 4)
-        
-        tests = await db.pd_tests.find({"development_id": dev["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-        samples = await db.pd_samples.find({"development_id": dev["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-        approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
-        cost_doc = await db.pd_costs.find_one({"development_id": dev["id"]}, {"_id": 0})
+
+        tests = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_tests WHERE development_id=$1 ORDER BY created_at DESC LIMIT 100", dev["id"]
+        ))
+        samples = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_samples WHERE development_id=$1 ORDER BY created_at DESC LIMIT 100", dev["id"]
+        ))
+        approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev["id"]))
+        cost_doc = _row(await pg_db.fetch_one("SELECT * FROM pd_costs WHERE development_id=$1", dev["id"]))
         if cost_doc:
             costs = cost_doc
-        documents = await db.pd_documents.find({"development_id": dev["id"]}, {"_id": 0}).sort("uploaded_at", -1).to_list(100)
+        documents = _rows(await pg_db.fetch_all(
+            "SELECT * FROM pd_documents WHERE development_id=$1 ORDER BY uploaded_at DESC LIMIT 100", dev["id"]
+        ))
 
         # Get unified lab results
-        lab_results_doc = await db.pd_lab_results.find_one({"development_id": dev["id"]}, {"_id": 0})
+        lab_results_doc = _row(await pg_db.fetch_one("SELECT * FROM pd_lab_results WHERE development_id=$1", dev["id"]))
 
         # Load cost versions (new versioned system) — response is role-filtered
-        cost_versions_raw = await db.pd_cost_versions.find_one({"development_id": dev["id"]}, {"_id": 0})
+        cost_versions_raw = _row(await pg_db.fetch_one("SELECT * FROM pd_cost_versions WHERE development_id=$1", dev["id"]))
         
         # Calculate formula cost data from latest formula
         formula_cost_auto = 0.0
@@ -3484,12 +3594,14 @@ async def get_pd_full_detail(req_id: str, request: Request):
             }
 
     # Get updates + pending (new feature: Atualizações)
-    updates_list = await db.pd_updates.find(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(200)
-    pending_list = await db.pd_pending_items.find(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(200)
+    updates_list = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_updates WHERE pd_request_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 200",
+        req_id, user["tenant_id"]
+    ))
+    pending_list = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_pending_items WHERE pd_request_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 200",
+        req_id, user["tenant_id"]
+    ))
     now_dt = datetime.now(timezone.utc)
     for it in pending_list:
         if it["status"] == "pendente" and it.get("data_prevista"):
@@ -3533,14 +3645,14 @@ async def pd_metrics(request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
     
-    total = await db.pd_requests.count_documents({"tenant_id": tid})
+    total = await pg_db.fetch_val("SELECT COUNT(*) FROM pd_requests WHERE tenant_id=$1", tid)
     by_status = {}
     for status in VALID_STATUSES:
-        by_status[status] = await db.pd_requests.count_documents({"tenant_id": tid, "status": status})
-    
+        by_status[status] = await pg_db.fetch_val("SELECT COUNT(*) FROM pd_requests WHERE tenant_id=$1 AND status=$2", tid, status)
+
     by_priority = {}
     for prio in ["Baixa", "Normal", "Alta", "Urgente"]:
-        by_priority[prio] = await db.pd_requests.count_documents({"tenant_id": tid, "priority": prio})
+        by_priority[prio] = await pg_db.fetch_val("SELECT COUNT(*) FROM pd_requests WHERE tenant_id=$1 AND priority=$2", tid, prio)
     
     return {
         "total": total,
@@ -3557,16 +3669,28 @@ class FormulaNewVersionInput(BaseModel):
 async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInput, request: Request):
     """RN-BF-01 / RN-PD-06: Creates a new unlocked version of a locked formula with mandatory justification."""
     user = await get_current_user(request)
-    old = await db.pd_formulas.find_one({"id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    old = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1 AND tenant_id=$2", formula_id, user["tenant_id"]))
     if not old:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
     if not old.get("locked"):
         raise HTTPException(status_code=400, detail="Apenas fórmulas registradas (bloqueadas) podem ser versionadas. Edite diretamente a fórmula atual.")
 
-    old_items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+    old_items = _rows(await pg_db.fetch_all(
+        'SELECT id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id FROM pd_formula_items WHERE formula_id=$1 LIMIT 200',
+        formula_id
+    ))
     new_formula_id = new_id()
     new_version_num = old.get("version", 1) + 1
 
+    await pg_db.execute(
+        """INSERT INTO pd_formulas (id, tenant_id, development_id, version, name, notes, volume, volume_unit, indice_perdas, cotacao_usd, locked, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())""",
+        new_formula_id, user["tenant_id"], old["development_id"], new_version_num,
+        old.get("name", f"Fórmula v{new_version_num}"), old.get("notes", ""),
+        old.get("volume", 0), old.get("volume_unit", "mL"),
+        old.get("indice_perdas", 0), old.get("cotacao_usd", 6.00),
+        False, user["id"], user.get("name", "")
+    )
     new_formula = {
         "id": new_formula_id,
         "tenant_id": user["tenant_id"],
@@ -3581,19 +3705,19 @@ async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInp
         "locked": False,
         "parent_formula_id": formula_id,
         "version_justification": data.justification.strip(),
-        "created_at": now_iso(),
         "created_by": user["id"],
         "created_by_name": user.get("name", ""),
     }
-    await db.pd_formulas.insert_one(new_formula)
-    new_formula.pop("_id", None)
 
     new_items = []
     for item in old_items:
-        new_item = {**{k: v for k, v in item.items() if k != "_id"}, "id": new_id(), "formula_id": new_formula_id}
+        new_item = {**{k: v for k, v in item.items()}, "id": new_id(), "formula_id": new_formula_id}
         new_items.append(new_item)
     if new_items:
-        await db.pd_formula_items.insert_many(new_items)
+        await pg_db.execute_many(
+            'INSERT INTO pd_formula_items (id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+            [(it["id"], new_formula_id, it.get("ingredient_name", ""), it.get("percentage", 0), it.get("price_per_kg", 0), it.get("price_usd"), it.get("cost_brl", 0), it.get("cost_kg_usd"), it.get("cost_brl_via_cambio"), it.get("fornecedor", ""), it.get("phase", ""), it.get("function", ""), it.get("catalog_id")) for it in new_items]
+        )
 
     await audit_log(
         tenant_id=user["tenant_id"],
@@ -3604,9 +3728,7 @@ async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInp
         entity_id=new_formula_id,
         after={"version": new_version_num, "parent_formula_id": formula_id, "justification": data.justification.strip()},
     )
-    new_formula["items"] = [
-        {k: v for k, v in it.items() if k != "_id"} for it in new_items
-    ]
+    new_formula["items"] = new_items
     return new_formula
 
 
@@ -3614,44 +3736,56 @@ async def create_formula_new_version(formula_id: str, data: FormulaNewVersionInp
 async def duplicate_formula(formula_id: str, request: Request):
     """Duplica uma fórmula (bloqueada ou não) como nova variação — ideal para lotes com base comum."""
     user = await get_current_user(request)
-    src = await db.pd_formulas.find_one({"id": formula_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    src = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE id=$1 AND tenant_id=$2", formula_id, user["tenant_id"]))
     if not src:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
 
-    siblings = await db.pd_formulas.find(
-        {"development_id": src["development_id"]}, {"version": 1}
-    ).to_list(100)
+    siblings = _rows(await pg_db.fetch_all("SELECT version FROM pd_formulas WHERE development_id=$1 LIMIT 100", src["development_id"]))
     next_version = max((s.get("version", 1) for s in siblings), default=1) + 1
 
-    src_items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(200)
+    src_items = _rows(await pg_db.fetch_all(
+        'SELECT id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id FROM pd_formula_items WHERE formula_id=$1 LIMIT 200',
+        formula_id
+    ))
     new_formula_id = new_id()
+    await pg_db.execute(
+        """INSERT INTO pd_formulas (id, tenant_id, development_id, version, name, notes, volume, volume_unit, indice_perdas, cotacao_usd, locked, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())""",
+        new_formula_id, src["tenant_id"], src["development_id"], next_version,
+        src.get("name", f"Fórmula v{next_version}"), src.get("notes", ""),
+        src.get("volume", 0), src.get("volume_unit", "mL"),
+        src.get("indice_perdas", 0), src.get("cotacao_usd", 6.00),
+        False, user["id"], user.get("name", "")
+    )
     new_formula = {
-        k: v for k, v in src.items()
-        if k not in ("id", "locked", "locked_at", "locked_by", "locked_by_name", "parent_formula_id",
-                     "version_justification", "created_at", "created_by", "created_by_name", "items")
-    }
-    new_formula.update({
         "id": new_formula_id,
+        "tenant_id": src["tenant_id"],
+        "development_id": src["development_id"],
         "version": next_version,
         "name": src.get("name", f"Fórmula v{next_version}"),
+        "notes": src.get("notes", ""),
+        "volume": src.get("volume", 0),
+        "volume_unit": src.get("volume_unit", "mL"),
+        "indice_perdas": src.get("indice_perdas", 0),
+        "cotacao_usd": src.get("cotacao_usd", 6.00),
         "locked": False,
         "parent_formula_id": formula_id,
         "version_justification": "Variação duplicada",
-        "created_at": now_iso(),
         "created_by": user["id"],
         "created_by_name": user.get("name", ""),
-    })
-    await db.pd_formulas.insert_one(new_formula)
-    new_formula.pop("_id", None)
+    }
 
     new_items = []
     for item in src_items:
-        new_item = {**{k: v for k, v in item.items() if k != "_id"}, "id": new_id(), "formula_id": new_formula_id}
+        new_item = {**{k: v for k, v in item.items()}, "id": new_id(), "formula_id": new_formula_id}
         new_items.append(new_item)
     if new_items:
-        await db.pd_formula_items.insert_many(new_items)
+        await pg_db.execute_many(
+            'INSERT INTO pd_formula_items (id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+            [(it["id"], new_formula_id, it.get("ingredient_name", ""), it.get("percentage", 0), it.get("price_per_kg", 0), it.get("price_usd"), it.get("cost_brl", 0), it.get("cost_kg_usd"), it.get("cost_brl_via_cambio"), it.get("fornecedor", ""), it.get("phase", ""), it.get("function", ""), it.get("catalog_id")) for it in new_items]
+        )
 
-    new_formula["items"] = [{k: v for k, v in it.items() if k != "_id"} for it in new_items]
+    new_formula["items"] = new_items
     return new_formula
 
 
@@ -3661,13 +3795,14 @@ async def duplicate_formula(formula_id: str, request: Request):
 async def get_or_init_stability_study_for_card(req_id: str, request: Request):
     """Gets (or auto-creates) the stability study for a P&D card, including all readings."""
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     study = await _ensure_stability_study_for_pd_card(pd_req, user)
-    readings = await db.pd_stability_readings.find(
-        {"study_id": study["id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort([("day_offset", 1), ("created_at", 1)]).to_list(5000)
+    readings = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_stability_readings WHERE study_id=$1 AND tenant_id=$2 ORDER BY day_offset, created_at LIMIT 5000",
+        study["id"], user["tenant_id"]
+    ))
     constants = {"conditions": STABILITY_CONDITIONS, "parameters": STABILITY_PARAMETERS, "checkpoints": STABILITY_CHECKPOINTS}
     return {"study": study, "readings": readings, "constants": constants}
 
@@ -3698,17 +3833,24 @@ class FichaTecnicaAnaliseUpsert(BaseModel):
 @pd_router.get("/requests/{req_id}/ficha-tecnica-ui")
 async def get_ficha_tecnica_ui(req_id: str, request: Request):
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     formula = None
     items = []
     if dev:
-        formula = await db.pd_formulas.find_one({"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)])
+        formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev["id"]))
         if formula:
-            items = await db.pd_formula_items.find({"formula_id": formula["id"]}, {"_id": 0}).to_list(200)
-    analise = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}) or {}
+            items = _rows(await pg_db.fetch_all(
+                'SELECT id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id FROM pd_formula_items WHERE formula_id=$1 LIMIT 200',
+                formula["id"]
+            ))
+    ft_row = _row(await pg_db.fetch_one("SELECT * FROM pd_ficha_tecnica WHERE pd_request_id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
+    analise = {}
+    if ft_row:
+        conteudo = ft_row.get("conteudo", {}) or {}
+        analise = {**conteudo, "id": ft_row["id"], "pd_request_id": ft_row["pd_request_id"], "tenant_id": ft_row["tenant_id"]}
     return {
         "request": pd_req,
         "development": dev,
@@ -3720,10 +3862,10 @@ async def get_ficha_tecnica_ui(req_id: str, request: Request):
 @pd_router.put("/requests/{req_id}/ficha-tecnica-ui")
 async def save_ficha_tecnica_ui(req_id: str, data: FichaTecnicaAnaliseUpsert, request: Request):
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE pd_request_id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     update_data = {}
     for field in ["produto", "lote", "data_fabricacao", "validade", "quantidade", "elaboracao", "resp_tecnico", "status_aprovacao"]:
         val = getattr(data, field, None)
@@ -3740,20 +3882,22 @@ async def save_ficha_tecnica_ui(req_id: str, data: FichaTecnicaAnaliseUpsert, re
         "updated_by": user["id"],
         "updated_by_name": user.get("name", ""),
     })
-    existing = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]})
+    existing = _row(await pg_db.fetch_one("SELECT id FROM pd_ficha_tecnica WHERE pd_request_id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if existing:
-        await db.pd_ficha_tecnica.update_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"$set": update_data})
+        await pg_db.execute(
+            "UPDATE pd_ficha_tecnica SET conteudo = conteudo || $1::jsonb, updated_at=NOW() WHERE pd_request_id=$2 AND tenant_id=$3",
+            update_data, req_id, user["tenant_id"]
+        )
     else:
-        update_data.update({
-            "id": new_id(),
-            "pd_request_id": req_id,
-            "development_id": dev["id"] if dev else None,
-            "tenant_id": user["tenant_id"],
-            "created_at": now_iso(),
-        })
-        await db.pd_ficha_tecnica.insert_one(update_data)
-    result = await db.pd_ficha_tecnica.find_one({"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
-    return result
+        await pg_db.execute(
+            "INSERT INTO pd_ficha_tecnica (id, tenant_id, pd_request_id, conteudo, created_at, updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())",
+            new_id(), user["tenant_id"], req_id, update_data
+        )
+    ft_row = _row(await pg_db.fetch_one("SELECT * FROM pd_ficha_tecnica WHERE pd_request_id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
+    if not ft_row:
+        return {}
+    conteudo = ft_row.get("conteudo", {}) or {}
+    return {**conteudo, "id": ft_row["id"], "pd_request_id": ft_row["pd_request_id"], "tenant_id": ft_row["tenant_id"]}
 
 
 # ============ FICHA TÉCNICA PDF GENERATION ============
@@ -3768,24 +3912,27 @@ async def generate_ficha_tecnica(req_id: str, request: Request):
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
 
-    dev = await db.pd_developments.find_one({"pd_request_id": req_id}, {"_id": 0})
-    
+    dev = _row(await pg_db.fetch_one("SELECT * FROM pd_developments WHERE pd_request_id=$1", req_id))
+
     formulas = []
     tests = []
     approval = None
     cost_data = None
-    
+
     if dev:
-        formulas = await db.pd_formulas.find({"development_id": dev["id"]}, {"_id": 0}).sort("version", -1).to_list(100)
+        formulas = _rows(await pg_db.fetch_all("SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 100", dev["id"]))
         for f in formulas:
-            f["items"] = await db.pd_formula_items.find({"formula_id": f["id"]}, {"_id": 0}).to_list(200)
-        tests = await db.pd_tests.find({"development_id": dev["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
-        approval = await db.pd_approvals.find_one({"development_id": dev["id"]}, {"_id": 0})
-        cost_data = await db.pd_costs.find_one({"development_id": dev["id"]}, {"_id": 0})
+            f["items"] = _rows(await pg_db.fetch_all(
+                'SELECT id, formula_id, ingredient_name, percentage, price_per_kg, price_usd, cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id FROM pd_formula_items WHERE formula_id=$1 LIMIT 200',
+                f["id"]
+            ))
+        tests = _rows(await pg_db.fetch_all("SELECT * FROM pd_tests WHERE development_id=$1 ORDER BY created_at DESC LIMIT 100", dev["id"]))
+        approval = _row(await pg_db.fetch_one("SELECT * FROM pd_approvals WHERE development_id=$1", dev["id"]))
+        cost_data = _row(await pg_db.fetch_one("SELECT * FROM pd_costs WHERE development_id=$1", dev["id"]))
 
     # Get client info
     client_info = None
@@ -4073,31 +4220,37 @@ async def create_catalog_item(data: CatalogItemCreate, request: Request):
         "created_by_name": user["name"],
         "created_at": now_iso(),
     }
-    await db.pd_catalog.insert_one(item)
-    item.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_catalog (id, tenant_id, nome, inci, codigo_interno, fornecedor, preco_rs_kg, moeda, unidade, categoria, observacoes, fornecedores, ultima_atualizacao, atualizado_por, atualizado_por_id, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())""",
+        item_id, user["tenant_id"], item["nome"], item["inci"], item["codigo_interno"],
+        item["fornecedor"], item["preco_rs_kg"], item["moeda"], item["unidade"],
+        item["categoria"], item["observacoes"], item["fornecedores"],
+        item["ultima_atualizacao"], item["atualizado_por"], item["atualizado_por_id"],
+        item["created_by"], item["created_by_name"]
+    )
     return item
 
 @pd_router.get("/catalog")
 async def list_catalog(request: Request, q: Optional[str] = None, categoria: Optional[str] = None):
     user = await get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
-    if q:
-        query["$or"] = [
-            {"nome": {"$regex": q, "$options": "i"}},
-            {"inci": {"$regex": q, "$options": "i"}},
-            {"codigo_interno": {"$regex": q, "$options": "i"}},
-            {"fornecedor": {"$regex": q, "$options": "i"}},
-            {"fornecedores.nome": {"$regex": q, "$options": "i"}},
-        ]
+    sql = "SELECT * FROM pd_catalog WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if categoria:
-        query["categoria"] = categoria
-    items = await db.pd_catalog.find(query, {"_id": 0}).sort("nome", 1).to_list(1000)
+        params.append(categoria)
+        sql += f" AND categoria=${len(params)}"
+    if q:
+        params.append(f"%{q}%")
+        n = len(params)
+        sql += f" AND (nome ILIKE ${n} OR inci ILIKE ${n} OR codigo_interno ILIKE ${n} OR fornecedor ILIKE ${n} OR EXISTS (SELECT 1 FROM jsonb_array_elements(fornecedores) e WHERE e->>'nome' ILIKE ${n}))"
+    sql += " ORDER BY nome LIMIT 1000"
+    items = _rows(await pg_db.fetch_all(sql, *params))
     return items
 
 @pd_router.get("/catalog/{item_id}")
 async def get_catalog_item(item_id: str, request: Request):
     user = await get_current_user(request)
-    item = await db.pd_catalog.find_one({"id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_catalog WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]))
     if not item:
         raise HTTPException(status_code=404, detail="Ingrediente não encontrado no banco de custos")
     return item
@@ -4105,7 +4258,7 @@ async def get_catalog_item(item_id: str, request: Request):
 @pd_router.put("/catalog/{item_id}")
 async def update_catalog_item(item_id: str, data: CatalogItemUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_catalog.find_one({"id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_catalog WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]))
     if not existing:
         raise HTTPException(status_code=404, detail="Ingrediente não encontrado")
 
@@ -4115,17 +4268,13 @@ async def update_catalog_item(item_id: str, data: CatalogItemUpdate, request: Re
 
     # Track price change history if preco changed
     if "preco_rs_kg" in update_fields and update_fields["preco_rs_kg"] != existing.get("preco_rs_kg"):
-        history_entry = {
-            "id": new_id(),
-            "catalog_item_id": item_id,
-            "preco_anterior": existing.get("preco_rs_kg", 0),
-            "preco_novo": update_fields["preco_rs_kg"],
-            "moeda": update_fields.get("moeda") or existing.get("moeda", "BRL"),
-            "atualizado_por": user["name"],
-            "atualizado_por_id": user["id"],
-            "created_at": now_iso(),
-        }
-        await db.pd_catalog_price_history.insert_one(history_entry)
+        await pg_db.execute(
+            "INSERT INTO pd_catalog_price_history (id, tenant_id, catalog_item_id, preco_anterior, preco_novo, moeda, atualizado_por, atualizado_por_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
+            new_id(), user["tenant_id"], item_id,
+            existing.get("preco_rs_kg", 0), update_fields["preco_rs_kg"],
+            update_fields.get("moeda") or existing.get("moeda", "BRL"),
+            user["name"], user["id"]
+        )
 
     update_fields["ultima_atualizacao"] = now_iso()
     update_fields["atualizado_por"] = user["name"]
@@ -4141,8 +4290,10 @@ async def update_catalog_item(item_id: str, data: CatalogItemUpdate, request: Re
         ignored_fields=["preco_rs_kg", "moeda", "unidade", "categoria", "observacoes", "ultima_atualizacao", "atualizado_por", "atualizado_por_id", "fornecedores", "codigo_interno"],
     )
 
-    await db.pd_catalog.update_one({"id": item_id}, {"$set": update_fields})
-    item = await db.pd_catalog.find_one({"id": item_id}, {"_id": 0})
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    params = list(update_fields.values()) + [item_id]
+    await pg_db.execute(f"UPDATE pd_catalog SET {set_parts} WHERE id=${len(params)}", *params)
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_catalog WHERE id=$1", item_id))
     if any(field in update_fields for field in ("nome", "inci", "fornecedor")):
         ficha_fields = ["composicao_completa"]
         epa_fields = ["bom_bulk_formula"]
@@ -4161,20 +4312,21 @@ async def update_catalog_item(item_id: str, data: CatalogItemUpdate, request: Re
 @pd_router.delete("/catalog/{item_id}")
 async def delete_catalog_item(item_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_catalog.delete_one({"id": item_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_val("DELETE FROM pd_catalog WHERE id=$1 AND tenant_id=$2 RETURNING id", item_id, user["tenant_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Ingrediente não encontrado")
     # Do not delete formula items referring to catalog - just unset catalog_id
-    await db.pd_formula_items.update_many({"catalog_id": item_id}, {"$set": {"catalog_id": None}})
+    await pg_db.execute("UPDATE pd_formula_items SET catalog_id=NULL WHERE catalog_id=$1", item_id)
     return {"message": "Ingrediente removido do banco de custos"}
 
 @pd_router.get("/catalog/{item_id}/price-history")
 async def catalog_price_history(item_id: str, request: Request):
     user = await get_current_user(request)
     await get_catalog_item(item_id, request)  # tenant check
-    history = await db.pd_catalog_price_history.find(
-        {"catalog_item_id": item_id}, {"_id": 0}
-    ).sort("created_at", -1).to_list(200)
+    history = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_catalog_price_history WHERE catalog_item_id=$1 ORDER BY created_at DESC LIMIT 200",
+        item_id
+    ))
     return history
 
 
@@ -4218,58 +4370,42 @@ async def create_internal_research(data: InternalResearchCreate, request: Reques
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
-    await db.pd_requests.insert_one(pd_request)
-    pd_request.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_requests (id, tenant_id, client_card_id, client_name, project_name, request_type, category, description, "references", restrictions, volume, packaging, priority, deadline, status, is_internal_research, created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW())""",
+        req_id, user["tenant_id"], None, pd_request["client_name"], pd_request["project_name"],
+        pd_request["request_type"], pd_request["category"], pd_request["description"],
+        pd_request.get("references", ""), pd_request["restrictions"], pd_request["volume"],
+        pd_request["packaging"], pd_request["priority"], pd_request["deadline"],
+        pd_request["status"], True, user["id"], user["name"]
+    )
 
     # Status history
-    await db.pd_request_status_history.insert_one({
-        "id": new_id(),
-        "pd_request_id": req_id,
-        "from_status": None,
-        "to_status": "OPEN",
-        "changed_by": user["id"],
-        "changed_by_name": user["name"],
-        "comment": "Pesquisa Interna iniciada pelo lab",
-        "created_at": now_iso(),
-    })
-    await db.pd_request_status_history.insert_one({
-        "id": new_id(),
-        "pd_request_id": req_id,
-        "from_status": "OPEN",
-        "to_status": "IN_PROGRESS",
-        "changed_by": user["id"],
-        "changed_by_name": user["name"],
-        "comment": "Auto-iniciado como Pesquisa Interna",
-        "created_at": now_iso(),
-    })
+    await pg_db.execute(
+        "INSERT INTO pd_request_status_history (id, tenant_id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
+        new_id(), user["tenant_id"], req_id, None, "OPEN", user["id"], user["name"], "Pesquisa Interna iniciada pelo lab"
+    )
+    await pg_db.execute(
+        "INSERT INTO pd_request_status_history (id, tenant_id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
+        new_id(), user["tenant_id"], req_id, "OPEN", "IN_PROGRESS", user["id"], user["name"], "Auto-iniciado como Pesquisa Interna"
+    )
 
     # Auto-create development
     dev_id = new_id()
-    await db.pd_developments.insert_one({
-        "id": dev_id,
-        "pd_request_id": req_id,
-        "tenant_id": user["tenant_id"],
-        "assigned_to": user["id"],
-        "assigned_to_name": user["name"],
-        "lab_responsible": user["name"],
-        "current_version": 0,
-        "status": "active",
-        "started_at": now_iso(),
-        "completed_at": None,
-        "is_internal_research": True,
-    })
+    await pg_db.execute(
+        "INSERT INTO pd_developments (id, tenant_id, pd_request_id, assigned_to, assigned_to_name, lab_responsible, current_version, status, started_at, is_internal_research) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        dev_id, user["tenant_id"], req_id, user["id"], user["name"], user["name"], 0, "active", now_iso(), True
+    )
 
     # Auto-create pd_card so it shows on Pipeline P&D kanban
     card_id = new_id()
     # Generate PI-XXX number
-    existing_pi = await db.pd_cards.count_documents({
-        "tenant_id": user["tenant_id"],
-        "numero_completo": {"$regex": "^PI-"}
-    })
+    existing_pi = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM pd_cards WHERE tenant_id=$1 AND (extra->>'numero_completo') LIKE 'PI-%'",
+        user["tenant_id"]
+    ) or 0
     numero = f"PI-{(existing_pi + 1):03d}"
-    await db.pd_cards.insert_one({
-        "id": card_id,
-        "tenant_id": user["tenant_id"],
+    card_extra = {
         "tipo": "pesquisa_interna",
         "numero_completo": numero,
         "produto": data.project_name,
@@ -4281,10 +4417,6 @@ async def create_internal_research(data: InternalResearchCreate, request: Reques
         "responsavel_pd": user["name"],
         "data_solicitacao": now_iso(),
         "prazo_prometido": data.deadline,
-        "status_pd": "em_desenvolvimento",  # skip "solicitado", start in dev
-        "amostra_id": None,
-        "amostra_variacao_id": None,
-        "pd_request_id": req_id,  # NEW: link to pd_request for navigation
         "is_internal_research": True,
         "historico_movimentacoes": [{
             "de": "",
@@ -4292,19 +4424,18 @@ async def create_internal_research(data: InternalResearchCreate, request: Reques
             "data": now_iso(),
             "usuario": user["name"],
             "usuario_id": user["id"],
-            "observacao": "Pesquisa Interna iniciada"
+            "observacao": "Pesquisa Interna iniciada",
         }],
         "created_by": user["id"],
         "created_by_name": user["name"],
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-    })
+    }
+    await pg_db.execute(
+        "INSERT INTO pd_cards (id, tenant_id, amostra_id, amostra_variacao_id, pd_request_id, status_pd, extra, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),NOW())",
+        card_id, user["tenant_id"], None, None, req_id, "em_desenvolvimento", card_extra
+    )
 
     # Also link pd_request with pd_card_id for reverse navigation
-    await db.pd_requests.update_one(
-        {"id": req_id},
-        {"$set": {"pd_card_id": card_id}}
-    )
+    await pg_db.execute("UPDATE pd_requests SET pd_card_id=$1, updated_at=NOW() WHERE id=$2", card_id, req_id)
 
     pd_request["pd_card_id"] = card_id
     return pd_request
@@ -4360,41 +4491,43 @@ async def create_stock_item(data: StockItemCreate, request: Request):
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
-    await db.pd_stock_items.insert_one(item)
-    item.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pd_stock_items (id, tenant_id, nome, codigo_interno, categoria, unidade, quantidade_atual, quantidade_minima, lote, validade, localizacao, custo_unitario, fornecedor, observacoes, catalog_id, formula_ref, fragrancia_percentual, fragrancia_id, linked_pd_request_id, linked_formula_id, created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW())""",
+        item_id, user["tenant_id"], item["nome"], item["codigo_interno"], item["categoria"],
+        item["unidade_medida"], item["quantidade_atual"], item["quantidade_minima"],
+        item["lote"], item["validade"], item["localizacao"], item["custo_unitario"],
+        item["fornecedor"], item["observacoes"], item["catalog_id"], item["formula_ref"],
+        item["fragrancia_percentual"], item["fragrancia_id"], item["linked_pd_request_id"],
+        item["linked_formula_id"], user["id"], user["name"]
+    )
 
     # Initial movement (entrada) if quantity > 0
     if item["quantidade_atual"] > 0:
-        await db.pd_stock_movements.insert_one({
-            "id": new_id(),
-            "tenant_id": user["tenant_id"],
-            "stock_item_id": item_id,
-            "tipo": "entrada",
-            "quantidade": item["quantidade_atual"],
-            "quantidade_antes": 0.0,
-            "quantidade_depois": item["quantidade_atual"],
-            "motivo": "Estoque inicial",
-            "lote": item.get("lote") or None,
-            "user_id": user["id"],
-            "user_name": user["name"],
-            "created_at": now_iso(),
-        })
+        await pg_db.execute(
+            "INSERT INTO pd_stock_movements (id, tenant_id, stock_item_id, tipo, quantidade, quantidade_antes, quantidade_depois, motivo, lote, user_id, user_name, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())",
+            new_id(), user["tenant_id"], item_id, "entrada",
+            item["quantidade_atual"], 0.0, item["quantidade_atual"],
+            "Estoque inicial", item.get("lote") or "",
+            user["id"], user["name"]
+        )
 
     return item
 
 @pd_router.get("/stock")
 async def list_stock(request: Request, categoria: Optional[str] = None, q: Optional[str] = None, low_stock: bool = False):
     user = await get_current_user(request)
-    query = {"tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM pd_stock_items WHERE tenant_id=$1"
+    params: list = [user["tenant_id"]]
     if categoria:
-        query["categoria"] = categoria
+        params.append(categoria)
+        sql += f" AND categoria=${len(params)}"
     if q:
-        query["$or"] = [
-            {"nome": {"$regex": q, "$options": "i"}},
-            {"codigo_interno": {"$regex": q, "$options": "i"}},
-            {"formula_ref": {"$regex": q, "$options": "i"}},
-        ]
-    items = await db.pd_stock_items.find(query, {"_id": 0}).sort("nome", 1).to_list(2000)
+        params.append(f"%{q}%")
+        n = len(params)
+        sql += f" AND (nome ILIKE ${n} OR codigo_interno ILIKE ${n} OR formula_ref ILIKE ${n})"
+    sql += " ORDER BY nome LIMIT 2000"
+    items = _rows(await pg_db.fetch_all(sql, *params))
     if low_stock:
         items = [it for it in items if it.get("quantidade_atual", 0) <= it.get("quantidade_minima", 0) and it.get("quantidade_minima", 0) > 0]
     return items
@@ -4403,7 +4536,7 @@ async def list_stock(request: Request, categoria: Optional[str] = None, q: Optio
 async def stock_alerts(request: Request):
     """Items below minimum stock or expiring soon"""
     user = await get_current_user(request)
-    items = await db.pd_stock_items.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).to_list(5000)
+    items = _rows(await pg_db.fetch_all("SELECT * FROM pd_stock_items WHERE tenant_id=$1", user["tenant_id"]))
     low_stock = []
     expiring = []
     now_dt = datetime.now(timezone.utc)
@@ -4433,9 +4566,8 @@ _LAB_SEQ_MAP = {
 
 async def _next_lab_seq(tenant_id: str, categoria: str) -> str:
     """R05: Gera código interno automático para Estoque Lab. MP-NNNNN / IN-NNNNN / AM-NNNNN."""
-    from workflow_engine import next_sequence
     seq_key, prefix = _LAB_SEQ_MAP.get(categoria, ("lab_xx_seq", "XX"))
-    seq = await next_sequence(tenant_id, seq_key, start=0)
+    seq = await next_sequence_pg(tenant_id, seq_key)
     return f"{prefix}-{str(seq).zfill(5)}"
 
 
@@ -4453,32 +4585,31 @@ async def list_all_lab_movements(
     t_id = user["tenant_id"]
 
     # Busca itens para filtrar por categoria e enriquecer movimentos
-    items_cursor = db.pd_stock_items.find({"tenant_id": t_id}, {"_id": 0})
-    items_list = await items_cursor.to_list(10000)
+    items_list = _rows(await pg_db.fetch_all("SELECT * FROM pd_stock_items WHERE tenant_id=$1", t_id))
     items_map = {i["id"]: i for i in items_list}
 
     if categoria:
-        valid_ids = {i["id"] for i in items_list if i.get("categoria") == categoria}
+        valid_ids = [i["id"] for i in items_list if i.get("categoria") == categoria]
     else:
-        valid_ids = set(items_map.keys())
+        valid_ids = list(items_map.keys())
 
-    query: dict = {"tenant_id": t_id}
-    if valid_ids:
-        query["stock_item_id"] = {"$in": list(valid_ids)}
-    else:
+    if not valid_ids:
         return {"movimentos": [], "kpis": {"entradas": 0, "saidas": 0, "saldo": 0, "itens_abaixo_minimo": 0}}
 
+    sql_parts = ["tenant_id=$1", "stock_item_id = ANY($2::text[])"]
+    params: list = [t_id, valid_ids]
     if tipo:
-        query["tipo"] = tipo
-    if data_inicio or data_fim:
-        dt: dict = {}
-        if data_inicio:
-            dt["$gte"] = data_inicio
-        if data_fim:
-            dt["$lte"] = data_fim + "T23:59:59"
-        query["created_at"] = dt
-
-    movs = await db.pd_stock_movements.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
+        params.append(tipo)
+        sql_parts.append(f"tipo=${len(params)}")
+    if data_inicio:
+        params.append(data_inicio)
+        sql_parts.append(f"created_at >= ${len(params)}::timestamptz")
+    if data_fim:
+        params.append(data_fim + "T23:59:59")
+        sql_parts.append(f"created_at <= ${len(params)}::timestamptz")
+    params.append(limit)
+    sql = f"SELECT * FROM pd_stock_movements WHERE {' AND '.join(sql_parts)} ORDER BY created_at DESC LIMIT ${len(params)}"
+    movs = _rows(await pg_db.fetch_all(sql, *params))
 
     # Enriquecer com nome/categoria do item
     for m in movs:
@@ -4509,7 +4640,7 @@ async def list_all_lab_movements(
 @pd_router.get("/stock/{item_id}")
 async def get_stock_item(item_id: str, request: Request):
     user = await get_current_user(request)
-    item = await db.pd_stock_items.find_one({"id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_stock_items WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]))
     if not item:
         raise HTTPException(status_code=404, detail="Item de estoque não encontrado")
     return item
@@ -4517,30 +4648,34 @@ async def get_stock_item(item_id: str, request: Request):
 @pd_router.put("/stock/{item_id}")
 async def update_stock_item(item_id: str, data: StockItemUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_stock_items.find_one({"id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT id FROM pd_stock_items WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]))
     if not existing:
         raise HTTPException(status_code=404, detail="Item não encontrado")
-    update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
-    if not update_fields:
+    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not update_data:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
-    update_fields["updated_at"] = now_iso()
-    await db.pd_stock_items.update_one({"id": item_id}, {"$set": update_fields})
-    item = await db.pd_stock_items.find_one({"id": item_id}, {"_id": 0})
+    if "unidade_medida" in update_data:
+        update_data["unidade"] = update_data.pop("unidade_medida")
+    update_data["updated_at"] = now_iso()
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_data.keys()))
+    params = list(update_data.values()) + [item_id]
+    await pg_db.execute(f"UPDATE pd_stock_items SET {set_parts} WHERE id=${len(params)}", *params)
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_stock_items WHERE id=$1", item_id))
     return item
 
 @pd_router.delete("/stock/{item_id}")
 async def delete_stock_item(item_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_stock_items.delete_one({"id": item_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_val("DELETE FROM pd_stock_items WHERE id=$1 AND tenant_id=$2 RETURNING id", item_id, user["tenant_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Item não encontrado")
-    await db.pd_stock_movements.delete_many({"stock_item_id": item_id})
+    await pg_db.execute("DELETE FROM pd_stock_movements WHERE stock_item_id=$1", item_id)
     return {"message": "Item removido"}
 
 @pd_router.post("/stock/{item_id}/movements")
 async def create_stock_movement(item_id: str, data: StockMovementCreate, request: Request):
     user = await get_current_user(request)
-    item = await db.pd_stock_items.find_one({"id": item_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    item = _row(await pg_db.fetch_one("SELECT * FROM pd_stock_items WHERE id=$1 AND tenant_id=$2", item_id, user["tenant_id"]))
     if not item:
         raise HTTPException(status_code=404, detail="Item não encontrado")
 
@@ -4578,12 +4713,16 @@ async def create_stock_movement(item_id: str, data: StockMovementCreate, request
         "user_name": user["name"],
         "created_at": now_iso(),
     }
-    await db.pd_stock_movements.insert_one(movement)
-    movement.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_stock_movements (id, tenant_id, stock_item_id, tipo, quantidade, quantidade_antes, quantidade_depois, motivo, lote, linked_dev_id, linked_pd_request_id, user_id, user_name, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())",
+        move_id, user["tenant_id"], item_id, data.tipo, qty, current, new_qty,
+        data.motivo or "", data.lote or item.get("lote") or "",
+        data.linked_dev_id, data.linked_pd_request_id, user["id"], user["name"]
+    )
 
-    await db.pd_stock_items.update_one(
-        {"id": item_id},
-        {"$set": {"quantidade_atual": new_qty, "updated_at": now_iso()}}
+    await pg_db.execute(
+        "UPDATE pd_stock_items SET quantidade_atual=$1, updated_at=NOW() WHERE id=$2",
+        new_qty, item_id
     )
 
     return movement
@@ -4592,9 +4731,10 @@ async def create_stock_movement(item_id: str, data: StockMovementCreate, request
 async def list_stock_movements(item_id: str, request: Request):
     user = await get_current_user(request)
     await get_stock_item(item_id, request)
-    movements = await db.pd_stock_movements.find(
-        {"stock_item_id": item_id}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    movements = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_stock_movements WHERE stock_item_id=$1 ORDER BY created_at DESC LIMIT 500",
+        item_id
+    ))
     return movements
 
 
@@ -4603,8 +4743,8 @@ async def list_stock_movements(item_id: str, request: Request):
 @pd_router.post("/requests/{req_id}/updates")
 async def create_update(req_id: str, data: UpdateCreate, request: Request):
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
-    if not pd_req:
+    pd_req_check = await pg_db.fetch_val("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"])
+    if not pd_req_check:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     up_id = new_id()
     upd = {
@@ -4622,25 +4762,29 @@ async def create_update(req_id: str, data: UpdateCreate, request: Request):
         "user_id": user["id"],
         "user_name": user["name"],
         "user_role": user.get("role", ""),
-        "created_at": now_iso(),
     }
-    await db.pd_updates.insert_one(upd)
-    upd.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_updates (id, pd_request_id, tenant_id, tipo, mensagem, visivel_comercial, item_solicitado, fornecedor, previsao_entrega, recebido, user_id, user_name, user_role, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())",
+        up_id, req_id, user["tenant_id"], upd["tipo"], upd["mensagem"], upd["visivel_comercial"],
+        upd["item_solicitado"], upd["fornecedor"], upd["previsao_entrega"], False,
+        user["id"], user["name"], user.get("role", "")
+    )
     return upd
 
 @pd_router.get("/requests/{req_id}/updates")
 async def list_updates(req_id: str, request: Request):
     user = await get_current_user(request)
-    updates = await db.pd_updates.find(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    updates = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_updates WHERE pd_request_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 500",
+        req_id, user["tenant_id"]
+    ))
     return updates
 
 @pd_router.delete("/updates/{up_id}")
 async def delete_update(up_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_updates.delete_one({"id": up_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_val("DELETE FROM pd_updates WHERE id=$1 AND tenant_id=$2 RETURNING id", up_id, user["tenant_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Atualização não encontrada")
     return {"message": "Atualização removida"}
 
@@ -4649,8 +4793,8 @@ async def delete_update(up_id: str, request: Request):
 @pd_router.post("/requests/{req_id}/pending")
 async def create_pending(req_id: str, data: PendingItemCreate, request: Request):
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
-    if not pd_req:
+    pd_req_check = await pg_db.fetch_val("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"])
+    if not pd_req_check:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     p_id = new_id()
     pending = {
@@ -4664,38 +4808,36 @@ async def create_pending(req_id: str, data: PendingItemCreate, request: Request)
         "data_recebido": None,
         "fornecedor": (data.fornecedor or "").strip(),
         "observacoes": (data.observacoes or "").strip(),
-        "status": "pendente",  # pendente, recebido, atrasado, cancelado
+        "status": "pendente",
         "user_id": user["id"],
         "user_name": user["name"],
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
     }
-    await db.pd_pending_items.insert_one(pending)
-    pending.pop("_id", None)
+    await pg_db.execute(
+        "INSERT INTO pd_pending_items (id, pd_request_id, tenant_id, tipo, descricao, data_solicitacao, data_prevista, fornecedor, observacoes, status, user_id, user_name, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW())",
+        p_id, req_id, user["tenant_id"], data.tipo, data.descricao.strip(),
+        now_iso(), data.data_prevista, (data.fornecedor or "").strip(),
+        (data.observacoes or "").strip(), "pendente", user["id"], user["name"]
+    )
 
     # Also log as update (visible to commercial)
-    await db.pd_updates.insert_one({
-        "id": new_id(),
-        "pd_request_id": req_id,
-        "tenant_id": user["tenant_id"],
-        "tipo": "pendencia_criada",
-        "mensagem": f"Solicitado(a) {data.tipo}: {data.descricao}" + (f" — previsão {data.data_prevista}" if data.data_prevista else ""),
-        "visivel_comercial": True,
-        "user_id": user["id"],
-        "user_name": user["name"],
-        "user_role": user.get("role", ""),
-        "pending_item_id": p_id,
-        "created_at": now_iso(),
-    })
+    await pg_db.execute(
+        "INSERT INTO pd_updates (id, pd_request_id, tenant_id, tipo, mensagem, visivel_comercial, recebido, pending_item_id, user_id, user_name, user_role, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())",
+        new_id(), req_id, user["tenant_id"], "pendencia_criada",
+        f"Solicitado(a) {data.tipo}: {data.descricao}" + (f" — previsão {data.data_prevista}" if data.data_prevista else ""),
+        True, False, p_id, user["id"], user["name"], user.get("role", "")
+    )
     return pending
 
 @pd_router.get("/requests/{req_id}/pending")
 async def list_pending(req_id: str, request: Request, status: Optional[str] = None):
     user = await get_current_user(request)
-    query = {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}
+    sql = "SELECT * FROM pd_pending_items WHERE pd_request_id=$1 AND tenant_id=$2"
+    params: list = [req_id, user["tenant_id"]]
     if status:
-        query["status"] = status
-    items = await db.pd_pending_items.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+        params.append(status)
+        sql += f" AND status=${len(params)}"
+    sql += " ORDER BY created_at DESC LIMIT 200"
+    items = _rows(await pg_db.fetch_all(sql, *params))
     # Calculate if atrasado
     now_dt = datetime.now(timezone.utc)
     for it in items:
@@ -4717,7 +4859,7 @@ async def list_pending(req_id: str, request: Request, status: Optional[str] = No
 @pd_router.put("/pending/{p_id}")
 async def update_pending(p_id: str, data: PendingItemUpdate, request: Request):
     user = await get_current_user(request)
-    existing = await db.pd_pending_items.find_one({"id": p_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_pending_items WHERE id=$1 AND tenant_id=$2", p_id, user["tenant_id"]))
     if not existing:
         raise HTTPException(status_code=404, detail="Pendência não encontrada")
     update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
@@ -4726,30 +4868,24 @@ async def update_pending(p_id: str, data: PendingItemUpdate, request: Request):
     # Mark recebido date
     if update_fields.get("status") == "recebido" and existing.get("status") != "recebido":
         update_fields["data_recebido"] = now_iso()
-        # Log as update
-        await db.pd_updates.insert_one({
-            "id": new_id(),
-            "pd_request_id": existing["pd_request_id"],
-            "tenant_id": user["tenant_id"],
-            "tipo": "pendencia_resolvida",
-            "mensagem": f"Recebido(a): {existing['descricao']}",
-            "visivel_comercial": True,
-            "user_id": user["id"],
-            "user_name": user["name"],
-            "user_role": user.get("role", ""),
-            "pending_item_id": p_id,
-            "created_at": now_iso(),
-        })
+        await pg_db.execute(
+            "INSERT INTO pd_updates (id, pd_request_id, tenant_id, tipo, mensagem, visivel_comercial, recebido, pending_item_id, user_id, user_name, user_role, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())",
+            new_id(), existing["pd_request_id"], user["tenant_id"], "pendencia_resolvida",
+            f"Recebido(a): {existing['descricao']}", True, False, p_id,
+            user["id"], user["name"], user.get("role", "")
+        )
     update_fields["updated_at"] = now_iso()
-    await db.pd_pending_items.update_one({"id": p_id}, {"$set": update_fields})
-    it = await db.pd_pending_items.find_one({"id": p_id}, {"_id": 0})
+    set_parts = ", ".join(f"{k}=${i+1}" for i, k in enumerate(update_fields.keys()))
+    params = list(update_fields.values()) + [p_id]
+    await pg_db.execute(f"UPDATE pd_pending_items SET {set_parts} WHERE id=${len(params)}", *params)
+    it = _row(await pg_db.fetch_one("SELECT * FROM pd_pending_items WHERE id=$1", p_id))
     return it
 
 @pd_router.delete("/pending/{p_id}")
 async def delete_pending(p_id: str, request: Request):
     user = await get_current_user(request)
-    result = await db.pd_pending_items.delete_one({"id": p_id, "tenant_id": user["tenant_id"]})
-    if result.deleted_count == 0:
+    deleted = await pg_db.fetch_val("DELETE FROM pd_pending_items WHERE id=$1 AND tenant_id=$2 RETURNING id", p_id, user["tenant_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Pendência não encontrada")
     return {"message": "Pendência removida"}
 
@@ -4760,15 +4896,17 @@ async def get_activity_for_crm(req_id: str, request: Request):
     """Endpoint que o CRM comercial usa para ver o que o lab está fazendo.
     Retorna updates visíveis + pendências."""
     user = await get_current_user(request)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
-    if not pd_req:
+    pd_req_check = await pg_db.fetch_val("SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"])
+    if not pd_req_check:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
-    updates = await db.pd_updates.find(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"], "visivel_comercial": True}, {"_id": 0}
-    ).sort("created_at", -1).to_list(200)
-    pending = await db.pd_pending_items.find(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0}
-    ).sort("created_at", -1).to_list(200)
+    updates = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_updates WHERE pd_request_id=$1 AND tenant_id=$2 AND visivel_comercial=TRUE ORDER BY created_at DESC LIMIT 200",
+        req_id, user["tenant_id"]
+    ))
+    pending = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_pending_items WHERE pd_request_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 200",
+        req_id, user["tenant_id"]
+    ))
     # Calculate atrasado
     now_dt = datetime.now(timezone.utc)
     for it in pending:
@@ -4790,9 +4928,10 @@ async def get_activity_for_crm(req_id: str, request: Request):
 @pd_router.get("/requests/internal-research/list")
 async def list_internal_research(request: Request):
     user = await get_current_user(request)
-    items = await db.pd_requests.find(
-        {"tenant_id": user["tenant_id"], "is_internal_research": True}, {"_id": 0}
-    ).sort("created_at", -1).to_list(500)
+    items = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_requests WHERE tenant_id=$1 AND is_internal_research=TRUE ORDER BY created_at DESC LIMIT 500",
+        user["tenant_id"]
+    ))
     return items
 
 
@@ -4810,16 +4949,20 @@ async def _evaluate_formula_homologacao(formula_id: str, tenant_id: str) -> Dict
     de cada MP usada (via catalog -> homologacao_mps por nome+inci).
     Retorna estrutura: {ok: bool, blocked: [..], pending: [..], total_items: int, summary: str}
     """
-    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(2000)
+    items = _rows(await pg_db.fetch_all(
+        'SELECT id, formula_id, ingredient_name, percentage, catalog_id, fornecedor FROM pd_formula_items WHERE formula_id=$1 LIMIT 2000',
+        formula_id
+    ))
     if not items:
         return {"ok": True, "blocked": [], "pending": [], "total_items": 0, "summary": "Formula sem itens"}
 
     catalog_ids = [it["catalog_id"] for it in items if it.get("catalog_id")]
     catalogs: Dict[str, Dict[str, Any]] = {}
     if catalog_ids:
-        docs = await db.pd_catalog.find(
-            {"tenant_id": tenant_id, "id": {"$in": catalog_ids}}, {"_id": 0}
-        ).to_list(2000)
+        docs = _rows(await pg_db.fetch_all(
+            "SELECT id, nome, inci, codigo_interno FROM pd_catalog WHERE tenant_id=$1 AND id = ANY($2::text[]) LIMIT 2000",
+            tenant_id, catalog_ids
+        ))
         catalogs = {d["id"]: d for d in docs if d.get("id")}
 
     mp_index: Dict[str, Dict[str, Any]] = {}
@@ -4896,26 +5039,16 @@ async def assert_formula_homologacao_ok(formula_id: str, tenant_id: str, *, allo
 
 async def assert_pd_card_ready_for_approval(card_id: str, tenant_id: str):
     """Antes de mover para aguardando_aprovacao/aprovado, validar todas as formulas ativas vinculadas."""
-    card = await db.pd_cards.find_one({"id": card_id, "tenant_id": tenant_id}, {"_id": 0, "amostra_variacao_id": 1, "amostra_id": 1})
+    card = _row(await pg_db.fetch_one("SELECT amostra_id, amostra_variacao_id FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, tenant_id))
     if not card:
         return
-    pd_request = await db.pd_requests.find_one(
-        {"tenant_id": tenant_id, "amostra_id": card.get("amostra_id")},
-        {"_id": 0, "id": 1},
-    )
+    pd_request = _row(await pg_db.fetch_one("SELECT id FROM pd_requests WHERE tenant_id=$1 AND amostra_id=$2 LIMIT 1", tenant_id, card.get("amostra_id")))
     if not pd_request:
         return
-    dev = await db.pd_developments.find_one(
-        {"tenant_id": tenant_id, "pd_request_id": pd_request["id"]},
-        {"_id": 0, "id": 1},
-    )
+    dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE tenant_id=$1 AND pd_request_id=$2", tenant_id, pd_request["id"]))
     if not dev:
         return
-    latest = await db.pd_formulas.find_one(
-        {"development_id": dev["id"]},
-        {"_id": 0, "id": 1},
-        sort=[("version", -1)],
-    )
+    latest = _row(await pg_db.fetch_one("SELECT id FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev["id"]))
     if not latest:
         return
     await assert_formula_homologacao_ok(latest["id"], tenant_id, allow_pending=True)
@@ -5224,13 +5357,10 @@ async def update_mp(mp_id: str, data: MPUpdate, request: Request):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="MP não encontrada")
     mp_doc = await db.homologacao_mps.find_one({"id": mp_id}, {"_id": 0})
-    catalog_docs = await db.pd_catalog.find(
-        {
-            "tenant_id": user["tenant_id"],
-            "$or": [{"nome": mp_doc.get("nome", "")}, {"inci": mp_doc.get("inci", "")}],
-        },
-        {"_id": 0, "id": 1}
-    ).to_list(100)
+    catalog_docs = _rows(await pg_db.fetch_all(
+        "SELECT id FROM pd_catalog WHERE tenant_id=$1 AND (nome=$2 OR inci=$3) LIMIT 100",
+        user["tenant_id"], mp_doc.get("nome", ""), mp_doc.get("inci", "")
+    ))
     if catalog_docs:
         await _auto_generate_documents_for_catalog_items(
             [doc["id"] for doc in catalog_docs if doc.get("id")],
@@ -5476,7 +5606,7 @@ def _formula_cost_view(versions: List[dict], user: dict) -> dict:
 async def get_formula_cost_versions(formula_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT id FROM pd_formulas WHERE id=$1", formula_id))
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
     versions = await db.formula_cost_versions.find(
@@ -5488,12 +5618,12 @@ async def get_formula_cost_versions(formula_id: str, request: Request):
 async def save_formula_cost_version(formula_id: str, data: FormulaCostVersionCreate, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE | COMERCIAL_FULL)
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT id FROM pd_formulas WHERE id=$1", formula_id))
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
 
     # Derive custo_mp_total from current formula items
-    items = await db.pd_formula_items.find({"formula_id": formula_id}, {"_id": 0}).to_list(500)
+    items = _rows(await pg_db.fetch_all("SELECT cost_brl FROM pd_formula_items WHERE formula_id=$1 LIMIT 500", formula_id))
     custo_mp_total = round(sum(it.get("cost_brl", 0) or 0 for it in items), 4)
 
     existing_count = await db.formula_cost_versions.count_documents({"formula_id": formula_id, "tenant_id": user["tenant_id"]})
@@ -5558,7 +5688,7 @@ async def list_formula_phases(formula_id: str, request: Request):
 async def create_formula_phase(formula_id: str, data: ProcedurePhaseCreate, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    formula = await db.pd_formulas.find_one({"id": formula_id}, {"_id": 0})
+    formula = _row(await pg_db.fetch_one("SELECT id FROM pd_formulas WHERE id=$1", formula_id))
     if not formula:
         raise HTTPException(status_code=404, detail="Fórmula não encontrada")
     max_order_doc = await db.formula_procedure_phases.find_one(
@@ -5640,21 +5770,20 @@ async def generate_sample_tech_sheet(crm_sample_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Amostra não encontrada")
 
     # Find the PD card linked to this sample
-    pd_card = await db.pd_cards.find_one({"amostra_id": crm_sample_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_card = _flatten_pd_card(_row(await pg_db.fetch_one("SELECT * FROM pd_cards WHERE amostra_id=$1 AND tenant_id=$2", crm_sample_id, user["tenant_id"])))
     formula = None
     items_safe = []
     phases = []
 
     if pd_card and pd_card.get("pd_request_id"):
-        dev = await db.pd_developments.find_one({"pd_request_id": pd_card["pd_request_id"]}, {"_id": 0})
+        dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE pd_request_id=$1", pd_card["pd_request_id"]))
         if dev:
-            formula = await db.pd_formulas.find_one(
-                {"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)]
-            )
+            formula = _row(await pg_db.fetch_one("SELECT * FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev["id"]))
             if formula:
-                raw_items = await db.pd_formula_items.find(
-                    {"formula_id": formula["id"]}, {"_id": 0}
-                ).to_list(500)
+                raw_items = _rows(await pg_db.fetch_all(
+                    'SELECT id, formula_id, ingredient_name, percentage, fornecedor, phase FROM pd_formula_items WHERE formula_id=$1 LIMIT 500',
+                    formula["id"]
+                ))
                 # NEVER include monetary values — select only safe fields
                 for it in raw_items:
                     items_safe.append({
@@ -5770,14 +5899,15 @@ async def generate_sample_tech_sheet(crm_sample_id: str, request: Request):
 async def mark_update_received(up_id: str, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    existing = await db.pd_updates.find_one({"id": up_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    existing = _row(await pg_db.fetch_one("SELECT * FROM pd_updates WHERE id=$1 AND tenant_id=$2", up_id, user["tenant_id"]))
     if not existing:
         raise HTTPException(status_code=404, detail="Atualização não encontrada")
-    await db.pd_updates.update_one(
-        {"id": up_id},
-        {"$set": {"recebido": True, "recebido_em": now_iso(), "recebido_por": user["id"], "recebido_por_nome": user["name"]}}
+    now = now_iso()
+    await pg_db.execute(
+        "UPDATE pd_updates SET recebido=TRUE, recebido_em=$1, recebido_por=$2, recebido_por_nome=$3 WHERE id=$4",
+        now, user["id"], user["name"], up_id
     )
-    return {**existing, "recebido": True, "recebido_em": now_iso()}
+    return {**existing, "recebido": True, "recebido_em": now}
 
 
 # ============================================================
@@ -5805,11 +5935,10 @@ async def create_batch_manipulation(data: BatchManipulationCreate, request: Requ
     sample_items: dict = {}  # amostra_id → list of items
     sample_labels: dict = {}
     for amostra_id in data.amostra_ids:
-        card = await db.pd_cards.find_one({"amostra_id": amostra_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+        card = _flatten_pd_card(_row(await pg_db.fetch_one("SELECT * FROM pd_cards WHERE amostra_id=$1 AND tenant_id=$2", amostra_id, user["tenant_id"])))
         sample = await db.crm_samples.find_one({"id": amostra_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
-        label = sample.get("numero_amostra") or amostra_id
-        if sample and sample.get("variacoes"):
-            # Try to get variacao codigo
+        label = (sample.get("numero_amostra") or amostra_id) if sample else amostra_id
+        if sample and sample.get("variacoes") and card:
             for v in sample["variacoes"]:
                 if v.get("id") == card.get("amostra_variacao_id"):
                     label = f"{label}/{v.get('codigo', '')}"
@@ -5818,15 +5947,14 @@ async def create_batch_manipulation(data: BatchManipulationCreate, request: Requ
 
         items = []
         if card and card.get("pd_request_id"):
-            dev = await db.pd_developments.find_one({"pd_request_id": card["pd_request_id"]}, {"_id": 0})
+            dev = _row(await pg_db.fetch_one("SELECT id FROM pd_developments WHERE pd_request_id=$1", card["pd_request_id"]))
             if dev:
-                formula = await db.pd_formulas.find_one(
-                    {"development_id": dev["id"]}, {"_id": 0}, sort=[("version", -1)]
-                )
+                formula = _row(await pg_db.fetch_one("SELECT id FROM pd_formulas WHERE development_id=$1 ORDER BY version DESC LIMIT 1", dev["id"]))
                 if formula:
-                    items = await db.pd_formula_items.find(
-                        {"formula_id": formula["id"]}, {"_id": 0}
-                    ).to_list(500)
+                    items = _rows(await pg_db.fetch_all(
+                        'SELECT id, formula_id, ingredient_name, percentage, fornecedor FROM pd_formula_items WHERE formula_id=$1 LIMIT 500',
+                        formula["id"]
+                    ))
         sample_items[amostra_id] = items
 
     # Find common ingredients (ingredient_name appears in ALL samples)
@@ -5876,11 +6004,17 @@ async def create_batch_manipulation(data: BatchManipulationCreate, request: Requ
         ingredientes_por_variacao[label] = variation_items
 
     # Generate order number
-    count = await db.pd_batch_orders.count_documents({"tenant_id": user["tenant_id"]})
+    count = await pg_db.fetch_val("SELECT COUNT(*) FROM pd_batch_orders WHERE tenant_id=$1", user["tenant_id"]) or 0
     ordem_numero = f"OM-{datetime.now(timezone.utc).year}-{str(count + 1).zfill(5)}"
 
+    order_id = new_id()
+    await pg_db.execute(
+        "INSERT INTO pd_batch_orders (id, tenant_id, ordem_numero, amostra_ids, volume_por_amostra_ml, n_amostras, base_compartilhada, ingredientes_por_variacao, observacao, criado_por, criado_por_nome, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())",
+        order_id, user["tenant_id"], ordem_numero, data.amostra_ids, vol, n_amostras,
+        base_items, ingredientes_por_variacao, data.observacao or "", user["id"], user["name"]
+    )
     order_doc = {
-        "id": new_id(),
+        "id": order_id,
         "tenant_id": user["tenant_id"],
         "ordem_numero": ordem_numero,
         "amostra_ids": data.amostra_ids,
@@ -5891,16 +6025,13 @@ async def create_batch_manipulation(data: BatchManipulationCreate, request: Requ
         "observacao": data.observacao or "",
         "criado_por": user["id"],
         "criado_por_nome": user["name"],
-        "created_at": now_iso(),
     }
-    await db.pd_batch_orders.insert_one(order_doc)
-    order_doc.pop("_id", None)
 
     # Move all linked PD cards to em_desenvolvimento
     for amostra_id in data.amostra_ids:
-        await db.pd_cards.update_many(
-            {"amostra_id": amostra_id, "tenant_id": user["tenant_id"]},
-            {"$set": {"status_pd": "em_desenvolvimento", "updated_at": now_iso()}}
+        await pg_db.execute(
+            "UPDATE pd_cards SET status_pd=$1, updated_at=NOW() WHERE amostra_id=$2 AND tenant_id=$3",
+            "em_desenvolvimento", amostra_id, user["tenant_id"]
         )
 
     return {**order_doc, "amostras_atualizadas": data.amostra_ids}
@@ -5910,7 +6041,10 @@ async def create_batch_manipulation(data: BatchManipulationCreate, request: Requ
 async def list_batch_orders(request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_READ)
-    orders = await db.pd_batch_orders.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    orders = _rows(await pg_db.fetch_all(
+        "SELECT * FROM pd_batch_orders WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 200",
+        user["tenant_id"]
+    ))
     return orders
 
 
@@ -5926,19 +6060,15 @@ class ExecutorAssign(BaseModel):
 async def assign_executor(card_id: str, data: ExecutorAssign, request: Request):
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    card = await db.pd_cards.find_one({"id": card_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    card = _flatten_pd_card(_row(await pg_db.fetch_one("SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"])))
     if not card:
         raise HTTPException(status_code=404, detail="Card P&D não encontrado")
-    updates = {
-        "executor_id": data.executor_id,
-        "executor_name": data.executor_name,
-        "atribuido_em": now_iso(),
-        "atribuido_por": user["id"],
-        "atribuido_por_nome": user["name"],
-        "updated_at": now_iso(),
-    }
-    await db.pd_cards.update_one({"id": card_id}, {"$set": updates})
-    return {**card, **updates}
+    now = now_iso()
+    await pg_db.execute(
+        "UPDATE pd_cards SET executor_id=$1, executor_name=$2, atribuido_em=$3, atribuido_por=$4, atribuido_por_nome=$5, updated_at=NOW() WHERE id=$6",
+        data.executor_id, data.executor_name, now, user["id"], user["name"], card_id
+    )
+    return {**card, "executor_id": data.executor_id, "executor_name": data.executor_name, "atribuido_em": now, "atribuido_por": user["id"], "atribuido_por_nome": user["name"]}
 
 
 # ============================================================
@@ -5951,12 +6081,10 @@ async def check_lab_stock_for_product(produto_nome: str, tenant_id: str) -> Opti
         return None
     from datetime import date as date_cls
     today_str = date_cls.today().isoformat()
-    item = await db.pd_stock_items.find_one({
-        "tenant_id": tenant_id,
-        "categoria": "amostra_acabada",
-        "nome": {"$regex": produto_nome.strip()[:40], "$options": "i"},
-        "quantidade_atual": {"$gt": 0},
-    }, {"_id": 0})
+    item = _row(await pg_db.fetch_one(
+        "SELECT * FROM pd_stock_items WHERE tenant_id=$1 AND categoria='amostra_acabada' AND nome ILIKE $2 AND quantidade_atual > 0 LIMIT 1",
+        tenant_id, f"%{produto_nome.strip()[:40]}%"
+    ))
     if not item:
         return None
     # Check validity
@@ -5966,7 +6094,7 @@ async def check_lab_stock_for_product(produto_nome: str, tenant_id: str) -> Opti
     return {
         "alerta": f"Há amostra em estoque: {item['nome']}",
         "quantidade": item["quantidade_atual"],
-        "unidade": item.get("unidade_medida", "un"),
+        "unidade": item.get("unidade", "un"),
         "localizacao": item.get("localizacao", ""),
         "validade": validade,
         "stock_item_id": item["id"],
@@ -5995,7 +6123,7 @@ async def link_internal_research_to_crm(req_id: str, data: LinkToCRMProject, req
     """Link an internal research request to a CRM project, converting it to a client-originated request."""
     user = await get_current_user(request)
     require_roles(user, PD_WRITE)
-    pd_req = await db.pd_requests.find_one({"id": req_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    pd_req = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1 AND tenant_id=$2", req_id, user["tenant_id"]))
     if not pd_req:
         raise HTTPException(status_code=404, detail="Solicitação não encontrada")
     if not pd_req.get("is_internal_research"):
@@ -6007,26 +6135,18 @@ async def link_internal_research_to_crm(req_id: str, data: LinkToCRMProject, req
         raise HTTPException(status_code=404, detail="Projeto CRM não encontrado")
 
     old_origem = "interno"
-    updates = {
-        "is_internal_research": False,
-        "crm_project_id": data.crm_project_id,
-        "client_card_id": data.crm_client_id or crm_project.get("cliente_id"),
-        "client_name": data.crm_client_name or crm_project.get("cliente_nome", ""),
-        "vinculado_em": now_iso(),
-        "vinculado_por": user["id"],
-        "updated_at": now_iso(),
-    }
-    await db.pd_requests.update_one({"id": req_id}, {"$set": updates})
+    client_card_id = data.crm_client_id or crm_project.get("cliente_id")
+    client_name = data.crm_client_name or crm_project.get("cliente_nome", "")
+    await pg_db.execute(
+        "UPDATE pd_requests SET is_internal_research=FALSE, crm_project_id=$1, client_card_id=$2, client_name=$3, vinculado_em=$4, vinculado_por=$5, updated_at=NOW() WHERE id=$6",
+        data.crm_project_id, client_card_id, client_name, now_iso(), user["id"], req_id
+    )
 
-    # Also update the pd_card
-    await db.pd_cards.update_many(
-        {"pd_request_id": req_id, "tenant_id": user["tenant_id"]},
-        {"$set": {
-            "cliente_id": updates["client_card_id"],
-            "cliente": updates["client_name"],
-            "crm_project_id": data.crm_project_id,
-            "updated_at": now_iso(),
-        }}
+    # Also update the pd_card extra JSONB
+    await pg_db.execute(
+        "UPDATE pd_cards SET extra = extra || $1::jsonb, updated_at=NOW() WHERE pd_request_id=$2 AND tenant_id=$3",
+        {"cliente_id": client_card_id, "cliente": client_name, "crm_project_id": data.crm_project_id},
+        req_id, user["tenant_id"]
     )
 
     # Audit log
@@ -6047,7 +6167,7 @@ async def link_internal_research_to_crm(req_id: str, data: LinkToCRMProject, req
     except Exception:
         pass
 
-    updated = await db.pd_requests.find_one({"id": req_id}, {"_id": 0})
+    updated = _row(await pg_db.fetch_one("SELECT * FROM pd_requests WHERE id=$1", req_id))
     return updated
 
 

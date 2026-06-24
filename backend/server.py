@@ -12,6 +12,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import database as pg_db  # PostgreSQL pool (Supabase migration)
+import auth_supabase as supa_auth  # Supabase Auth integration
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
@@ -153,6 +155,17 @@ async def get_current_user(request: Request) -> dict:
             token = auth[7:]
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # ── Caminho 1: Supabase JWT ──────────────────────────────────────────────
+    if supa_auth.is_supabase_available() and supa_auth.is_supabase_token(token):
+        claims = supa_auth.verify_supabase_jwt(token)
+        if claims:
+            user = supa_auth.supabase_claims_to_kuryos_user(claims)
+            if user:
+                return user
+        raise HTTPException(status_code=401, detail="Token Supabase inválido ou expirado")
+
+    # ── Caminho 2: JWT customizado (legado — MongoDB) ────────────────────────
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
@@ -356,15 +369,48 @@ async def register(input_data: RegisterInput, response: Response):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     tenant_id = new_id()
-    await db.tenants.insert_one({"id": tenant_id, "name": input_data.org_name, "created_at": now_iso()})
-
     user_id = new_id()
-    await db.users.insert_one({
+
+    # ── Criar tenant ────────────────────────────────────────────────────────
+    await db.tenants.insert_one({"id": tenant_id, "name": input_data.org_name, "created_at": now_iso()})
+    if pg_db._pool:
+        await pg_db.execute(
+            "INSERT INTO tenants(id, name, created_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+            tenant_id, input_data.org_name, now_iso()
+        )
+
+    # ── Criar usuário no Supabase Auth (se disponível) ──────────────────────
+    supabase_user = None
+    if supa_auth.is_supabase_available():
+        supabase_user = supa_auth.create_supabase_user(
+            email=email, password=input_data.password,
+            tenant_id=tenant_id, role="admin",
+            name=input_data.name, kuryos_id=user_id,
+        )
+
+    # ── Criar usuário no MongoDB (legado / fallback) ─────────────────────────
+    user_doc = {
         "id": user_id, "email": email, "password_hash": hash_password(input_data.password),
-        "name": input_data.name, "role": "admin", "tenant_id": tenant_id, "created_at": now_iso()
-    })
+        "name": input_data.name, "role": "admin", "tenant_id": tenant_id,
+        "supabase_id": (supabase_user or {}).get("id"), "created_at": now_iso()
+    }
+    await db.users.insert_one(user_doc)
+
+    # ── Criar usuário na tabela PostgreSQL ───────────────────────────────────
+    if pg_db._pool:
+        await pg_db.execute(
+            "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+            user_id, tenant_id, email, input_data.name, "admin", now_iso()
+        )
 
     await seed_default_pipeline(tenant_id)
+
+    # ── Se Supabase disponível, usar token Supabase; senão token legado ──────
+    if supabase_user and supa_auth.is_supabase_available():
+        session = supa_auth.sign_in_with_password(email, input_data.password)
+        if session:
+            set_auth_cookies(response, session["access_token"], session["refresh_token"])
+            return {"id": user_id, "email": email, "name": input_data.name, "role": "admin", "tenant_id": tenant_id}
 
     access = create_access_token(user_id, email, tenant_id, "admin")
     refresh = create_refresh_token(user_id)
@@ -374,6 +420,23 @@ async def register(input_data: RegisterInput, response: Response):
 @router.post("/auth/login")
 async def login(input_data: LoginInput, response: Response):
     email = input_data.email.lower().strip()
+
+    # ── Caminho 1: Supabase Auth (usuários já migrados) ──────────────────────
+    if supa_auth.is_supabase_available():
+        session = supa_auth.sign_in_with_password(email, input_data.password)
+        if session:
+            # Extrai o usuário Kuryos a partir das claims do token Supabase
+            claims = supa_auth.verify_supabase_jwt(session["access_token"])
+            kuryos_user = supa_auth.supabase_claims_to_kuryos_user(claims) if claims else None
+            if kuryos_user:
+                set_auth_cookies(response, session["access_token"], session["refresh_token"])
+                return {
+                    "id": kuryos_user["id"], "email": email,
+                    "name": kuryos_user["name"], "role": kuryos_user["role"],
+                    "tenant_id": kuryos_user["tenant_id"],
+                }
+
+    # ── Caminho 2: Auth legado MongoDB (usuários ainda não migrados) ─────────
     user = await db.users.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -1160,12 +1223,30 @@ async def invite_user(data: InviteInput, request: Request):
         raise HTTPException(status_code=400, detail=f"Role invalida. Use: {', '.join(valid_roles)}")
 
     temp_password = f"Kuryos{uuid.uuid4().hex[:6]}!"
+    invited_id = new_id()
+
+    # ── Criar no Supabase Auth (envia email de convite) ──────────────────────
+    supa_user = None
+    if supa_auth.is_supabase_available():
+        supa_user = supa_auth.invite_supabase_user(
+            email=email, tenant_id=user["tenant_id"],
+            role=data.role, name=data.name, kuryos_id=invited_id,
+        )
+
     new_user = {
-        "id": new_id(), "email": email, "password_hash": hash_password(temp_password),
+        "id": invited_id, "email": email, "password_hash": hash_password(temp_password),
         "name": data.name, "role": data.role, "tenant_id": user["tenant_id"],
+        "supabase_id": (supa_user or {}).get("id"),
         "invited_by": user["id"], "created_at": now_iso()
     }
     await db.users.insert_one(new_user)
+
+    # ── Registrar na tabela PostgreSQL ───────────────────────────────────────
+    if pg_db._pool:
+        await pg_db.execute(
+            "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+            invited_id, user["tenant_id"], email, data.name, data.role, now_iso()
+        )
 
     # Mock email with temp password
     await db.email_logs.insert_one({
@@ -1664,11 +1745,11 @@ async def erp_overview(request: Request):
         db.cq_rncs.count_documents({"tenant_id": tid, "status": {"$in": ["aberta", "em_tratamento"]}}),
         db.cq_retencoes.count_documents({"tenant_id": tid, "status": "em_guarda"}),
         db.cq_checklists.count_documents({"tenant_id": tid, "status": {"$in": ["pendente", "em_andamento"]}}),
-        # Compras
-        db.compras_fornecedores.count_documents({"tenant_id": tid, "homologacao.status": "homologado"}),
-        db.compras_fornecedores.count_documents({"tenant_id": tid, "homologacao.status": "em_avaliacao"}),
-        db.compras_pos.count_documents({"tenant_id": tid, "status": {"$in": ["emitida", "confirmada"]}}),
-        db.compras_pos.count_documents({"tenant_id": tid, "status": {"$in": ["emitida", "confirmada"]}, "data_entrega_prevista": {"$lt": now}}),
+        # Compras (PostgreSQL)
+        pg_db.fetch_val("SELECT COUNT(*) FROM compras_fornecedores WHERE tenant_id=$1 AND homologacao->>'status'='homologado'", tid),
+        pg_db.fetch_val("SELECT COUNT(*) FROM compras_fornecedores WHERE tenant_id=$1 AND homologacao->>'status'='em_processo'", tid),
+        pg_db.fetch_val("SELECT COUNT(*) FROM compras_pos WHERE tenant_id=$1 AND status=ANY($2::text[])", tid, ["emitida", "confirmada"]),
+        pg_db.fetch_val("SELECT COUNT(*) FROM compras_pos WHERE tenant_id=$1 AND status=ANY($2::text[]) AND data_entrega_solicitada < $3", tid, ["emitida", "confirmada"], now[:10]),
         # Pedidos
         db.orders.count_documents({"tenant_id": tid, "status": {"$in": ["rascunho", "aprovado", "em_producao"]}}),
         db.orders.count_documents({"tenant_id": tid, "status": "em_producao"}),
@@ -1930,6 +2011,18 @@ async def seed_admin():
 
 @app.on_event("startup")
 async def startup():
+    # Inicializa pool PostgreSQL (Supabase) se DATABASE_URL estiver definida
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        try:
+            await pg_db.init_db()
+            logger.info("PostgreSQL pool inicializado (Supabase)")
+        except Exception as e:
+            logger.warning(f"PostgreSQL indisponível, usando apenas MongoDB: {e}")
+
+    # Inicializa Supabase Auth admin client
+    supa_auth.init_supabase_auth()
+
     await db.users.create_index("email", unique=True)
     await db.users.create_index("tenant_id")
     await db.cards.create_index([("tenant_id", 1), ("pipeline_id", 1)])
@@ -2105,6 +2198,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
+    await pg_db.close_db()
 
 # ============ INCLUDE ROUTER + CORS + WEBSOCKET ============
 

@@ -13,19 +13,19 @@ from datetime import datetime, date
 import logging
 from workflow_engine import next_lote_per_day, format_lote_numero
 
+import database as pg_db
+
 logger = logging.getLogger(__name__)
 
 pcp_router = APIRouter(prefix="/api/pcp")
 
-db = None
 get_current_user = None
 new_id_func = None
 now_iso_func = None
 
 
 def init_pcp(database, auth_func, id_func, iso_func):
-    global db, get_current_user, new_id_func, now_iso_func
-    db = database
+    global get_current_user, new_id_func, now_iso_func
     get_current_user = auth_func
     new_id_func = id_func
     now_iso_func = iso_func
@@ -37,6 +37,10 @@ def _new_id():
 
 def _now():
     return now_iso_func()
+
+
+def _row(r):
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} if r else None
 
 
 SLOT_STATUSES = ["planejado", "em_execucao", "concluido", "cancelado"]
@@ -56,7 +60,6 @@ DIAS_SEMANA = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
 
 
 def _week_key(data_iso: str) -> str:
-    """Return ISO week string YYYY-WW for a given date."""
     d = datetime.fromisoformat(data_iso[:10])
     iso = d.isocalendar()
     return f"{iso[0]}-{str(iso[1]).zfill(2)}"
@@ -87,17 +90,13 @@ class LinhaUpdate(BaseModel):
 class SlotCreate(BaseModel):
     op_id: str = ""
     linha_id: str
-    # Hour-by-hour fields (spec 3.4 / 4)
-    data: Optional[str] = None          # YYYY-MM-DD single day
-    hora_inicio: Optional[str] = None   # "HH:MM"
-    hora_fim: Optional[str] = None      # "HH:MM"
-    # Slot type
-    tipo: str = "producao"              # producao | setup | almoco
+    data: Optional[str] = None
+    hora_inicio: Optional[str] = None
+    hora_fim: Optional[str] = None
+    tipo: str = "producao"
     setup_tempo_min: Optional[int] = None
     setup_tipo: str = "assepsia"
-    # Lote link
     lote_id: Optional[str] = None
-    # Legacy date range (kept for compat)
     data_inicio: Optional[str] = None
     data_fim: Optional[str] = None
     turno: str = "integral"
@@ -124,7 +123,7 @@ class SlotUpdate(BaseModel):
 
 class LoteCreate(BaseModel):
     op_id: str
-    data_manipulacao: str       # YYYY-MM-DD
+    data_manipulacao: str
     data_envase: Optional[str] = None
     qtd_planejada: int = 0
     observacoes: str = ""
@@ -149,7 +148,7 @@ class CalendarioDiaConfig(BaseModel):
 
 
 class CalendarioCreate(BaseModel):
-    semana: str        # YYYY-WW
+    semana: str
     linha_id: str
     seg: Optional[CalendarioDiaConfig] = None
     ter: Optional[CalendarioDiaConfig] = None
@@ -162,7 +161,7 @@ class CalendarioCreate(BaseModel):
 
 # ===== SEQUENCES =====
 async def _next_prog_numero(tenant_id: str) -> str:
-    count = await db.pcp_programacao.count_documents({"tenant_id": tenant_id})
+    count = await pg_db.fetch_val("SELECT COUNT(*) FROM pcp_programacao WHERE tenant_id=$1", tenant_id)
     return f"PCP-{str(count + 1).zfill(5)}"
 
 
@@ -170,17 +169,23 @@ async def _next_prog_numero(tenant_id: str) -> str:
 @pcp_router.get("/linhas")
 async def list_linhas(request: Request, status: Optional[str] = None):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if status:
-        query["status"] = status
-    linhas = await db.pcp_linhas.find(query, {"_id": 0}).sort("nome", 1).to_list(100)
-    return linhas
+        clauses.append(f"status=${i}"); vals.append(status); i += 1
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM pcp_linhas WHERE {' AND '.join(clauses)} ORDER BY nome", *vals
+    )
+    return [_row(r) for r in rows]
 
 
 @pcp_router.get("/linhas/{linha_id}")
 async def get_linha(linha_id: str, request: Request):
     user = await get_current_user(request)
-    linha = await db.pcp_linhas.find_one({"id": linha_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    linha = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_linhas WHERE id=$1 AND tenant_id=$2", linha_id, user["tenant_id"]
+    ))
     if not linha:
         raise HTTPException(status_code=404, detail="Linha não encontrada")
     return linha
@@ -195,32 +200,26 @@ async def create_linha(data: LinhaCreate, request: Request):
     if data.tipo not in TIPOS_LINHA:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Permitidos: {TIPOS_LINHA}")
     now = _now()
-    linha = {
-        "id": _new_id(),
-        "tenant_id": tid,
-        "nome": data.nome.strip(),
-        "codigo": data.codigo,
-        "tipo": data.tipo,
-        "capacidade_diaria": data.capacidade_diaria,
-        "unidade_capacidade": data.unidade_capacidade,
-        "setup_minutos": data.setup_minutos,
-        "status": "ativa",
-        "observacoes": data.observacoes,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.pcp_linhas.insert_one(linha)
-    linha.pop("_id", None)
+    linha_id = _new_id()
+    await pg_db.execute(
+        """INSERT INTO pcp_linhas
+           (id, tenant_id, nome, codigo, tipo, capacidade_diaria, unidade_capacidade,
+            setup_minutos, status, observacoes, created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+        linha_id, tid, data.nome.strip(), data.codigo, data.tipo, data.capacidade_diaria,
+        data.unidade_capacidade, data.setup_minutos, "ativa", data.observacoes,
+        user["id"], user["name"], now, now,
+    )
     logger.info(f"Linha {data.nome} criada por {user['name']}")
-    return linha
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_linhas WHERE id=$1", linha_id))
 
 
 @pcp_router.put("/linhas/{linha_id}")
 async def update_linha(linha_id: str, data: LinhaUpdate, request: Request):
     user = await get_current_user(request)
-    linha = await db.pcp_linhas.find_one({"id": linha_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    linha = _row(await pg_db.fetch_one(
+        "SELECT id, status FROM pcp_linhas WHERE id=$1 AND tenant_id=$2", linha_id, user["tenant_id"]
+    ))
     if not linha:
         raise HTTPException(status_code=404, detail="Linha não encontrada")
     payload = data.model_dump(exclude_unset=True)
@@ -228,8 +227,18 @@ async def update_linha(linha_id: str, data: LinhaUpdate, request: Request):
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Permitidos: {TIPOS_LINHA}")
     updates: Dict[str, Any] = {k: v for k, v in payload.items() if v is not None}
     updates["updated_at"] = _now()
-    await db.pcp_linhas.update_one({"id": linha_id}, {"$set": updates})
-    return await db.pcp_linhas.find_one({"id": linha_id}, {"_id": 0})
+
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE pcp_linhas SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, linha_id, user["tenant_id"],
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_linhas WHERE id=$1", linha_id))
 
 
 @pcp_router.delete("/linhas/{linha_id}")
@@ -248,36 +257,36 @@ async def list_programacao(
     q: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if status:
-        query["status"] = status
+        clauses.append(f"status=${i}"); vals.append(status); i += 1
     if linha_id:
-        query["linha_id"] = linha_id
+        clauses.append(f"linha_id=${i}"); vals.append(linha_id); i += 1
     if data_inicio:
-        query["data_inicio"] = {"$gte": data_inicio}
+        clauses.append(f"data_inicio >= ${i}"); vals.append(data_inicio); i += 1
     if data_fim:
-        existing = query.get("data_inicio", {})
-        if isinstance(existing, dict):
-            existing["$lte"] = data_fim
-            query["data_inicio"] = existing
-        else:
-            query["data_inicio"] = {"$lte": data_fim}
+        clauses.append(f"data_inicio <= ${i}"); vals.append(data_fim); i += 1
     if q:
-        query["$or"] = [
-            {"numero_prog": {"$regex": q, "$options": "i"}},
-            {"op_numero": {"$regex": q, "$options": "i"}},
-            {"cliente_nome": {"$regex": q, "$options": "i"}},
-            {"produto_nome": {"$regex": q, "$options": "i"}},
-            {"linha_nome": {"$regex": q, "$options": "i"}},
-        ]
-    slots = await db.pcp_programacao.find(query, {"_id": 0}).sort("data_inicio", 1).to_list(1000)
-    return slots
+        clauses.append(
+            f"(numero_prog ILIKE ${i} OR op_numero ILIKE ${i} OR cliente_nome ILIKE ${i} OR produto_nome ILIKE ${i} OR linha_nome ILIKE ${i})"
+        )
+        vals.append(f"%{q}%"); i += 1
+
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM pcp_programacao WHERE {' AND '.join(clauses)} ORDER BY data_inicio",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 @pcp_router.get("/programacao/{slot_id}")
 async def get_slot(slot_id: str, request: Request):
     user = await get_current_user(request)
-    slot = await db.pcp_programacao.find_one({"id": slot_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    slot = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_programacao WHERE id=$1 AND tenant_id=$2", slot_id, user["tenant_id"]
+    ))
     if not slot:
         raise HTTPException(status_code=404, detail="Programação não encontrada")
     return slot
@@ -288,17 +297,21 @@ async def create_slot(data: SlotCreate, request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    # Validate OP (required for producao slots only)
     op = None
     if data.op_id:
-        op = await db.ops.find_one({"id": data.op_id, "tenant_id": tid}, {"_id": 0})
+        op = _row(await pg_db.fetch_one(
+            "SELECT id, numero_op, pedido_id, pedido_numero, cliente_nome, items FROM ops WHERE id=$1 AND tenant_id=$2",
+            data.op_id, tid,
+        ))
         if not op:
             raise HTTPException(status_code=404, detail="OP não encontrada")
     elif data.tipo == "producao":
         raise HTTPException(status_code=400, detail="op_id obrigatório para slots de produção")
 
-    # Validate linha
-    linha = await db.pcp_linhas.find_one({"id": data.linha_id, "tenant_id": tid}, {"_id": 0})
+    linha = _row(await pg_db.fetch_one(
+        "SELECT id, nome, tipo, setup_minutos, status FROM pcp_linhas WHERE id=$1 AND tenant_id=$2",
+        data.linha_id, tid,
+    ))
     if not linha:
         raise HTTPException(status_code=404, detail="Linha não encontrada")
     if linha.get("status") != "ativa":
@@ -309,94 +322,86 @@ async def create_slot(data: SlotCreate, request: Request):
     if data.tipo not in TIPOS_SLOT:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Permitidos: {TIPOS_SLOT}")
 
-    # Resolve anchor date for calendar check
     anchor_date = data.data or data.data_inicio
     if not anchor_date:
         raise HTTPException(status_code=400, detail="data ou data_inicio obrigatório")
 
-    # RN-PCP-03: calendar must be configured for this week before scheduling
     semana = _week_key(anchor_date)
-    calendar_exists = await db.pcp_calendario.find_one(
-        {"tenant_id": tid, "semana": semana, "linha_id": data.linha_id}, {"_id": 0}
-    )
+    calendar_exists = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2 AND linha_id=$3",
+        tid, semana, data.linha_id,
+    ))
     if not calendar_exists:
         raise HTTPException(
             status_code=422,
-            detail=f"Calendário não configurado para a semana {semana} na linha '{linha['nome']}' (RN-PCP-03). Configure o calendário antes de programar."
+            detail=f"Calendário não configurado para a semana {semana} na linha '{linha['nome']}' (RN-PCP-03). Configure o calendário antes de programar.",
         )
 
     numero_prog = await _next_prog_numero(tid)
     now = _now()
 
-    # Resolve product/order info from OP (may be None for setup/almoco slots)
-    op_items = op.get("items", []) if op else []
+    op_items = (op.get("items") or []) if op else []
     produto_nome = ""
     if op_items:
         produto_nome = op_items[0].get("item", "") or op_items[0].get("produto", "")
 
-    # Normalize hora fields
-    hora_inicio = data.hora_inicio or calendar_exists.get("seg", {}).get("hora_inicio", "07:00") if calendar_exists else "07:00"
-    hora_fim = data.hora_fim or calendar_exists.get("seg", {}).get("hora_fim", "18:00") if calendar_exists else "18:00"
+    seg_cal = calendar_exists.get("seg") or {}
+    hora_inicio = data.hora_inicio or seg_cal.get("hora_inicio", "07:00")
+    hora_fim = data.hora_fim or seg_cal.get("hora_fim", "18:00")
 
-    slot = {
-        "id": _new_id(),
-        "tenant_id": tid,
-        "numero_prog": numero_prog,
-        "op_id": data.op_id,
-        "op_numero": op.get("numero_op", "") if op else "",
-        "pedido_id": op.get("pedido_id", "") if op else "",
-        "pedido_numero": op.get("pedido_numero", "") if op else "",
-        "cliente_nome": op.get("cliente_nome", "") if op else "",
-        "produto_nome": produto_nome,
-        "sku": op_items[0].get("codigo_kuryos", "") if op_items else "",
-        "linha_id": data.linha_id,
-        "linha_nome": linha["nome"],
-        "linha_tipo": linha.get("tipo", "geral"),
-        # Hour-by-hour fields
-        "data": data.data or data.data_inicio,
-        "hora_inicio": hora_inicio,
-        "hora_fim": hora_fim,
-        "tipo": data.tipo,
-        "setup_tempo_min": data.setup_tempo_min,
-        "setup_tipo": data.setup_tipo if data.tipo == "setup" else None,
-        "lote_id": data.lote_id,
-        # Legacy
-        "data_inicio": data.data_inicio or data.data,
-        "data_fim": data.data_fim or data.data or data.data_inicio,
-        "turno": data.turno,
-        "qtd_planejada": data.qtd_planejada or (op_items[0].get("qtd_planejada", 0) if op_items else 0),
-        "qtd_produzida": 0.0,
-        "status": "planejado",
-        "historico": [{"de": None, "para": "planejado", "por": user["name"], "em": now}],
-        "observacoes": data.observacoes,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.pcp_programacao.insert_one(slot)
-    slot.pop("_id", None)
+    slot_id = _new_id()
+    historico = [{"de": None, "para": "planejado", "por": user["name"], "em": now}]
 
-    # Link slot back to OP
-    await db.ops.update_one(
-        {"id": data.op_id, "tenant_id": tid},
-        {"$set": {"pcp_slot_id": slot["id"], "pcp_numero": numero_prog, "updated_at": now}}
+    await pg_db.execute(
+        """INSERT INTO pcp_programacao
+           (id, tenant_id, numero_prog, op_id, op_numero, pedido_id, pedido_numero,
+            cliente_nome, produto_nome, sku, linha_id, linha_nome, linha_tipo,
+            data, hora_inicio, hora_fim, tipo, setup_tempo_min, setup_tipo, lote_id,
+            data_inicio, data_fim, turno, qtd_planejada, qtd_produzida,
+            status, historico, observacoes, created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                   $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)""",
+        slot_id, tid, numero_prog,
+        data.op_id, op.get("numero_op", "") if op else "",
+        op.get("pedido_id", "") if op else "", op.get("pedido_numero", "") if op else "",
+        op.get("cliente_nome", "") if op else "", produto_nome,
+        op_items[0].get("codigo_kuryos", "") if op_items else "",
+        data.linha_id, linha["nome"], linha.get("tipo", "geral"),
+        data.data or data.data_inicio, hora_inicio, hora_fim,
+        data.tipo, data.setup_tempo_min,
+        data.setup_tipo if data.tipo == "setup" else None,
+        data.lote_id,
+        data.data_inicio or data.data,
+        data.data_fim or data.data or data.data_inicio,
+        data.turno,
+        data.qtd_planejada or (op_items[0].get("qtd_planejada", 0) if op_items else 0),
+        0.0, "planejado", historico, data.observacoes,
+        user["id"], user["name"], now, now,
     )
 
-    logger.info(f"PCP {numero_prog} criado para OP {op.get('numero_op')} por {user['name']}")
-    return slot
+    if data.op_id:
+        await pg_db.execute(
+            "UPDATE ops SET pcp_slot_id=$1, pcp_numero=$2, updated_at=$3 WHERE id=$4 AND tenant_id=$5",
+            slot_id, numero_prog, now, data.op_id, tid,
+        )
+
+    logger.info(f"PCP {numero_prog} criado para OP {op.get('numero_op') if op else '-'} por {user['name']}")
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_programacao WHERE id=$1", slot_id))
 
 
 @pcp_router.put("/programacao/{slot_id}")
 async def update_slot(slot_id: str, data: SlotUpdate, request: Request):
     user = await get_current_user(request)
-    slot = await db.pcp_programacao.find_one({"id": slot_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    tid = user["tenant_id"]
+    slot = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_programacao WHERE id=$1 AND tenant_id=$2", slot_id, tid
+    ))
     if not slot:
         raise HTTPException(status_code=404, detail="Programação não encontrada")
 
     now = _now()
     updates: Dict[str, Any] = {"updated_at": now}
-    historico = list(slot.get("historico", []))
+    historico = list(slot.get("historico") or [])
     payload = data.model_dump(exclude_unset=True)
 
     if "status" in payload:
@@ -407,29 +412,28 @@ async def update_slot(slot_id: str, data: SlotUpdate, request: Request):
         if novo_status not in allowed:
             raise HTTPException(
                 status_code=422,
-                detail=f"Transição {slot['status']} → {novo_status} não permitida"
+                detail=f"Transição {slot['status']} → {novo_status} não permitida",
             )
         historico.append({"de": slot["status"], "para": novo_status, "por": user["name"], "em": now})
         updates["status"] = novo_status
         updates["historico"] = historico
 
-        # Sync OP status
-        tid = user["tenant_id"]
-        if novo_status == "em_execucao":
-            await db.ops.update_one(
-                {"id": slot["op_id"], "tenant_id": tid},
-                {"$set": {"status": "em_processo", "updated_at": now}}
+        if novo_status == "em_execucao" and slot.get("op_id"):
+            await pg_db.execute(
+                "UPDATE ops SET status='em_processo', updated_at=$1 WHERE id=$2 AND tenant_id=$3",
+                now, slot["op_id"], tid,
             )
-        elif novo_status == "concluido":
-            await db.ops.update_one(
-                {"id": slot["op_id"], "tenant_id": tid},
-                {"$set": {"status": "concluida", "updated_at": now}}
+        elif novo_status == "concluido" and slot.get("op_id"):
+            await pg_db.execute(
+                "UPDATE ops SET status='concluida', updated_at=$1 WHERE id=$2 AND tenant_id=$3",
+                now, slot["op_id"], tid,
             )
 
     if "linha_id" in payload and payload["linha_id"]:
-        linha = await db.pcp_linhas.find_one(
-            {"id": payload["linha_id"], "tenant_id": user["tenant_id"]}, {"_id": 0}
-        )
+        linha = _row(await pg_db.fetch_one(
+            "SELECT id, nome, tipo FROM pcp_linhas WHERE id=$1 AND tenant_id=$2",
+            payload["linha_id"], tid,
+        ))
         if linha:
             updates["linha_id"] = payload["linha_id"]
             updates["linha_nome"] = linha["nome"]
@@ -441,8 +445,17 @@ async def update_slot(slot_id: str, data: SlotUpdate, request: Request):
                 raise HTTPException(status_code=400, detail=f"Turno inválido: {payload[field]}")
             updates[field] = payload[field]
 
-    await db.pcp_programacao.update_one({"id": slot_id}, {"$set": updates})
-    return await db.pcp_programacao.find_one({"id": slot_id}, {"_id": 0})
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE pcp_programacao SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, slot_id, tid,
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_programacao WHERE id=$1", slot_id))
 
 
 @pcp_router.delete("/programacao/{slot_id}")
@@ -456,29 +469,33 @@ async def pcp_dashboard(request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    linhas_ativas = await db.pcp_linhas.count_documents({"tenant_id": tid, "status": "ativa"})
-    planejados = await db.pcp_programacao.count_documents({"tenant_id": tid, "status": "planejado"})
-    em_execucao = await db.pcp_programacao.count_documents({"tenant_id": tid, "status": "em_execucao"})
-    concluidos_hoje = await db.pcp_programacao.count_documents({
-        "tenant_id": tid,
-        "status": "concluido",
-        "updated_at": {"$gte": _now()[:10]},
-    })
-    ops_sem_pcp = await db.ops.count_documents({
-        "tenant_id": tid,
-        "status": "aberta",
-        "pcp_slot_id": {"$exists": False},
-    })
-
-    lotes_ativos = await db.pcp_lotes.count_documents({"tenant_id": tid, "status": {"$in": ["planejado", "em_preparo", "em_envase"]}})
+    linhas_ativas = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM pcp_linhas WHERE tenant_id=$1 AND status='ativa'", tid
+    )
+    prog_row = _row(await pg_db.fetch_one(
+        """SELECT
+               COUNT(*) FILTER (WHERE status='planejado') AS planejados,
+               COUNT(*) FILTER (WHERE status='em_execucao') AS em_execucao,
+               COUNT(*) FILTER (WHERE status='concluido' AND updated_at >= CURRENT_DATE::timestamptz) AS concluidos_hoje
+           FROM pcp_programacao WHERE tenant_id=$1""",
+        tid,
+    ))
+    ops_sem_pcp = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM ops WHERE tenant_id=$1 AND status='aberta' AND pcp_slot_id IS NULL", tid
+    )
+    lotes_ativos = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM pcp_lotes WHERE tenant_id=$1 AND status IN ('planejado','em_preparo','em_envase')", tid
+    )
     semana_atual = _week_key(_now()[:10])
-    calendarios_semana = await db.pcp_calendario.count_documents({"tenant_id": tid, "semana": semana_atual})
+    calendarios_semana = await pg_db.fetch_val(
+        "SELECT COUNT(*) FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2", tid, semana_atual
+    )
 
     return {
         "linhas_ativas": linhas_ativas,
-        "planejados": planejados,
-        "em_execucao": em_execucao,
-        "concluidos_hoje": concluidos_hoje,
+        "planejados": prog_row["planejados"],
+        "em_execucao": prog_row["em_execucao"],
+        "concluidos_hoje": prog_row["concluidos_hoje"],
         "ops_sem_pcp": ops_sem_pcp,
         "lotes_ativos": lotes_ativos,
         "calendarios_semana_atual": calendarios_semana,
@@ -495,21 +512,23 @@ async def list_lotes(
     data_fim: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if status:
-        query["status"] = status
+        clauses.append(f"status=${i}"); vals.append(status); i += 1
     if op_id:
-        query["op_id"] = op_id
+        clauses.append(f"op_id=${i}"); vals.append(op_id); i += 1
     if data_inicio:
-        query["data_manipulacao"] = {"$gte": data_inicio}
+        clauses.append(f"data_manipulacao >= ${i}"); vals.append(data_inicio); i += 1
     if data_fim:
-        existing = query.get("data_manipulacao", {})
-        if isinstance(existing, dict):
-            existing["$lte"] = data_fim
-        else:
-            query["data_manipulacao"] = {"$lte": data_fim}
-    lotes = await db.pcp_lotes.find(query, {"_id": 0}).sort("data_manipulacao", -1).to_list(500)
-    return lotes
+        clauses.append(f"data_manipulacao <= ${i}"); vals.append(data_fim); i += 1
+
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM pcp_lotes WHERE {' AND '.join(clauses)} ORDER BY data_manipulacao DESC",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 @pcp_router.post("/lotes")
@@ -517,14 +536,15 @@ async def create_lote(data: LoteCreate, request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    # Validate OP
-    op = await db.ops.find_one({"id": data.op_id, "tenant_id": tid}, {"_id": 0})
+    op = _row(await pg_db.fetch_one(
+        "SELECT id, numero_op, pedido_id, pedido_numero, cliente_nome, items, checklist_insumos FROM ops WHERE id=$1 AND tenant_id=$2",
+        data.op_id, tid,
+    ))
     if not op:
         raise HTTPException(status_code=404, detail="OP não encontrada")
 
-    # RN-PCP-01: insumos must be checked before creating lote
-    op_items = op.get("items", [])
-    checklist = op.get("checklist_insumos", {})
+    op_items = op.get("items") or []
+    checklist = op.get("checklist_insumos") or {}
     insumos_pendentes = []
     for item in op_items:
         cat = item.get("categoria", "")
@@ -534,57 +554,50 @@ async def create_lote(data: LoteCreate, request: Request):
     if insumos_pendentes:
         raise HTTPException(
             status_code=422,
-            detail=f"Insumos pendentes de confirmação (RN-PCP-01): {', '.join(insumos_pendentes)}. Verifique o checklist antes de criar o lote."
+            detail=f"Insumos pendentes de confirmação (RN-PCP-01): {', '.join(insumos_pendentes)}. Verifique o checklist antes de criar o lote.",
         )
 
-    # RN-PCP-02: auto-number lote
     seq = await next_lote_per_day(tid, data.data_manipulacao)
     numero_lote = format_lote_numero(data.data_manipulacao, seq)
 
     now = _now()
-    op_items = op.get("items", [])
     produto_nome = op_items[0].get("item", "") if op_items else ""
+    lote_id = _new_id()
+    historico = [{"de": None, "para": "planejado", "por": user["name"], "em": now}]
 
-    lote = {
-        "id": _new_id(),
-        "tenant_id": tid,
-        "numero_lote": numero_lote,
-        "op_id": data.op_id,
-        "op_numero": op.get("numero_op", ""),
-        "pedido_id": op.get("pedido_id", ""),
-        "pedido_numero": op.get("pedido_numero", ""),
-        "cliente_nome": op.get("cliente_nome", ""),
-        "produto_nome": produto_nome,
-        "sku": op_items[0].get("codigo_kuryos", "") if op_items else "",
-        "data_manipulacao": data.data_manipulacao,
-        "data_envase": data.data_envase,
-        "qtd_planejada": data.qtd_planejada or (op_items[0].get("qtd_planejada", 0) if op_items else 0),
-        "qtd_produzida": 0,
-        "status": "planejado",
-        "historico": [{"de": None, "para": "planejado", "por": user["name"], "em": now}],
-        "observacoes": data.observacoes,
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.pcp_lotes.insert_one(lote)
-    lote.pop("_id", None)
+    await pg_db.execute(
+        """INSERT INTO pcp_lotes
+           (id, tenant_id, numero_lote, op_id, op_numero, pedido_id, pedido_numero,
+            cliente_nome, produto_nome, sku, data_manipulacao, data_envase,
+            qtd_planejada, qtd_produzida, status, historico, observacoes,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+        lote_id, tid, numero_lote,
+        data.op_id, op.get("numero_op", ""),
+        op.get("pedido_id", ""), op.get("pedido_numero", ""),
+        op.get("cliente_nome", ""), produto_nome,
+        op_items[0].get("codigo_kuryos", "") if op_items else "",
+        data.data_manipulacao, data.data_envase,
+        data.qtd_planejada or (op_items[0].get("qtd_planejada", 0) if op_items else 0),
+        0, "planejado", historico, data.observacoes,
+        user["id"], user["name"], now, now,
+    )
 
-    # Link lote to OP
-    await db.ops.update_one(
-        {"id": data.op_id, "tenant_id": tid},
-        {"$push": {"lote_ids": lote["id"]}, "$set": {"updated_at": now}}
+    await pg_db.execute(
+        "UPDATE ops SET lote_ids = lote_ids || $1::jsonb, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+        [lote_id], now, data.op_id, tid,
     )
 
     logger.info(f"Lote {numero_lote} criado para OP {op.get('numero_op')} por {user['name']}")
-    return lote
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_lotes WHERE id=$1", lote_id))
 
 
 @pcp_router.get("/lotes/{lote_id}")
 async def get_lote(lote_id: str, request: Request):
     user = await get_current_user(request)
-    lote = await db.pcp_lotes.find_one({"id": lote_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    lote = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_lotes WHERE id=$1 AND tenant_id=$2", lote_id, user["tenant_id"]
+    ))
     if not lote:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
     return lote
@@ -593,7 +606,10 @@ async def get_lote(lote_id: str, request: Request):
 @pcp_router.put("/lotes/{lote_id}")
 async def update_lote(lote_id: str, data: LoteUpdate, request: Request):
     user = await get_current_user(request)
-    lote = await db.pcp_lotes.find_one({"id": lote_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    tid = user["tenant_id"]
+    lote = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_lotes WHERE id=$1 AND tenant_id=$2", lote_id, tid
+    ))
     if not lote:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
 
@@ -608,7 +624,7 @@ async def update_lote(lote_id: str, data: LoteUpdate, request: Request):
     now = _now()
     payload = data.model_dump(exclude_unset=True)
     updates: Dict[str, Any] = {"updated_at": now}
-    historico = list(lote.get("historico", []))
+    historico = list(lote.get("historico") or [])
 
     if "status" in payload:
         novo_status = payload["status"]
@@ -618,7 +634,7 @@ async def update_lote(lote_id: str, data: LoteUpdate, request: Request):
         if novo_status not in allowed:
             raise HTTPException(
                 status_code=422,
-                detail=f"Transição {lote['status']} → {novo_status} não permitida"
+                detail=f"Transição {lote['status']} → {novo_status} não permitida",
             )
         historico.append({"de": lote["status"], "para": novo_status, "por": user["name"], "em": now})
         updates["status"] = novo_status
@@ -628,8 +644,17 @@ async def update_lote(lote_id: str, data: LoteUpdate, request: Request):
         if field in payload and payload[field] is not None:
             updates[field] = payload[field]
 
-    await db.pcp_lotes.update_one({"id": lote_id}, {"$set": updates})
-    return await db.pcp_lotes.find_one({"id": lote_id}, {"_id": 0})
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE pcp_lotes SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
+        *vals, lote_id, tid,
+    )
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_lotes WHERE id=$1", lote_id))
 
 
 @pcp_router.delete("/lotes/{lote_id}")
@@ -645,13 +670,19 @@ async def list_calendario(
     linha_id: Optional[str] = None,
 ):
     user = await get_current_user(request)
-    query: Dict[str, Any] = {"tenant_id": user["tenant_id"]}
+    clauses = ["tenant_id=$1"]
+    vals = [user["tenant_id"]]
+    i = 2
     if semana:
-        query["semana"] = semana
+        clauses.append(f"semana=${i}"); vals.append(semana); i += 1
     if linha_id:
-        query["linha_id"] = linha_id
-    calendarios = await db.pcp_calendario.find(query, {"_id": 0}).sort("semana", -1).to_list(200)
-    return calendarios
+        clauses.append(f"linha_id=${i}"); vals.append(linha_id); i += 1
+
+    rows = await pg_db.fetch_all(
+        f"SELECT * FROM pcp_calendario WHERE {' AND '.join(clauses)} ORDER BY semana DESC",
+        *vals,
+    )
+    return [_row(r) for r in rows]
 
 
 @pcp_router.post("/calendario")
@@ -659,58 +690,57 @@ async def create_calendario(data: CalendarioCreate, request: Request):
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    # Validate semana format YYYY-WW
     if not data.semana or len(data.semana) != 7 or data.semana[4] != "-":
         raise HTTPException(status_code=400, detail="Formato de semana inválido. Use YYYY-WW (ex: 2026-24)")
 
-    # Validate linha
-    linha = await db.pcp_linhas.find_one({"id": data.linha_id, "tenant_id": tid}, {"_id": 0})
+    linha = _row(await pg_db.fetch_one(
+        "SELECT id, nome FROM pcp_linhas WHERE id=$1 AND tenant_id=$2", data.linha_id, tid
+    ))
     if not linha:
         raise HTTPException(status_code=404, detail="Linha não encontrada")
 
-    # Upsert: one calendario per (tenant, semana, linha)
-    existing = await db.pcp_calendario.find_one(
-        {"tenant_id": tid, "semana": data.semana, "linha_id": data.linha_id}, {"_id": 0}
-    )
+    existing = _row(await pg_db.fetch_one(
+        "SELECT id FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2 AND linha_id=$3",
+        tid, data.semana, data.linha_id,
+    ))
     if existing:
         raise HTTPException(
             status_code=409,
-            detail=f"Calendário já existe para a semana {data.semana} / linha {linha['nome']}. Use PUT para atualizar."
+            detail=f"Calendário já existe para a semana {data.semana} / linha {linha['nome']}. Use PUT para atualizar.",
         )
 
     now = _now()
     default_dia = CalendarioDiaConfig()
+    default_sab = CalendarioDiaConfig(habilitado=False)
 
-    cal = {
-        "id": _new_id(),
-        "tenant_id": tid,
-        "semana": data.semana,
-        "linha_id": data.linha_id,
-        "linha_nome": linha["nome"],
-        "seg": (data.seg or default_dia).model_dump(),
-        "ter": (data.ter or default_dia).model_dump(),
-        "qua": (data.qua or default_dia).model_dump(),
-        "qui": (data.qui or default_dia).model_dump(),
-        "sex": (data.sex or default_dia).model_dump(),
-        "sab": (data.sab or CalendarioDiaConfig(habilitado=False)).model_dump(),
-        "dom": (data.dom or CalendarioDiaConfig(habilitado=False)).model_dump(),
-        "created_by": user["id"],
-        "created_by_name": user["name"],
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.pcp_calendario.insert_one(cal)
-    cal.pop("_id", None)
+    cal_id = _new_id()
+    await pg_db.execute(
+        """INSERT INTO pcp_calendario
+           (id, tenant_id, semana, linha_id, linha_nome,
+            seg, ter, qua, qui, sex, sab, dom,
+            created_by, created_by_name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+        cal_id, tid, data.semana, data.linha_id, linha["nome"],
+        (data.seg or default_dia).model_dump(),
+        (data.ter or default_dia).model_dump(),
+        (data.qua or default_dia).model_dump(),
+        (data.qui or default_dia).model_dump(),
+        (data.sex or default_dia).model_dump(),
+        (data.sab or default_sab).model_dump(),
+        (data.dom or default_sab).model_dump(),
+        user["id"], user.get("name", ""), now, now,
+    )
     logger.info(f"Calendário {data.semana}/{data.linha_id} criado por {user['name']}")
-    return cal
+    return _row(await pg_db.fetch_one("SELECT * FROM pcp_calendario WHERE id=$1", cal_id))
 
 
 @pcp_router.get("/calendario/{semana}/{linha_id}")
 async def get_calendario(semana: str, linha_id: str, request: Request):
     user = await get_current_user(request)
-    cal = await db.pcp_calendario.find_one(
-        {"tenant_id": user["tenant_id"], "semana": semana, "linha_id": linha_id}, {"_id": 0}
-    )
+    cal = _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2 AND linha_id=$3",
+        user["tenant_id"], semana, linha_id,
+    ))
     if not cal:
         raise HTTPException(status_code=404, detail="Calendário não encontrado para esta semana/linha")
     return cal
@@ -721,9 +751,10 @@ async def update_calendario(semana: str, linha_id: str, data: CalendarioCreate, 
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    cal = await db.pcp_calendario.find_one(
-        {"tenant_id": tid, "semana": semana, "linha_id": linha_id}, {"_id": 0}
-    )
+    cal = _row(await pg_db.fetch_one(
+        "SELECT id FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2 AND linha_id=$3",
+        tid, semana, linha_id,
+    ))
     if not cal:
         raise HTTPException(status_code=404, detail="Calendário não encontrado. Use POST para criar.")
 
@@ -733,12 +764,20 @@ async def update_calendario(semana: str, linha_id: str, data: CalendarioCreate, 
         if dia in payload and payload[dia] is not None:
             updates[dia] = payload[dia]
 
-    await db.pcp_calendario.update_one(
-        {"tenant_id": tid, "semana": semana, "linha_id": linha_id}, {"$set": updates}
+    set_clauses = []
+    vals = []
+    i = 1
+    for k, v in updates.items():
+        set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+
+    await pg_db.execute(
+        f"UPDATE pcp_calendario SET {', '.join(set_clauses)} WHERE tenant_id=${i} AND semana=${i+1} AND linha_id=${i+2}",
+        *vals, tid, semana, linha_id,
     )
-    return await db.pcp_calendario.find_one(
-        {"tenant_id": tid, "semana": semana, "linha_id": linha_id}, {"_id": 0}
-    )
+    return _row(await pg_db.fetch_one(
+        "SELECT * FROM pcp_calendario WHERE tenant_id=$1 AND semana=$2 AND linha_id=$3",
+        tid, semana, linha_id,
+    ))
 
 
 # ========== SETUP SUGESTÃO ==========
@@ -749,24 +788,26 @@ async def setup_sugestao(
     data: str,
     hora: str,
 ):
-    """Return suggested setup block between two different products (RN-PCP-10)."""
     user = await get_current_user(request)
     tid = user["tenant_id"]
 
-    linha = await db.pcp_linhas.find_one({"id": linha_id, "tenant_id": tid}, {"_id": 0})
+    linha = _row(await pg_db.fetch_one(
+        "SELECT id, nome, setup_minutos FROM pcp_linhas WHERE id=$1 AND tenant_id=$2", linha_id, tid
+    ))
     if not linha:
         raise HTTPException(status_code=404, detail="Linha não encontrada")
 
-    # Find previous slot on same line+day to determine if setup is needed
-    slots_do_dia = await db.pcp_programacao.find(
-        {"tenant_id": tid, "linha_id": linha_id, "data": data, "tipo": "producao", "status": {"$nin": ["cancelado"]}},
-        {"_id": 0}
-    ).sort("hora_inicio", -1).to_list(50)
+    slots_do_dia = [_row(r) for r in await pg_db.fetch_all(
+        """SELECT * FROM pcp_programacao
+           WHERE tenant_id=$1 AND linha_id=$2 AND data=$3 AND tipo='producao' AND status != 'cancelado'
+           ORDER BY hora_inicio DESC""",
+        tid, linha_id, data,
+    )]
 
-    setup_minutos = linha.get("setup_minutos", 30)
+    setup_minutos = linha.get("setup_minutos") or 30
     anterior = None
     for s in slots_do_dia:
-        if s.get("hora_fim", "") <= hora:
+        if (s.get("hora_fim") or "") <= hora:
             anterior = s
             break
 
