@@ -1018,28 +1018,35 @@ async def _advance_project_stage_if_needed(
         project_id, user["tenant_id"]
     ))
 
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="project",
-        entity_id=project_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_stage,
-        new_stage=new_stage,
-        user=user,
-    )
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="project_auto_moved",
-        entity_type="project",
-        entity_id=project_id,
-        before={"stage": old_stage},
-        after={"stage": new_stage},
-        metadata={
-            "source": movement_source,
-            "tasks_generated": [task["id"] for task in new_tasks],
-        },
-    )
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="project",
+            entity_id=project_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_stage,
+            new_stage=new_stage,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[project_auto_move] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="project_auto_moved",
+            entity_type="project",
+            entity_id=project_id,
+            before={"stage": old_stage},
+            after={"stage": new_stage},
+            metadata={
+                "source": movement_source,
+                "tasks_generated": [task["id"] for task in new_tasks],
+            },
+        )
+    except Exception as exc:
+        logger.error(f"[project_auto_move] audit_log falhou (ignorado): {exc}", exc_info=True)
     if new_stage == "em_negociacao" and updated:
         await _mirror_client_stage_to_negociacao(updated, user)
 
@@ -1705,28 +1712,35 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
 
     updated = _row(await pg_db.fetch_one("SELECT * FROM crm_clients WHERE id=$1", client_id))
 
-    # ERP v3.0: trigger workflow tasks for the new stage
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="client",
-        entity_id=client_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_stage,
-        new_stage=new_stage,
-        user=user,
-    )
+    # ERP v3.0: trigger workflow tasks for the new stage (non-fatal — schema issues must not block the move)
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="client",
+            entity_id=client_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_stage,
+            new_stage=new_stage,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[move_client] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
 
-    # ERP v3.0: immutable audit log of stage change
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="client_moved",
-        entity_type="client",
-        entity_id=client_id,
-        before={"stage": old_stage},
-        after={"stage": new_stage, "motivo_perda": update_data.get("motivo_perda")},
-        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
-    )
+    # ERP v3.0: immutable audit log of stage change (non-fatal)
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="client_moved",
+            entity_type="client",
+            entity_id=client_id,
+            before={"stage": old_stage},
+            after={"stage": new_stage, "motivo_perda": update_data.get("motivo_perda")},
+            metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+        )
+    except Exception as exc:
+        logger.error(f"[move_client] audit_log falhou (ignorado): {exc}", exc_info=True)
 
     # Determine if batch project creation is triggered
     trigger_batch_projects = (new_stage == "projeto_em_discussao")
@@ -2111,14 +2125,18 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
     if new_stage == "amostra_solicitada":
         await _create_project_deadline_alert_task(updated, user)
 
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="project",
-        entity_id=project_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_stage,
-        new_stage=new_stage,
-        user=user,
-    )
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="project",
+            entity_id=project_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_stage,
+            new_stage=new_stage,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[move_project] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
     kickoff_created = None
     kickoff_tasks = []
     if new_stage == "pedido_aprovado":
@@ -2131,17 +2149,20 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
         }
         kickoff_tasks.append({"tipo": "preencher_kickoff_bloco2", "responsavel": "comercial"})
 
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="project_moved",
-        entity_type="project",
-        entity_id=project_id,
-        before={"stage": old_stage},
-        after={"stage": new_stage, "motivo_arquivamento": update_fields.get("motivo_arquivamento")},
-        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
-    )
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="project_moved",
+            entity_type="project",
+            entity_id=project_id,
+            before={"stage": old_stage},
+            after={"stage": new_stage, "motivo_arquivamento": update_fields.get("motivo_arquivamento")},
+            metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+        )
+    except Exception as exc:
+        logger.error(f"[move_project] audit_log falhou (ignorado): {exc}", exc_info=True)
 
     if new_stage == "em_negociacao" and updated:
         await _mirror_client_stage_to_negociacao(updated, user)
@@ -3205,26 +3226,33 @@ async def move_sample(sample_id: str, data: SampleMove, request: Request):
         sample_id, user["tenant_id"]
     ))
 
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="sample",
-        entity_id=sample_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_stage,
-        new_stage=new_stage,
-        user=user,
-    )
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="sample",
+            entity_id=sample_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_stage,
+            new_stage=new_stage,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[move_sample] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
 
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="sample_moved",
-        entity_type="sample",
-        entity_id=sample_id,
-        before={"stage": old_stage},
-        after={"stage": new_stage, "motivo": update_data.get("motivo_retrabalho")},
-        metadata={"tasks_generated": [t["id"] for t in new_tasks]},
-    )
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="sample_moved",
+            entity_type="sample",
+            entity_id=sample_id,
+            before={"stage": old_stage},
+            after={"stage": new_stage, "motivo": update_data.get("motivo_retrabalho")},
+            metadata={"tasks_generated": [t["id"] for t in new_tasks]},
+        )
+    except Exception as exc:
+        logger.error(f"[move_sample] audit_log falhou (ignorado): {exc}", exc_info=True)
 
     # TRIGGER: Auto-create SKU when sample is approved
     sku_created = None
@@ -3674,26 +3702,33 @@ async def move_variacao(sample_id: str, variacao_id: str, data: VariacaoMove, re
         sample_id, user["tenant_id"]
     ))
 
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="variacao",
-        entity_id=variacao_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_status,
-        new_stage=new_status,
-        user=user,
-    )
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="variacao",
+            entity_id=variacao_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_status,
+            new_stage=new_status,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[move_variacao] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
 
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="variacao_moved",
-        entity_type="variacao",
-        entity_id=variacao_id,
-        before={"status": old_status},
-        after={"status": new_status},
-        metadata={"sample_id": sample_id, "tasks_generated": [t["id"] for t in new_tasks]},
-    )
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="variacao_moved",
+            entity_type="variacao",
+            entity_id=variacao_id,
+            before={"status": old_status},
+            after={"status": new_status},
+            metadata={"sample_id": sample_id, "tasks_generated": [t["id"] for t in new_tasks]},
+        )
+    except Exception as exc:
+        logger.error(f"[move_variacao] audit_log falhou (ignorado): {exc}", exc_info=True)
 
     # TRIGGER: Auto-create SKU when variação is approved
     sku_created = None
@@ -4853,14 +4888,18 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     )
 
     # ERP v3.0: trigger tasks (CQ approval, lab tests)
-    new_tasks = await trigger_tasks_for_transition(
-        entity_type="pd_card",
-        entity_id=card_id,
-        tenant_id=user["tenant_id"],
-        old_stage=old_status,
-        new_stage=new_status,
-        user=user,
-    )
+    new_tasks = []
+    try:
+        new_tasks = await trigger_tasks_for_transition(
+            entity_type="pd_card",
+            entity_id=card_id,
+            tenant_id=user["tenant_id"],
+            old_stage=old_status,
+            new_stage=new_status,
+            user=user,
+        )
+    except Exception as exc:
+        logger.error(f"[move_pd_card] trigger_tasks_for_transition falhou (ignorado): {exc}", exc_info=True)
 
     stability_study = None
     if new_status == "em_testes":
@@ -4914,20 +4953,23 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     ))
     await _broadcast_pd_card_update(user["tenant_id"], updated, old_status, new_status)
 
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="pd_card_moved",
-        entity_type="pd_card",
-        entity_id=card_id,
-        before={"status_pd": old_status},
-        after={"status_pd": new_status, "observacao": data.observacao},
-        metadata={
-            "amostra_variacao_id": card.get("amostra_variacao_id"),
-            "tasks_generated": [t["id"] for t in new_tasks],
-        },
-    )
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="pd_card_moved",
+            entity_type="pd_card",
+            entity_id=card_id,
+            before={"status_pd": old_status},
+            after={"status_pd": new_status, "observacao": data.observacao},
+            metadata={
+                "amostra_variacao_id": card.get("amostra_variacao_id"),
+                "tasks_generated": [t["id"] for t in new_tasks],
+            },
+        )
+    except Exception as exc:
+        logger.error(f"[move_pd_card] audit_log falhou (ignorado): {exc}", exc_info=True)
 
     return {
         "card": updated,
