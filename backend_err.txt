@@ -25,3 +25,13 @@ INFO:     connection closed
 INFO:     ('127.0.0.1', 65314) - "WebSocket /api/ws" [accepted]
 INFO:     connection open
 INFO:     connection closed
+2026-06-22 12:28:01,816 - crm_routes - INFO - Alert scheduler: created 1 alerts across 1 tenants
+INFO:     ('127.0.0.1', 63502) - "WebSocket /api/ws" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     ('127.0.0.1', 63505) - "WebSocket /api/ws" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     ('127.0.0.1', 63708) - "WebSocket /api/ws" [accepted]
+INFO:     connection open
+INFO:     connection closed

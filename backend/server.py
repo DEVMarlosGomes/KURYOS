@@ -222,52 +222,22 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 
-# ============ OBJECT STORAGE ============
+# ============ LOCAL FILE STORAGE ============
 
-STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
 APP_NAME = "kuryos-crm"
-storage_key = None
-
-def init_storage():
-    global storage_key
-    if storage_key:
-        return storage_key
-    key = os.environ.get("EMERGENT_LLM_KEY")
-    if not key:
-        logger.warning("No EMERGENT_LLM_KEY for storage")
-        return None
-    try:
-        resp = http_requests.post(f"{STORAGE_URL}/init", json={"emergent_key": key}, timeout=30)
-        resp.raise_for_status()
-        storage_key = resp.json()["storage_key"]
-        logger.info("Object storage initialized")
-        return storage_key
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
-        return None
+UPLOAD_DIR = PathLib("/app/uploads")
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    if not key:
-        raise HTTPException(status_code=500, detail="Storage not initialized")
-    resp = http_requests.put(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key, "Content-Type": content_type},
-        data=data, timeout=120
-    )
-    resp.raise_for_status()
-    return resp.json()
+    file_path = UPLOAD_DIR / path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(data)
+    return {"path": path, "size": len(data)}
 
 def get_object(path: str):
-    key = init_storage()
-    if not key:
-        raise HTTPException(status_code=500, detail="Storage not initialized")
-    resp = http_requests.get(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key}, timeout=60
-    )
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+    file_path = UPLOAD_DIR / path
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Arquivo nao encontrado no disco")
+    return file_path.read_bytes(), "application/octet-stream"
 
 # ============ PYDANTIC MODELS ============
 

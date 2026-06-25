@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-const HERO_BG = "https://static.prod-images.emergentagent.com/jobs/19c57ff8-68c4-4faf-a657-3fa1c5f88325/images/5f28b7762e8cf043112e395479622397b2bf72076fc5cd0bf5186d12c784ff37.png";
 
 export default function LoginPage() {
     const { user, loading, login, register } = useAuth();
