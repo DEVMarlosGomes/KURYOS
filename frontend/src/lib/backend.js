@@ -41,7 +41,8 @@ function getLocalDevBackendUrls() {
         ]);
     }
 
-    return [origin];
+    // In production the frontend origin is NOT the backend — don't add it as candidate
+    return [];
 }
 
 function unique(values) {
