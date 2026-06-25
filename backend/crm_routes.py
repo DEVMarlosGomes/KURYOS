@@ -4795,6 +4795,12 @@ async def list_pd_cards(
                 f" OR extra->>'cliente' ILIKE ${n})")
     sql += " ORDER BY created_at DESC LIMIT 5000"
     cards = _rows(await pg_db.fetch_all(sql, *params))
+    # Flatten extra JSONB into top-level fields so the frontend can access produto, numero_completo, etc.
+    for card in cards:
+        extra = card.pop("extra", None) or {}
+        for k, v in extra.items():
+            if k not in card:
+                card[k] = v
     return cards
 
 
@@ -4809,11 +4815,16 @@ async def get_pd_card(card_id: str, request: Request):
     if not card:
         raise HTTPException(status_code=404, detail="Card não encontrado")
 
+    # Flatten extra JSONB into top-level fields
+    extra = card.pop("extra", None) or {}
+    for k, v in extra.items():
+        if k not in card:
+            card[k] = v
+
     # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
     if not card.get("pd_request_id"):
         try:
-            merged = {**card, **(card.get("extra") or {})}
-            await _ensure_pd_request_for_card(merged, user)
+            await _ensure_pd_request_for_card(card, user)
         except Exception as exc:  # pragma: no cover
             logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
 
@@ -4993,6 +5004,11 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     updated = _row(await pg_db.fetch_one(
         "SELECT * FROM pd_cards WHERE id=$1 AND tenant_id=$2", card_id, user["tenant_id"]
     ))
+    # Flatten extra so WebSocket consumers and the response have produto/numero_completo etc. at top level
+    _extra = updated.pop("extra", None) or {}
+    for _k, _v in _extra.items():
+        if _k not in updated:
+            updated[_k] = _v
     await _broadcast_pd_card_update(user["tenant_id"], updated, old_status, new_status)
 
     try:

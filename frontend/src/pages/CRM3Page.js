@@ -63,6 +63,7 @@ const STAGE_LABELS = Object.fromEntries(STAGES.map(s => [s.id, s.label]));
 
 export default function CRM3Page() {
     const { user: authUser } = useAuth();
+    const navigate = useNavigate();
     const wsRef = useRef(null);
     const [samples, setSamples] = useState([]);
     const [loading, setLoading] = useState(true);
