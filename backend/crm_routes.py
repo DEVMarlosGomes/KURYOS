@@ -4845,7 +4845,8 @@ async def get_pd_card(card_id: str, request: Request):
             if new_req_id:
                 card["pd_request_id"] = new_req_id
         except Exception as exc:  # pragma: no cover
-            logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
+            logger.error(f"[get_pd_card] Lazy creation FAILED for card {card_id}: {exc}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Falha ao criar P&D request: {exc}")
 
     # Buscar amostra e variação relacionadas
     if card.get("amostra_id"):

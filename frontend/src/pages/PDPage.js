@@ -232,10 +232,12 @@ const validCards = Array.isArray(data) ? data.filter(c => c && c.id) : (Array.is
                 navigate(`/pd/${data.pd_request_id}`);
                 return;
             }
+            // API responded but no pd_request_id yet — show side panel with fresh data
+            setSelectedCard(data || card);
         } catch (e) {
-            // Fall back to side sheet on error
+            toast.error("Erro ao carregar card P&D: " + (e.response?.data?.detail || e.message || "Tente novamente"));
+            setSelectedCard(card);
         }
-        setSelectedCard(card);
     };
 
     if (loading) return (
