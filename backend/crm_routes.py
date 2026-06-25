@@ -2877,7 +2877,19 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
 
     now = _now_iso()
 
-    # Move pd_request to IN_PROGRESS so the dev/formula appear active
+    # 1) Development — criado ANTES de mudar status; se falhar o status fica OPEN e o usuário vê o botão "Iniciar"
+    dev_id = _new_id()
+    await pg_db.execute(
+        """INSERT INTO pd_developments
+           (id, pd_request_id, tenant_id, assigned_to, assigned_to_name,
+            lab_responsible, current_version, status, started_at, completed_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9)""",
+        dev_id, pd_request_id, user["tenant_id"],
+        user["id"], user.get("name", ""),
+        None, 1, "active", None,
+    )
+
+    # Só após o development existir é que mudamos o status do pd_request para IN_PROGRESS
     await pg_db.execute(
         "UPDATE pd_requests SET status='IN_PROGRESS', updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
         pd_request_id, user["tenant_id"]
@@ -2889,18 +2901,6 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
         _new_id(), user["tenant_id"], pd_request_id, "OPEN", "IN_PROGRESS",
         user["id"], user.get("name", ""),
         "Bootstrap automático: desenvolvimento + fórmula inicial criados a partir do briefing CRM",
-    )
-
-    # 1) Development
-    dev_id = _new_id()
-    await pg_db.execute(
-        """INSERT INTO pd_developments
-           (id, pd_request_id, tenant_id, assigned_to, assigned_to_name,
-            lab_responsible, current_version, status, started_at, completed_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-        dev_id, pd_request_id, user["tenant_id"],
-        user["id"], user.get("name", ""),
-        None, 1, "active", now_iso(), None,
     )
 
     # 2) Initial formula pre-filled

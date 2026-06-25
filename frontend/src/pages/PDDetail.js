@@ -614,7 +614,7 @@ function NeedsDev({ onAction, status, canEdit }) {
       <p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto">
         Para acessar formulação, testes, amostras, custos e documentos, inicie o desenvolvimento.
       </p>
-      {status === "OPEN" && canEdit && (
+      {(status === "OPEN" || status === "IN_PROGRESS") && canEdit && (
         <Button onClick={onAction} className="gap-2">
           <ArrowRight className="h-4 w-4" />
           Iniciar Desenvolvimento
