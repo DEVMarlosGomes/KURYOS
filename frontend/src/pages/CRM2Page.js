@@ -378,6 +378,7 @@ export default function CRM2Page() {
             await handleMoveProject(draggableId, destination.droppableId);
         } catch (error) {
             toast.error(formatApiError(error));
+            await loadProjects();
         }
     };
 

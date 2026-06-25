@@ -2136,7 +2136,10 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
         project_id, user["tenant_id"]
     ))
     if new_stage == "amostra_solicitada":
-        await _create_project_deadline_alert_task(updated, user)
+        try:
+            await _create_project_deadline_alert_task(updated, user)
+        except Exception as _exc:
+            logger.error(f"[move_project] deadline_task falhou (ignorado): {_exc}", exc_info=True)
 
     new_tasks = []
     try:
