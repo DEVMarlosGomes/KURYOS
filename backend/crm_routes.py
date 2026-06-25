@@ -4825,6 +4825,20 @@ async def get_pd_card(card_id: str, request: Request):
             card[k] = v
 
     # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
+    # Se pd_request_id existe mas foi criado no MongoDB (era antiga), não existe no PostgreSQL → limpa e recria
+    if card.get("pd_request_id"):
+        pg_check = _row(await pg_db.fetch_one(
+            "SELECT id FROM pd_requests WHERE id=$1 AND tenant_id=$2",
+            card["pd_request_id"], user["tenant_id"]
+        ))
+        if not pg_check:
+            logger.info(f"[get_pd_card] pd_request_id {card['pd_request_id']} não existe no PostgreSQL (era MongoDB) — recriando")
+            card["pd_request_id"] = None
+            await pg_db.execute(
+                "UPDATE pd_cards SET pd_request_id=NULL, updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+                card_id, user["tenant_id"]
+            )
+
     if not card.get("pd_request_id"):
         try:
             new_req_id = await _ensure_pd_request_for_card(card, user)
