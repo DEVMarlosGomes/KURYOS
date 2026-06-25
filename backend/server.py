@@ -225,7 +225,7 @@ ws_manager = ConnectionManager()
 # ============ LOCAL FILE STORAGE ============
 
 APP_NAME = "kuryos-crm"
-UPLOAD_DIR = PathLib("/app/uploads")
+UPLOAD_DIR = Path("/app/uploads")
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
     file_path = UPLOAD_DIR / path
