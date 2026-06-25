@@ -43,9 +43,7 @@ export default function LoginPage() {
 
     return (
         <div className="min-h-screen flex" data-testid="login-page">
-            <div className="hidden lg:flex lg:w-1/2 relative overflow-hidden">
-                <img src={HERO_BG} alt="" className="absolute inset-0 w-full h-full object-cover" />
-                <div className="absolute inset-0 bg-black/50" />
+            <div className="hidden lg:flex lg:w-1/2 relative overflow-hidden bg-gradient-to-br from-stone-800 to-stone-950">
                 <div className="relative z-10 flex flex-col justify-end p-12">
                     <h1 className="text-5xl font-heading font-light text-white tracking-tight leading-tight">
                         CRM<br />

@@ -2007,10 +2007,6 @@ async def startup():
     await db.notifications.create_index([("tenant_id", 1), ("user_id", 1)])
     await db.files.create_index("tenant_id")
     await db.email_logs.create_index("tenant_id")
-    try:
-        init_storage()
-    except Exception as e:
-        logger.warning(f"Storage init deferred: {e}")
     # P&D module indexes
     await db.pd_requests.create_index("tenant_id")
     await db.pd_requests.create_index([("tenant_id", 1), ("status", 1)])
