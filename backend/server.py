@@ -1,9 +1,15 @@
+import os
 from dotenv import load_dotenv
 from pathlib import Path
 from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads")))
+MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", str(BASE_DIR / "memory")))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
 load_dotenv(REPO_ROOT / ".env")
 load_dotenv(BASE_DIR / ".env", override=False)
 
@@ -18,7 +24,6 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
-import os
 import logging
 import uuid
 import bcrypt
@@ -225,7 +230,6 @@ ws_manager = ConnectionManager()
 # ============ LOCAL FILE STORAGE ============
 
 APP_NAME = "kuryos-crm"
-UPLOAD_DIR = BASE_DIR / "uploads"
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
     file_path = UPLOAD_DIR / path
@@ -1958,24 +1962,26 @@ async def seed_admin():
         seeded_credentials.append((email, role_password, role, name))
 
     # Write credentials
-    Path("/app/memory").mkdir(exist_ok=True)
-    creds_md = ["# Test Credentials\n", "All users belong to the same tenant (Kuryos Demo).\n"]
-    creds_md.append("## Login Endpoint\nPOST /api/auth/login  →  body: { email, password }\n")
-    creds_md.append("## Users (one per RBAC profile, Section 10 PRD)\n")
-    creds_md.append("| Email | Senha | Perfil | Nome |")
-    creds_md.append("| --- | --- | --- | --- |")
-    for email, pwd, role, name in seeded_credentials:
-        creds_md.append(f"| {email} | {pwd} | {role} | {name} |")
-    creds_md.append("")
-    creds_md.append("## Auth Endpoints")
-    creds_md.append("- POST /api/auth/login")
-    creds_md.append("- POST /api/auth/register")
-    creds_md.append("- GET /api/auth/me")
-    creds_md.append("- POST /api/auth/logout")
-    creds_md.append("- POST /api/auth/refresh")
-    creds_md.append("")
-    with open("/app/memory/test_credentials.md", "w", encoding="utf-8") as f:
-        f.write("\n".join(creds_md))
+    try:
+        creds_md = ["# Test Credentials\n", "All users belong to the same tenant (Kuryos Demo).\n"]
+        creds_md.append("## Login Endpoint\nPOST /api/auth/login  →  body: { email, password }\n")
+        creds_md.append("## Users (one per RBAC profile, Section 10 PRD)\n")
+        creds_md.append("| Email | Senha | Perfil | Nome |")
+        creds_md.append("| --- | --- | --- | --- |")
+        for email, pwd, role, name in seeded_credentials:
+            creds_md.append(f"| {email} | {pwd} | {role} | {name} |")
+        creds_md.append("")
+        creds_md.append("## Auth Endpoints")
+        creds_md.append("- POST /api/auth/login")
+        creds_md.append("- POST /api/auth/register")
+        creds_md.append("- GET /api/auth/me")
+        creds_md.append("- POST /api/auth/logout")
+        creds_md.append("- POST /api/auth/refresh")
+        creds_md.append("")
+        with open(MEMORY_DIR / "test_credentials.md", "w", encoding="utf-8") as f:
+            f.write("\n".join(creds_md))
+    except Exception as e:
+        logger.warning(f"Could not write credentials file: {e}")
 
 # ============ STARTUP ============
 
@@ -2275,5 +2281,4 @@ else:
     )
 
 # Mount static files for uploads
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
