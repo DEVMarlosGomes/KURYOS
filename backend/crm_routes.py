@@ -1923,45 +1923,57 @@ async def batch_create_projects(data: ProjectBatchCreate, request: Request):
             )
             created_project_ids.append(project_id)
 
-            viability_task = await create_workflow_task(
-                tenant_id=user["tenant_id"],
-                entity_type="project",
-                entity_id=project_id,
-                title="Validar viabilidade tecnica do pre-briefing",
-                description="Tarefa automatica ao criar projeto em discussao.",
-                category="pd_dev",
-                blocking=False,
-                due_in_days=2,
-                created_by=user,
-            )
+            viability_task = None
+            try:
+                viability_task = await create_workflow_task(
+                    tenant_id=user["tenant_id"],
+                    entity_type="project",
+                    entity_id=project_id,
+                    title="Validar viabilidade tecnica do pre-briefing",
+                    description="Tarefa automatica ao criar projeto em discussao.",
+                    category="pd_dev",
+                    blocking=False,
+                    due_in_days=2,
+                    created_by=user,
+                )
+            except Exception as _wf_exc:
+                logger.error(f"[batch_create_projects] create_workflow_task falhou (ignorado): {_wf_exc}", exc_info=True)
             if viability_task and viability_task.get("id"):
                 created_task_ids.append(viability_task["id"])
 
-            deadline_task = await _create_project_deadline_alert_task(project, user)
+            deadline_task = None
+            try:
+                deadline_task = await _create_project_deadline_alert_task(project, user)
+            except Exception as _dl_exc:
+                logger.error(f"[batch_create_projects] deadline_task falhou (ignorado): {_dl_exc}", exc_info=True)
             if deadline_task and deadline_task.get("id"):
                 created_task_ids.append(deadline_task["id"])
 
-            audit_entry = await audit_log(
-                tenant_id=user["tenant_id"],
-                user_id=user["id"],
-                user_name=user.get("name", ""),
-                action="project_created",
-                entity_type="project",
-                entity_id=project_id,
-                after={
-                    "nome_projeto": project["nome_projeto"],
-                    "cliente_id": data.cliente_id,
-                    "stage": project["stage"],
-                },
-                metadata={
-                    "tasks_generated": [
-                        task_id for task_id in [
-                            viability_task.get("id") if viability_task else None,
-                            deadline_task.get("id") if deadline_task else None,
-                        ] if task_id
-                    ]
-                },
-            )
+            audit_entry = None
+            try:
+                audit_entry = await audit_log(
+                    tenant_id=user["tenant_id"],
+                    user_id=user["id"],
+                    user_name=user.get("name", ""),
+                    action="project_created",
+                    entity_type="project",
+                    entity_id=project_id,
+                    after={
+                        "nome_projeto": project["nome_projeto"],
+                        "cliente_id": data.cliente_id,
+                        "stage": project["stage"],
+                    },
+                    metadata={
+                        "tasks_generated": [
+                            task_id for task_id in [
+                                viability_task.get("id") if viability_task else None,
+                                deadline_task.get("id") if deadline_task else None,
+                            ] if task_id
+                        ]
+                    },
+                )
+            except Exception as _al_exc:
+                logger.error(f"[batch_create_projects] audit_log falhou (ignorado): {_al_exc}", exc_info=True)
             if audit_entry and audit_entry.get("id"):
                 created_audit_ids.append(audit_entry["id"])
 
