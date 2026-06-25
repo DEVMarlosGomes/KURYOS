@@ -10,6 +10,11 @@ MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", str(BASE_DIR / "memory")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
+# Cookie settings: cross-origin (Vercel → Render) requires SameSite=None + Secure
+_is_production = os.environ.get("RENDER") is not None
+COOKIE_SECURE = _is_production
+COOKIE_SAMESITE = "none" if _is_production else "lax"
+
 load_dotenv(REPO_ROOT / ".env")
 load_dotenv(BASE_DIR / ".env", override=False)
 
@@ -185,8 +190,8 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
-    response.set_cookie(key="refresh_token", value=refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    response.set_cookie(key="access_token", value=access, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=43200, path="/")
+    response.set_cookie(key="refresh_token", value=refresh, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=604800, path="/")
 
 
 async def get_commercial_user(request: Request) -> dict:
@@ -433,6 +438,25 @@ async def me(request: Request):
     user = await get_current_user(request)
     return user
 
+class ForgotPasswordInput(BaseModel):
+    email: str
+
+@router.post("/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordInput):
+    email = data.email.lower().strip()
+    user_doc = await db.users.find_one({"email": email}, {"_id": 0, "id": 1, "name": 1, "tenant_id": 1})
+    if user_doc:
+        temp_password = "Kuryos" + uuid.uuid4().hex[:6].upper() + "!"
+        await db.users.update_one({"email": email}, {"$set": {"password_hash": hash_password(temp_password)}})
+        await db.email_logs.insert_one({
+            "id": new_id(), "tenant_id": user_doc["tenant_id"],
+            "to": email, "subject": "Redefinicao de Senha — ERP Kuryos",
+            "body": f"Sua senha temporaria: {temp_password}\nAcesse o sistema e altere sua senha em seguida.",
+            "status": "mock_sent", "created_at": now_iso()
+        })
+        logger.info(f"[forgot-password] reset para: {email} | temp: {temp_password}")
+    return {"message": "Se o email estiver cadastrado, as instrucoes foram geradas."}
+
 @router.post("/auth/refresh")
 async def refresh_token(request: Request, response: Response):
     token = request.cookies.get("refresh_token")
@@ -446,7 +470,7 @@ async def refresh_token(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         access = create_access_token(user["id"], user["email"], user["tenant_id"], user["role"])
-        response.set_cookie(key="access_token", value=access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
+        response.set_cookie(key="access_token", value=access, httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=43200, path="/")
         return {"message": "Token refreshed"}
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh token expired")

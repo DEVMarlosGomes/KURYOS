@@ -24,8 +24,8 @@ export default function NotificationPanel() {
                 api.get("/notifications"),
                 api.get("/notifications/count")
             ]);
-            setNotifications(notifs);
-            setUnread(count.count);
+            setNotifications(Array.isArray(notifs) ? notifs : []);
+            setUnread(typeof count?.count === "number" ? count.count : 0);
         } catch {}
     }, []);
 

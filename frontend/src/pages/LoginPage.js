@@ -4,17 +4,17 @@ import { Navigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-
+import api from "@/lib/api";
 
 export default function LoginPage() {
-    const { user, loading, login, register } = useAuth();
-    const [tab, setTab] = useState("login");
+    const { user, loading, login } = useAuth();
     const [error, setError] = useState("");
     const [submitting, setSubmitting] = useState(false);
-
     const [loginForm, setLoginForm] = useState({ email: "", password: "" });
-    const [regForm, setRegForm] = useState({ email: "", password: "", name: "", org_name: "" });
+    const [showForgot, setShowForgot] = useState(false);
+    const [forgotEmail, setForgotEmail] = useState("");
+    const [forgotMsg, setForgotMsg] = useState("");
+    const [forgotLoading, setForgotLoading] = useState(false);
 
     if (loading) return (
         <div className="h-screen flex items-center justify-center bg-background" data-testid="login-loading">
@@ -32,13 +32,14 @@ export default function LoginPage() {
         setSubmitting(false);
     };
 
-    const handleRegister = async (e) => {
+    const handleForgot = async (e) => {
         e.preventDefault();
-        setError("");
-        setSubmitting(true);
-        const res = await register(regForm.email, regForm.password, regForm.name, regForm.org_name);
-        if (!res.success) setError(res.error);
-        setSubmitting(false);
+        setForgotLoading(true);
+        try {
+            await api.post("/auth/forgot-password", { email: forgotEmail });
+        } catch {}
+        setForgotMsg("Se o email estiver cadastrado, voce recebera uma nova senha temporaria. Entre em contato com o administrador se nao receber.");
+        setForgotLoading(false);
     };
 
     return (
@@ -46,7 +47,7 @@ export default function LoginPage() {
             <div className="hidden lg:flex lg:w-1/2 relative overflow-hidden bg-gradient-to-br from-stone-800 to-stone-950">
                 <div className="relative z-10 flex flex-col justify-end p-12">
                     <h1 className="text-5xl font-heading font-light text-white tracking-tight leading-tight">
-                        CRM<br />
+                        ERP<br />
                         <span className="font-semibold">Kuryos</span>
                     </h1>
                     <p className="mt-4 text-white/70 text-lg font-body max-w-md leading-relaxed">
@@ -58,92 +59,76 @@ export default function LoginPage() {
             <div className="flex-1 flex items-center justify-center p-8 bg-background">
                 <div className="w-full max-w-md">
                     <div className="mb-8 lg:hidden">
-                        <h1 className="text-3xl font-heading font-semibold tracking-tight">CRM Kuryos</h1>
+                        <h1 className="text-3xl font-heading font-semibold tracking-tight">ERP Kuryos</h1>
                     </div>
 
-                    <Tabs value={tab} onValueChange={(v) => { setTab(v); setError(""); }} data-testid="auth-tabs">
-                        <TabsList className="grid w-full grid-cols-2 mb-6">
-                            <TabsTrigger value="login" data-testid="login-tab">Entrar</TabsTrigger>
-                            <TabsTrigger value="register" data-testid="register-tab">Criar Conta</TabsTrigger>
-                        </TabsList>
-
-                        <TabsContent value="login">
-                            <form onSubmit={handleLogin} className="space-y-5">
-                                <div className="space-y-2">
-                                    <Label htmlFor="login-email">Email</Label>
-                                    <Input id="login-email" data-testid="login-email-input" type="email" placeholder="seu@email.com"
-                                        value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required />
-                                </div>
-                                <div className="space-y-2">
-                                    <Label htmlFor="login-password">Senha</Label>
-                                    <Input id="login-password" data-testid="login-password-input" type="password" placeholder="********"
-                                        value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required />
-                                </div>
-                                {error && <p className="text-sm text-destructive" data-testid="auth-error">{error}</p>}
-                                <Button type="submit" className="w-full" disabled={submitting} data-testid="login-submit-btn">
-                                    {submitting ? "Entrando..." : "Entrar"}
-                                </Button>
-                            </form>
-
-                            <div className="mt-6 pt-6 border-t border-border" data-testid="demo-users-section">
-                                <p className="text-xs uppercase tracking-wider text-muted-foreground mb-3 font-medium">
-                                    Acesso rapido — 8 perfis demo
-                                </p>
-                                <div className="grid grid-cols-2 gap-2">
-                                    {[
-                                        { email: "admin@kuryos.com", pwd: "admin123", label: "Admin" },
-                                        { email: "vendedor@kuryos.com", pwd: "kuryos123", label: "Vendedor" },
-                                        { email: "salesops@kuryos.com", pwd: "kuryos123", label: "Sales Ops" },
-                                        { email: "formulador@kuryos.com", pwd: "kuryos123", label: "Formulador" },
-                                        { email: "qa@kuryos.com", pwd: "kuryos123", label: "Qualidade" },
-                                        { email: "liderpd@kuryos.com", pwd: "kuryos123", label: "Lider P&D" },
-                                        { email: "engenharia@kuryos.com", pwd: "kuryos123", label: "Eng. Produto" },
-                                        { email: "sucesso@kuryos.com", pwd: "kuryos123", label: "Sucesso Cliente" },
-                                    ].map((u) => (
-                                        <button
-                                            key={u.email}
-                                            type="button"
-                                            data-testid={`demo-login-${u.label.toLowerCase().replace(/[^a-z]/g, "-")}`}
-                                            onClick={() => setLoginForm({ email: u.email, password: u.pwd })}
-                                            className="text-xs rounded-md border border-border px-2 py-1.5 hover:bg-accent text-left transition-colors"
-                                        >
-                                            <span className="block font-medium truncate">{u.label}</span>
-                                            <span className="block text-[10px] text-muted-foreground truncate">{u.email}</span>
-                                        </button>
-                                    ))}
-                                </div>
+                    {!showForgot ? (
+                        <form onSubmit={handleLogin} className="space-y-5" data-testid="login-form">
+                            <div className="mb-6">
+                                <h2 className="text-xl font-heading font-semibold">Entrar</h2>
+                                <p className="text-sm text-muted-foreground mt-1">Acesse sua conta para continuar.</p>
                             </div>
-                        </TabsContent>
-
-                        <TabsContent value="register">
-                            <form onSubmit={handleRegister} className="space-y-4">
-                                <div className="space-y-2">
-                                    <Label htmlFor="reg-name">Nome</Label>
-                                    <Input id="reg-name" data-testid="register-name-input" placeholder="Seu nome"
-                                        value={regForm.name} onChange={(e) => setRegForm({ ...regForm, name: e.target.value })} required />
+                            <div className="space-y-2">
+                                <Label htmlFor="login-email">Email</Label>
+                                <Input id="login-email" data-testid="login-email-input" type="email" placeholder="seu@email.com"
+                                    value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required />
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="login-password">Senha</Label>
+                                <Input id="login-password" data-testid="login-password-input" type="password" placeholder="••••••••"
+                                    value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required />
+                            </div>
+                            {error && <p className="text-sm text-destructive" data-testid="auth-error">{error}</p>}
+                            <Button type="submit" className="w-full" disabled={submitting} data-testid="login-submit-btn">
+                                {submitting ? "Entrando..." : "Entrar"}
+                            </Button>
+                            <div className="text-center pt-1">
+                                <button type="button" onClick={() => { setShowForgot(true); setError(""); }}
+                                    className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4 transition-colors"
+                                    data-testid="forgot-password-btn">
+                                    Esqueci minha senha
+                                </button>
+                            </div>
+                        </form>
+                    ) : (
+                        <div className="space-y-5" data-testid="forgot-password-form">
+                            <div className="mb-6">
+                                <h2 className="text-xl font-heading font-semibold">Redefinir senha</h2>
+                                <p className="text-sm text-muted-foreground mt-1">
+                                    Informe seu email. Uma senha temporaria sera gerada e aparecera nos logs de email da equipe.
+                                </p>
+                            </div>
+                            {!forgotMsg ? (
+                                <form onSubmit={handleForgot} className="space-y-4">
+                                    <div className="space-y-2">
+                                        <Label htmlFor="forgot-email">Email</Label>
+                                        <Input id="forgot-email" data-testid="forgot-email-input" type="email" placeholder="seu@email.com"
+                                            value={forgotEmail} onChange={(e) => setForgotEmail(e.target.value)} required />
+                                    </div>
+                                    <Button type="submit" className="w-full" disabled={forgotLoading}>
+                                        {forgotLoading ? "Processando..." : "Solicitar nova senha"}
+                                    </Button>
+                                    <div className="text-center">
+                                        <button type="button"
+                                            onClick={() => { setShowForgot(false); setForgotEmail(""); setForgotMsg(""); }}
+                                            className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4 transition-colors">
+                                            Voltar ao login
+                                        </button>
+                                    </div>
+                                </form>
+                            ) : (
+                                <div className="space-y-4">
+                                    <p className="text-sm text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 p-3 rounded-md border border-green-200 dark:border-green-900">
+                                        {forgotMsg}
+                                    </p>
+                                    <Button variant="outline" className="w-full"
+                                        onClick={() => { setShowForgot(false); setForgotEmail(""); setForgotMsg(""); }}>
+                                        Voltar ao login
+                                    </Button>
                                 </div>
-                                <div className="space-y-2">
-                                    <Label htmlFor="reg-org">Organizacao</Label>
-                                    <Input id="reg-org" data-testid="register-org-input" placeholder="Nome da empresa"
-                                        value={regForm.org_name} onChange={(e) => setRegForm({ ...regForm, org_name: e.target.value })} required />
-                                </div>
-                                <div className="space-y-2">
-                                    <Label htmlFor="reg-email">Email</Label>
-                                    <Input id="reg-email" data-testid="register-email-input" type="email" placeholder="seu@email.com"
-                                        value={regForm.email} onChange={(e) => setRegForm({ ...regForm, email: e.target.value })} required />
-                                </div>
-                                <div className="space-y-2">
-                                    <Label htmlFor="reg-password">Senha</Label>
-                                    <Input id="reg-password" data-testid="register-password-input" type="password" placeholder="Min. 6 caracteres"
-                                        value={regForm.password} onChange={(e) => setRegForm({ ...regForm, password: e.target.value })} required />
-                                </div>
-                                {error && <p className="text-sm text-destructive" data-testid="auth-error">{error}</p>}
-                                <Button type="submit" className="w-full" disabled={submitting} data-testid="register-submit-btn">
-                                    {submitting ? "Criando conta..." : "Criar Conta"}
-                                </Button>
-                            </form>
-                        </TabsContent>
-                    </Tabs>
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>
