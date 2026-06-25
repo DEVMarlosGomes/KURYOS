@@ -2721,9 +2721,10 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
         # Backfill: garantir que development + fórmula inicial existem
         # (cards criados antes do bootstrap automático ainda podem estar sem dev)
         try:
-            existing_dev = await db.pd_developments.find_one(
-                {"pd_request_id": existing_id, "tenant_id": user["tenant_id"]}
-            )
+            existing_dev = _row(await pg_db.fetch_one(
+                "SELECT id FROM pd_developments WHERE pd_request_id=$1 AND tenant_id=$2",
+                existing_id, user["tenant_id"]
+            ))
             if not existing_dev and card.get("amostra_id") and card.get("amostra_variacao_id"):
                 await _bootstrap_pd_development_for_variacao(
                     pd_request_id=existing_id, card=card, user=user
@@ -2804,17 +2805,34 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
         "updated_at": now,
     }
 
-    await db.pd_requests.insert_one(pd_request)
-    await db.pd_request_status_history.insert_one({
-        "id": _new_id(),
-        "pd_request_id": req_id,
-        "from_status": None,
-        "to_status": "OPEN",
-        "changed_by": user["id"],
-        "changed_by_name": user.get("name", ""),
-        "comment": "Criado automaticamente a partir de variação CRM",
-        "created_at": now,
-    })
+    # Inserir pd_request no PostgreSQL (onde get_pd_full_detail busca)
+    await pg_db.execute(
+        """INSERT INTO pd_requests
+           (id, tenant_id, client_card_id, client_name, project_name, technical_name,
+            commercial_name, internal_code, request_type, category, description,
+            references, restrictions, volume, packaging, priority, deadline, status,
+            is_internal_research, kickoff_completed, created_by, created_by_name,
+            created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW())""",
+        req_id, user["tenant_id"], pd_request.get("client_card_id"),
+        pd_request.get("client_name", ""), pd_request.get("project_name", req_id),
+        pd_request.get("technical_name", ""), pd_request.get("commercial_name", ""),
+        pd_request.get("internal_code", ""), pd_request.get("request_type", "Amostra"),
+        pd_request.get("category", ""), pd_request.get("description", ""),
+        pd_request.get("references", ""), pd_request.get("restrictions", ""),
+        pd_request.get("volume", ""), pd_request.get("packaging", ""),
+        pd_request.get("priority", "Normal"), None,
+        pd_request.get("status", "OPEN"),
+        pd_request.get("is_internal_research", False), pd_request.get("kickoff_completed", False),
+        pd_request.get("created_by", user["id"]), pd_request.get("created_by_name", user.get("name", "")),
+    )
+    await pg_db.execute(
+        """INSERT INTO pd_request_status_history
+           (id, tenant_id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())""",
+        _new_id(), user["tenant_id"], req_id, None, "OPEN",
+        user["id"], user.get("name", ""), "Criado automaticamente a partir de variação CRM",
+    )
 
     # Link card -> pd_request
     await pg_db.execute(
@@ -2860,35 +2878,30 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
     now = _now_iso()
 
     # Move pd_request to IN_PROGRESS so the dev/formula appear active
-    await db.pd_requests.update_one(
-        {"id": pd_request_id, "tenant_id": user["tenant_id"]},
-        {"$set": {"status": "IN_PROGRESS", "updated_at": now}},
+    await pg_db.execute(
+        "UPDATE pd_requests SET status='IN_PROGRESS', updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+        pd_request_id, user["tenant_id"]
     )
-    await db.pd_request_status_history.insert_one({
-        "id": _new_id(),
-        "pd_request_id": pd_request_id,
-        "from_status": "OPEN",
-        "to_status": "IN_PROGRESS",
-        "changed_by": user["id"],
-        "changed_by_name": user.get("name", ""),
-        "comment": "Bootstrap automático: desenvolvimento + fórmula inicial criados a partir do briefing CRM",
-        "created_at": now,
-    })
+    await pg_db.execute(
+        """INSERT INTO pd_request_status_history
+           (id, tenant_id, pd_request_id, from_status, to_status, changed_by, changed_by_name, comment, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())""",
+        _new_id(), user["tenant_id"], pd_request_id, "OPEN", "IN_PROGRESS",
+        user["id"], user.get("name", ""),
+        "Bootstrap automático: desenvolvimento + fórmula inicial criados a partir do briefing CRM",
+    )
 
     # 1) Development
     dev_id = _new_id()
-    await db.pd_developments.insert_one({
-        "id": dev_id,
-        "pd_request_id": pd_request_id,
-        "tenant_id": user["tenant_id"],
-        "assigned_to": user["id"],
-        "assigned_to_name": user.get("name", ""),
-        "lab_responsible": None,
-        "current_version": 1,
-        "status": "active",
-        "started_at": now,
-        "completed_at": None,
-    })
+    await pg_db.execute(
+        """INSERT INTO pd_developments
+           (id, pd_request_id, tenant_id, assigned_to, assigned_to_name,
+            lab_responsible, current_version, status, started_at, completed_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+        dev_id, pd_request_id, user["tenant_id"],
+        user["id"], user.get("name", ""),
+        None, 1, "active", now_iso(), None,
+    )
 
     # 2) Initial formula pre-filled
     quantidade = sample.get("quantidade_por_variacao") or 0.0
@@ -2925,21 +2938,16 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
 
     formula_id = _new_id()
     formula_name = f"Manipulação {variacao.get('codigo', '')} — {sample.get('nome_produto', '')} v1".strip()
-    await db.pd_formulas.insert_one({
-        "id": formula_id,
-        "tenant_id": user["tenant_id"],
-        "development_id": dev_id,
-        "version": 1,
-        "name": formula_name,
-        "notes": "\n".join(notes_lines).strip(),
-        "volume": float(quantidade or 0.0),
-        "volume_unit": volume_unit,
-        "indice_perdas": 0.0,
-        "cotacao_usd": 6.00,
-        "created_by": user["id"],
-        "created_by_name": user.get("name", ""),
-        "created_at": now,
-    })
+    await pg_db.execute(
+        """INSERT INTO pd_formulas
+           (id, tenant_id, development_id, version, name, notes, volume, volume_unit,
+            indice_perdas, cotacao_usd, created_by, created_by_name, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())""",
+        formula_id, user["tenant_id"], dev_id, 1, formula_name,
+        "\n".join(notes_lines).strip(),
+        float(quantidade or 0.0), volume_unit, 0.0, 6.00,
+        user["id"], user.get("name", ""),
+    )
 
     # 3) Fragrance pre-filled as first item (if available)
     if variacao.get("percentual_fragrancia") is not None and float(variacao.get("percentual_fragrancia") or 0) > 0:
@@ -2950,19 +2958,14 @@ async def _bootstrap_pd_development_for_variacao(pd_request_id: str, card: dict,
         cost_brl = round((pct / 100.0) * custo_kg, 4)
         cost_kg_usd = round((custo_kg / cotacao) if cotacao else 0.0, 4)
         item_id = _new_id()
-        await db.pd_formula_items.insert_one({
-            "id": item_id,
-            "formula_id": formula_id,
-            "ingredient_name": ref_frag,
-            "percentage": pct,
-            "price_per_kg": custo_kg,
-            "cost_brl": cost_brl,
-            "cost_kg_usd": cost_kg_usd,
-            "fornecedor": "",
-            "phase": "Fragrância",
-            "function": "Fragrância",
-            "catalog_id": None,
-        })
+        await pg_db.execute(
+            """INSERT INTO pd_formula_items
+               (id, formula_id, ingredient_name, percentage, price_per_kg, price_usd,
+                cost_brl, cost_kg_usd, cost_brl_via_cambio, fornecedor, phase, "function", catalog_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
+            item_id, formula_id, ref_frag, pct, custo_kg, None,
+            cost_brl, cost_kg_usd, None, "", "Fragrância", "Fragrância", None,
+        )
 
     await audit_log(
         tenant_id=user["tenant_id"],
