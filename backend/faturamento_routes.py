@@ -83,8 +83,8 @@ def _parse_parcelas(condicao: str, valor_total: float, data_emissao: Optional[st
 async def _auto_mark_vencidas(tid: str):
     today = date.today().isoformat()
     await pg_db.execute(
-        "UPDATE faturamento_duplicatas SET status='vencida', updated_at=$1 WHERE tenant_id=$2 AND status='aberta' AND data_vencimento < $3",
-        _now(), tid, today,
+        "UPDATE faturamento_duplicatas SET status='vencida', updated_at=NOW() WHERE tenant_id=$1 AND status='aberta' AND data_vencimento < $2",
+        tid, today,
     )
 
 
@@ -247,8 +247,8 @@ async def create_nota(data: NFCreate, request: Request):
 
     if data.order_id:
         await pg_db.execute(
-            "UPDATE orders SET nf_id=$1, nf_numero=$2, updated_at=$3 WHERE id=$4 AND tenant_id=$5",
-            nf_id, numero_interno, now, data.order_id, tid,
+            "UPDATE orders SET nf_id=$1, nf_numero=$2, updated_at=NOW() WHERE id=$3 AND tenant_id=$4",
+            nf_id, numero_interno, data.order_id, tid,
         )
 
     logger.info(f"NF {numero_interno} criada por {user['name']}")
@@ -369,8 +369,8 @@ async def gerar_duplicatas(nf_id: str, request: Request):
     )
 
     await pg_db.execute(
-        "UPDATE faturamento_notas SET duplicatas_geradas=TRUE, total_parcelas=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        total_p, now, nf_id, tid,
+        "UPDATE faturamento_notas SET duplicatas_geradas=TRUE, total_parcelas=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        total_p, nf_id, tid,
     )
 
     logger.info(f"NF {nf_num}: {total_p} duplicata(s) gerada(s) por {user['name']}")

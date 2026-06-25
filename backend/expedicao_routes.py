@@ -226,9 +226,9 @@ async def update_ordem(exp_id: str, data: ExpUpdate, request: Request):
         raise HTTPException(status_code=404, detail="EXP não encontrada")
 
     now = _now()
-    set_parts = ["updated_at=$1"]
-    vals: list = [now]
-    i = 2
+    set_parts = ["updated_at=NOW()"]
+    vals: list = []
+    i = 1
 
     payload = data.model_dump(exclude_unset=True)
     historico = list(exp.get("historico") or [])
@@ -270,8 +270,8 @@ async def update_ordem(exp_id: str, data: ExpUpdate, request: Request):
                 qty_saida = float(item.get("quantidade") or 0)
                 qty_depois = max(0.0, qty_antes - qty_saida)
                 await pg_db.execute(
-                    "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
-                    qty_depois, now, eid,
+                    "UPDATE estoque_items SET quantidade_atual=$1, updated_at=NOW() WHERE id=$2",
+                    qty_depois, eid,
                 )
                 await pg_db.execute(
                     """INSERT INTO estoque_movimentos
@@ -344,9 +344,9 @@ async def conferir_ordem(exp_id: str, data: ConferenciaCreate, request: Request)
 
     await pg_db.execute(
         """UPDATE expedicao_ordens SET
-               status='conferido', conferencia=$1, historico=$2, updated_at=$3
-           WHERE id=$4 AND tenant_id=$5""",
-        conferencia_record, historico, now, exp_id, tid,
+               status='conferido', conferencia=$1, historico=$2, updated_at=NOW()
+           WHERE id=$3 AND tenant_id=$4""",
+        conferencia_record, historico, exp_id, tid,
     )
     return _row(await pg_db.fetch_one("SELECT * FROM expedicao_ordens WHERE id=$1", exp_id))
 

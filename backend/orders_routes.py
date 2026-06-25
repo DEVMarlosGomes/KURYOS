@@ -687,7 +687,7 @@ async def aprovar_cliente(order_id: str, request: Request):
     now = _now()
     await pg_db.execute(
         """UPDATE orders SET aprovacao_cliente='aprovado', aprovacao_cliente_obs=$1,
-           aprovacao_cliente_em=$2, aprovacao_cliente_por=$3, updated_at=$2
+           aprovacao_cliente_em=$2, aprovacao_cliente_por=$3, updated_at=NOW()
            WHERE id=$4 AND tenant_id=$5""",
         obs, now, user.get("name", ""), order_id, user["tenant_id"],
     )
@@ -713,7 +713,7 @@ async def aprovar_comercial(order_id: str, request: Request):
     now = _now()
     await pg_db.execute(
         """UPDATE orders SET aprovacao_comercial='aprovada', aprovacao_comercial_obs=$1,
-           aprovacao_comercial_em=$2, aprovacao_comercial_por=$3, updated_at=$2
+           aprovacao_comercial_em=$2, aprovacao_comercial_por=$3, updated_at=NOW()
            WHERE id=$4 AND tenant_id=$5""",
         obs, now, user.get("name", ""), order_id, user["tenant_id"],
     )
@@ -737,7 +737,7 @@ async def rejeitar_comercial(order_id: str, request: Request):
     now = _now()
     await pg_db.execute(
         """UPDATE orders SET aprovacao_comercial='rejeitada', aprovacao_comercial_obs=$1,
-           aprovacao_comercial_em=$2, aprovacao_comercial_por=$3, updated_at=$2
+           aprovacao_comercial_em=$2, aprovacao_comercial_por=$3, updated_at=NOW()
            WHERE id=$4 AND tenant_id=$5""",
         obs, now, user.get("name", ""), order_id, user["tenant_id"],
     )
@@ -765,7 +765,7 @@ async def sign_cgi(order_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
     now = _now()
     await pg_db.execute(
-        "UPDATE orders SET cgi_status='assinado', cgi_assinado_em=$1, cgi_assinado_por=$2, updated_at=$1 WHERE id=$3 AND tenant_id=$4",
+        "UPDATE orders SET cgi_status='assinado', cgi_assinado_em=$1, cgi_assinado_por=$2, updated_at=NOW() WHERE id=$3 AND tenant_id=$4",
         now, user.get("name", ""), order_id, user["tenant_id"],
     )
     return _row(await pg_db.fetch_one("SELECT * FROM orders WHERE id=$1", order_id))
@@ -823,8 +823,8 @@ async def create_op_from_order(order_id: str, request: Request):
         now, user["id"], user.get("name", ""),
     )
     await pg_db.execute(
-        "UPDATE orders SET op_id=$1, status='em_producao', updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        op_id, now, order_id, tid,
+        "UPDATE orders SET op_id=$1, status='em_producao', updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        op_id, order_id, tid,
     )
     return _row(await pg_db.fetch_one("SELECT * FROM ops WHERE id=$1", op_id))
 
@@ -1383,8 +1383,8 @@ async def pausar_op(op_id: str, data: PausaCreate, request: Request):
         "em": now,
     }
     await pg_db.execute(
-        "UPDATE ops SET pausas = pausas || $1::jsonb, status='pausada', updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        [pausa], now, op_id, tid,
+        "UPDATE ops SET pausas = pausas || $1::jsonb, status='pausada', updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        [pausa], op_id, tid,
     )
     return _row(await pg_db.fetch_one("SELECT * FROM ops WHERE id=$1", op_id))
 
@@ -1413,8 +1413,8 @@ async def retomar_op(op_id: str, request: Request):
             break
 
     await pg_db.execute(
-        "UPDATE ops SET pausas=$1, status='em_processo', updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        pausas, now, op_id, tid,
+        "UPDATE ops SET pausas=$1, status='em_processo', updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        pausas, op_id, tid,
     )
     return _row(await pg_db.fetch_one("SELECT * FROM ops WHERE id=$1", op_id))
 
@@ -1454,7 +1454,7 @@ async def registrar_perda(op_id: str, data: PerdaCreate, request: Request):
         "em": now,
     }
     await pg_db.execute(
-        "UPDATE ops SET perdas = perdas || $1::jsonb, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        [perda], now, op_id, tid,
+        "UPDATE ops SET perdas = perdas || $1::jsonb, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        [perda], op_id, tid,
     )
     return _row(await pg_db.fetch_one("SELECT * FROM ops WHERE id=$1", op_id))

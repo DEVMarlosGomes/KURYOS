@@ -533,10 +533,10 @@ def _current_approval_step(kickoff: dict) -> Optional[Dict[str, Any]]:
 async def _sync_project_kickoff_summary(kickoff: dict):
     await pg_db.execute(
         """UPDATE crm_projects SET kickoff_id=$1, kickoff_numero=$2, kickoff_status=$3,
-           kickoff_versao=$4, kickoff_group_id=$5, updated_at=$6
-           WHERE id=$7 AND tenant_id=$8""",
+           kickoff_versao=$4, kickoff_group_id=$5, updated_at=NOW()
+           WHERE id=$6 AND tenant_id=$7""",
         kickoff["id"], kickoff["numero_kickoff"], kickoff["status"],
-        kickoff["versao"], kickoff["kickoff_group_id"], now_iso(),
+        kickoff["versao"], kickoff["kickoff_group_id"],
         kickoff["projeto_id"], kickoff["tenant_id"],
     )
 
@@ -831,8 +831,8 @@ async def _refresh_bom(kickoff: dict) -> dict:
         return kickoff
     bom_lines = await _build_bom_lines(kickoff)
     await pg_db.execute(
-        "UPDATE kickoffs SET bom=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        bom_lines, now_iso(), kickoff["id"], kickoff["tenant_id"],
+        "UPDATE kickoffs SET bom=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        bom_lines, kickoff["id"], kickoff["tenant_id"],
     )
     kickoff["bom"] = bom_lines
     return kickoff
@@ -929,8 +929,8 @@ async def _create_revision_version(kickoff: dict, user: dict, reason: str) -> di
     )
     await _insert_kickoff(revision)
     await pg_db.execute(
-        "UPDATE kickoffs SET status='substituida', updated_at=$1 WHERE id=$2 AND tenant_id=$3",
-        now_iso(), kickoff["id"], kickoff["tenant_id"],
+        "UPDATE kickoffs SET status='substituida', updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+        kickoff["id"], kickoff["tenant_id"],
     )
     await _sync_project_kickoff_summary(revision)
     await audit_log(
@@ -999,8 +999,8 @@ async def _mark_pd_request_kickoff_complete(kickoff: dict, user: dict) -> List[D
     if not pd_request:
         return generated
     await pg_db.execute(
-        "UPDATE pd_requests SET updated_at=$1 WHERE id=$2 AND tenant_id=$3",
-        now_iso(), pd_request["id"], kickoff["tenant_id"],
+        "UPDATE pd_requests SET updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+        pd_request["id"], kickoff["tenant_id"],
     )
     try:
         from pd_routes import _generate_live_document_version
@@ -1180,8 +1180,8 @@ async def update_kickoff_bloco2(kickoff_id: str, data: KickoffBloco2Input, reque
     await pg_db.execute(
         """UPDATE kickoffs SET bloco2=$1, status=$2,
            log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $3::jsonb,
-           updated_at=$4 WHERE id=$5 AND tenant_id=$6""",
-        merged, new_status, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
+           updated_at=NOW() WHERE id=$4 AND tenant_id=$5""",
+        merged, new_status, changes, kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     block2_ok, _ = _block2_ready(merged)
@@ -1222,8 +1222,8 @@ async def update_kickoff_bloco3(kickoff_id: str, data: KickoffBloco3Input, reque
     await pg_db.execute(
         """UPDATE kickoffs SET bloco3=$1, status=$2,
            log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $3::jsonb,
-           updated_at=$4 WHERE id=$5 AND tenant_id=$6""",
-        merged, new_status, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
+           updated_at=NOW() WHERE id=$4 AND tenant_id=$5""",
+        merged, new_status, changes, kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     block3_ok, _ = _block3_ready(merged)
@@ -1259,8 +1259,8 @@ async def update_kickoff_bloco4(kickoff_id: str, data: KickoffBloco4Input, reque
     await pg_db.execute(
         """UPDATE kickoffs SET bloco4=$1, status='aguardando_aprovacao',
            log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $2::jsonb,
-           updated_at=$3 WHERE id=$4 AND tenant_id=$5""",
-        merged, changes, now_iso(), kickoff["id"], kickoff["tenant_id"],
+           updated_at=NOW() WHERE id=$3 AND tenant_id=$4""",
+        merged, changes, kickoff["id"], kickoff["tenant_id"],
     )
     kickoff = await _get_kickoff_or_404(kickoff["id"], user["tenant_id"])
     kickoff = await _refresh_bom(kickoff)
@@ -1432,11 +1432,11 @@ async def approve_kickoff(kickoff_id: str, data: KickoffApprovalInput, request: 
         "justificativa": data.justificativa or "",
     }
     await pg_db.execute(
-        """UPDATE kickoffs SET aprovacoes=$1, status=$2, updated_at=$3,
-           approved_at=$4, approved_by=$5, approved_by_name=$6,
-           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $7::jsonb
-           WHERE id=$8 AND tenant_id=$9""",
-        updated_steps, status, now,
+        """UPDATE kickoffs SET aprovacoes=$1, status=$2, updated_at=NOW(),
+           approved_at=$3, approved_by=$4, approved_by_name=$5,
+           log_auditoria = COALESCE(log_auditoria,'[]'::jsonb) || $6::jsonb
+           WHERE id=$7 AND tenant_id=$8""",
+        updated_steps, status,
         now if status == "aprovado" else kickoff.get("approved_at"),
         user["id"] if status == "aprovado" else kickoff.get("approved_by"),
         user.get("name", "") if status == "aprovado" else kickoff.get("approved_by_name", ""),

@@ -280,13 +280,12 @@ async def update_item(item_id: str, data: EstoqueItemUpdate, request: Request):
     update_fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
-    update_fields["updated_at"] = _now_iso()
-
     set_clauses = []
     vals = []
     i = 1
     for k, v in update_fields.items():
         set_clauses.append(f"{k}=${i}"); vals.append(v); i += 1
+    set_clauses.append("updated_at=NOW()")
 
     await pg_db.execute(
         f"UPDATE estoque_items SET {', '.join(set_clauses)} WHERE id=${i} AND tenant_id=${i+1}",
@@ -322,8 +321,8 @@ async def update_posicao_cq(item_id: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Posição inválida. Permitidas: {POSICOES_CQ}")
     await _get_item_or_404(item_id, user["tenant_id"])
     await pg_db.execute(
-        "UPDATE estoque_items SET posicao_cq=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        nova_posicao, _now_iso(), item_id, user["tenant_id"],
+        "UPDATE estoque_items SET posicao_cq=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        nova_posicao, item_id, user["tenant_id"],
     )
     return _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", item_id))
 
@@ -364,8 +363,8 @@ async def create_movimento(data: MovimentoCreate, request: Request):
         )
 
     await pg_db.execute(
-        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
-        quantidade_depois, _now_iso(), data.item_id,
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=NOW() WHERE id=$2",
+        quantidade_depois, data.item_id,
     )
 
     mov = await _log_movimento(
@@ -429,12 +428,12 @@ async def create_transferencia(data: TransferenciaCreate, request: Request):
                (id, tenant_id, tipo_item, setor, nome, codigo, mp_id, produto_id,
                 unidade, quantidade_atual, estoque_minimo, localizacao, lote, validade,
                 observacoes, posicao_cq, localizacao_estruturada, created_by, created_by_name, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW())""",
             dest_id, tid, origem["tipo_item"], data.setor_destino,
             origem["nome"], origem.get("codigo", ""), origem.get("mp_id"), origem.get("produto_id"),
             origem.get("unidade", "un"), 0, 0, "", origem.get("lote", ""), origem.get("validade"),
             f"Criado automaticamente por transferência de {SETOR_LABELS.get(origem['setor'], origem['setor'])}",
-            "livre", "", user["id"], user.get("name", ""), now, now,
+            "livre", "", user["id"], user.get("name", ""),
         )
         destino = _row(await pg_db.fetch_one("SELECT * FROM estoque_items WHERE id=$1", dest_id))
 
@@ -443,12 +442,12 @@ async def create_transferencia(data: TransferenciaCreate, request: Request):
     qty_dest_depois = qty_dest_antes + data.quantidade
 
     await pg_db.execute(
-        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
-        qty_origem_depois, now, origem["id"],
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=NOW() WHERE id=$2",
+        qty_origem_depois, origem["id"],
     )
     await pg_db.execute(
-        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=$2 WHERE id=$3",
-        qty_dest_depois, now, destino["id"],
+        "UPDATE estoque_items SET quantidade_atual=$1, updated_at=NOW() WHERE id=$2",
+        qty_dest_depois, destino["id"],
     )
 
     ref = f"TRANSF-{_new_id()[:8]}"
