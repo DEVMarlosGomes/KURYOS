@@ -2671,27 +2671,33 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
             sample.get("created_by", ""), sample.get("created_by_name", "")
         )
 
-        await audit_log(
-            tenant_id=user["tenant_id"],
-            user_id=user["id"],
-            user_name=user.get("name", ""),
-            action="sample_created",
-            entity_type="sample",
-            entity_id=sample_id,
-            after={
-                "numero_amostra": sample["numero_amostra"],
-                "projeto_id": data.projeto_id,
-                "cliente_id": project["cliente_id"],
-                "nome_produto": sample["nome_produto"],
-                "variacoes": [v["codigo"] for v in variacoes_data],
-            },
-        )
+        try:
+            await audit_log(
+                tenant_id=user["tenant_id"],
+                user_id=user["id"],
+                user_name=user.get("name", ""),
+                action="sample_created",
+                entity_type="sample",
+                entity_id=sample_id,
+                after={
+                    "numero_amostra": sample["numero_amostra"],
+                    "projeto_id": data.projeto_id,
+                    "cliente_id": project["cliente_id"],
+                    "nome_produto": sample["nome_produto"],
+                    "variacoes": [v["codigo"] for v in variacoes_data],
+                },
+            )
+        except Exception as _al_exc:
+            logger.error(f"[batch_create_samples_v2] audit_log falhou (ignorado): {_al_exc}", exc_info=True)
 
         created_samples.append(sample)
 
         # Criar cards no P&D para cada variação
         for variacao in variacoes_data:
-            await _create_pd_card_for_variacao(sample, variacao, user)
+            try:
+                await _create_pd_card_for_variacao(sample, variacao, user)
+            except Exception as _pd_exc:
+                logger.error(f"[batch_create_samples_v2] _create_pd_card_for_variacao falhou (ignorado): {_pd_exc}", exc_info=True)
 
     if _project_stage_rank(project.get("stage")) < _project_stage_rank("amostra_solicitada"):
         await _advance_project_stage_if_needed(
@@ -3056,20 +3062,23 @@ async def _create_pd_card_for_variacao(sample: dict, variacao: dict, user: dict)
     # Atualizar variação com o card_id
     await _update_variacao_in_sample(sample["id"], user["tenant_id"], variacao["id"], {"pd_card_id": card_id})
 
-    await audit_log(
-        tenant_id=user["tenant_id"],
-        user_id=user["id"],
-        user_name=user.get("name", ""),
-        action="pd_card_auto_created",
-        entity_type="pd_card",
-        entity_id=card_id,
-        after={
-            "numero_completo": variacao["codigo"],
-            "amostra_id": sample["id"],
-            "variacao_id": variacao["id"],
-            "trigger": "sample_creation",
-        },
-    )
+    try:
+        await audit_log(
+            tenant_id=user["tenant_id"],
+            user_id=user["id"],
+            user_name=user.get("name", ""),
+            action="pd_card_auto_created",
+            entity_type="pd_card",
+            entity_id=card_id,
+            after={
+                "numero_completo": variacao["codigo"],
+                "amostra_id": sample["id"],
+                "variacao_id": variacao["id"],
+                "trigger": "sample_creation",
+            },
+        )
+    except Exception as _al_exc:
+        logger.error(f"[_create_pd_card_for_variacao] audit_log falhou (ignorado): {_al_exc}", exc_info=True)
 
     logger.info(f"Created P&D card {card_id} for variação {variacao['codigo']}")
     # pd_request é criado sob demanda quando o formulador abre o card (GET /pd/cards/{id}).
@@ -4156,7 +4165,10 @@ async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, req
         sample_id, user["tenant_id"]
     ))
     for new_var in new_variacoes:
-        await _create_pd_card_for_variacao(updated, new_var, user)
+        try:
+            await _create_pd_card_for_variacao(updated, new_var, user)
+        except Exception as _pd_exc:
+            logger.error(f"[add_variacoes_to_sample] _create_pd_card_for_variacao falhou (ignorado): {_pd_exc}", exc_info=True)
 
     final = _row(await pg_db.fetch_one(
         "SELECT * FROM crm_samples WHERE id=$1 AND tenant_id=$2",
@@ -4168,6 +4180,23 @@ async def add_variacoes_to_sample(sample_id: str, data: AddVariacoesRequest, req
         "added": len(new_variacoes),
         "new_variacoes": new_variacoes,
     }
+
+
+@crm_router.post("/samples/{sample_id}/variacoes/{variacao_id}/send-to-pd")
+async def send_variacao_to_pd(sample_id: str, variacao_id: str, request: Request):
+    """Cria retroativamente um card P&D para uma variação que não tem pd_card_id."""
+    user = await _get_current_user(request)
+    sample = await assert_sample_exists(user["tenant_id"], sample_id)
+    variacoes = sample.get("variacoes") or []
+    variacao = next((v for v in variacoes if v["id"] == variacao_id), None)
+    if not variacao:
+        raise HTTPException(status_code=404, detail="Variação não encontrada")
+    if variacao.get("pd_card_id"):
+        return {"message": "Variação já possui card P&D", "pd_card_id": variacao["pd_card_id"]}
+    await _create_pd_card_for_variacao(sample, variacao, user)
+    updated = await assert_sample_exists(user["tenant_id"], sample_id)
+    updated_var = next((v for v in (updated.get("variacoes") or []) if v["id"] == variacao_id), None)
+    return {"message": "Card P&D criado com sucesso!", "pd_card_id": updated_var.get("pd_card_id") if updated_var else None}
 
 
 async def _create_sku_from_variacao(sample: dict, variacao: dict, user: dict) -> dict:

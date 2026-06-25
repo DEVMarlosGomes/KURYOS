@@ -396,6 +396,24 @@ export default function CRM3Page() {
         }
     };
 
+    const handleSendToPd = async (variacao) => {
+        if (!selectedSample) return;
+        try {
+            const { data } = await api.post(`/crm/samples/${selectedSample.id}/variacoes/${variacao.id}/send-to-pd`);
+            toast.success("Card P&D criado! Abrindo...");
+            const { data: updated } = await api.get(`/crm/samples/${selectedSample.id}`);
+            setSelectedSample(updated);
+            loadSamples();
+            if (data.pd_card_id) {
+                const card = await api.get(`/crm/pd/cards/${data.pd_card_id}`);
+                if (card.data?.pd_request_id) navigate(`/pd/${card.data.pd_request_id}`);
+                else navigate("/pd");
+            }
+        } catch (e) {
+            toast.error(formatApiError(e));
+        }
+    };
+
     const openPdCard = async (variacao) => {
         if (variacao.pd_request_id) {
             navigate(`/pd/${variacao.pd_request_id}`);
@@ -664,56 +682,63 @@ export default function CRM3Page() {
 
             {/* Sample Detail Sheet */}
             <Sheet open={!!selectedSample} onOpenChange={(v) => { if (!v) { setSelectedSample(null); loadSamples(); } }}>
-                <SheetContent className="w-[480px] sm:w-[520px] p-0 flex flex-col" side="right">
+                <SheetContent className="w-full sm:max-w-2xl p-0 flex flex-col" side="right">
                     {selectedSample && (
                         <>
-                            <SheetHeader className="p-6 pb-3">
-                                <SheetTitle className="font-heading text-xl">
-                                    {String(selectedSample?.nome_amostra || selectedSample?.nome_produto || 'Amostra')}
-                                </SheetTitle>
-                                <div className="flex items-center gap-2 mt-1 flex-wrap">
-                                    <Badge variant="outline" className="text-xs">{String(selectedSample?.cliente_nome || '')}</Badge>
-                                    <Badge className="text-xs">{String(selectedSample?.projeto_nome || '')}</Badge>
-                                    {selectedSample?.codigo_referencia && (
-                                        <span className="text-xs mono-num text-muted-foreground">{String(selectedSample.codigo_referencia)}</span>
-                                    )}
+                            <SheetHeader className="px-6 pt-5 pb-4 border-b border-border">
+                                <div className="flex items-start gap-3">
+                                    <div className="flex-1 min-w-0">
+                                        <SheetTitle className="text-lg font-semibold leading-tight truncate">
+                                            {String(selectedSample?.nome_amostra || selectedSample?.nome_produto || 'Amostra')}
+                                        </SheetTitle>
+                                        <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                                            {selectedSample?.numero_amostra && (
+                                                <span className="font-mono text-[11px] font-bold text-primary bg-primary/10 px-1.5 py-0.5 rounded">
+                                                    {selectedSample.numero_amostra}
+                                                </span>
+                                            )}
+                                            <Badge variant="secondary" className="text-[11px] h-5">{String(selectedSample?.cliente_nome || '')}</Badge>
+                                            <Badge variant="outline" className="text-[11px] h-5 text-muted-foreground">{String(selectedSample?.projeto_nome || '')}</Badge>
+                                        </div>
+                                    </div>
                                 </div>
                             </SheetHeader>
-                            <Separator />
                             <Tabs value={tab} onValueChange={setTab} className="flex-1 flex flex-col min-h-0">
-                                <TabsList className="mx-6 mt-3">
-                                    <TabsTrigger value="briefing">Briefing</TabsTrigger>
-                                    <TabsTrigger value="variacoes">Variações</TabsTrigger>
-                                    <TabsTrigger value="info">Dados</TabsTrigger>
-                                    <TabsTrigger value="retrabalhos">Retrabalhos</TabsTrigger>
-                                    <TabsTrigger value="timeline">Histórico</TabsTrigger>
-                                </TabsList>
+                                <div className="border-b border-border px-2">
+                                    <TabsList className="h-10 bg-transparent gap-0 w-full justify-start overflow-x-auto">
+                                        <TabsTrigger value="briefing" className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent text-sm px-4">Briefing</TabsTrigger>
+                                        <TabsTrigger value="variacoes" className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent text-sm px-4">Variações</TabsTrigger>
+                                        <TabsTrigger value="info" className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent text-sm px-4">Dados</TabsTrigger>
+                                        <TabsTrigger value="retrabalhos" className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent text-sm px-4">Retrabalhos</TabsTrigger>
+                                        <TabsTrigger value="timeline" className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent text-sm px-4">Histórico</TabsTrigger>
+                                    </TabsList>
+                                </div>
 
-                                <TabsContent value="briefing" className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 mt-3">
-                                    <div className="space-y-4">
-                                        <div className="space-y-2">
-                                            <Label className="text-xs font-semibold">Produto</Label>
-                                            <Input defaultValue={selectedSample.produto || ""}
+                                <TabsContent value="briefing" className="flex-1 min-h-0 overflow-y-auto pb-6">
+                                    <div className="px-6 pt-5 space-y-5">
+                                        <div className="space-y-1.5">
+                                            <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Produto</Label>
+                                            <Input defaultValue={selectedSample.produto || ""} className="bg-muted/30 border-border/60 focus:bg-background"
                                                 onBlur={(e) => handleUpdateSample(selectedSample.id, { produto: e.target.value })} />
                                         </div>
-                                        <div className="space-y-2">
-                                            <Label className="text-xs font-semibold">Objetivo do Projeto</Label>
-                                            <Textarea defaultValue={selectedSample.objetivo_projeto || ""} rows={3}
+                                        <div className="space-y-1.5">
+                                            <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Objetivo do Projeto</Label>
+                                            <Textarea defaultValue={selectedSample.objetivo_projeto || ""} rows={3} className="bg-muted/30 border-border/60 focus:bg-background resize-none"
                                                 onBlur={(e) => handleUpdateSample(selectedSample.id, { objetivo_projeto: e.target.value })} />
                                         </div>
-                                        <div className="space-y-2">
-                                            <Label className="text-xs font-semibold">Aplicações a Desenvolver</Label>
-                                            <Textarea defaultValue={selectedSample.aplicacoes_desenvolver || ""} rows={3}
+                                        <div className="space-y-1.5">
+                                            <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Aplicações a Desenvolver</Label>
+                                            <Textarea defaultValue={selectedSample.aplicacoes_desenvolver || ""} rows={3} className="bg-muted/30 border-border/60 focus:bg-background resize-none"
                                                 onBlur={(e) => handleUpdateSample(selectedSample.id, { aplicacoes_desenvolver: e.target.value })} />
                                         </div>
-                                        <div className="space-y-2">
-                                            <Label className="text-xs font-semibold">Ativos para Claims</Label>
-                                            <Textarea defaultValue={selectedSample.ativos_claims || ""} rows={3}
+                                        <div className="space-y-1.5">
+                                            <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Ativos para Claims</Label>
+                                            <Textarea defaultValue={selectedSample.ativos_claims || ""} rows={3} className="bg-muted/30 border-border/60 focus:bg-background resize-none"
                                                 onBlur={(e) => handleUpdateSample(selectedSample.id, { ativos_claims: e.target.value })} />
                                         </div>
-                                        <div className="space-y-2">
-                                            <Label className="text-xs font-semibold">Referências</Label>
-                                            <Textarea defaultValue={selectedSample.referencias || ""} rows={3}
+                                        <div className="space-y-1.5">
+                                            <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Referências</Label>
+                                            <Textarea defaultValue={selectedSample.referencias || ""} rows={3} className="bg-muted/30 border-border/60 focus:bg-background resize-none"
                                                 onBlur={(e) => handleUpdateSample(selectedSample.id, { referencias: e.target.value })} />
                                         </div>
                                         <div className="space-y-2">
@@ -791,13 +816,21 @@ export default function CRM3Page() {
                                                             <Lock className="h-2.5 w-2.5 shrink-0" />
                                                         </span>
                                                         {v.sku_id && <Badge className="text-[10px] bg-emerald-500">SKU</Badge>}
-                                                        {(v.pd_request_id || v.pd_card_id) && (
+                                                        {(v.pd_request_id || v.pd_card_id) ? (
                                                             <button
                                                                 className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-300 transition-colors"
                                                                 title="Abrir desenvolvimento no módulo P&D"
                                                                 onClick={() => openPdCard(v)}
                                                             >
                                                                 <FlaskConical className="h-2.5 w-2.5 shrink-0" /> Abrir P&D
+                                                            </button>
+                                                        ) : (
+                                                            <button
+                                                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-800 dark:bg-violet-950/30 dark:text-violet-300 transition-colors"
+                                                                title="Criar card no Pipeline P&D"
+                                                                onClick={() => handleSendToPd(v)}
+                                                            >
+                                                                <FlaskConical className="h-2.5 w-2.5 shrink-0" /> Enviar para P&D
                                                             </button>
                                                         )}
                                                     </div>
