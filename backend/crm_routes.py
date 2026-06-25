@@ -2818,8 +2818,8 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
 
     # Link card -> pd_request
     await pg_db.execute(
-        "UPDATE pd_cards SET pd_request_id=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-        req_id, now, card["id"], user["tenant_id"]
+        "UPDATE pd_cards SET pd_request_id=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3",
+        req_id, card["id"], user["tenant_id"]
     )
     card["pd_request_id"] = req_id
 
@@ -4824,7 +4824,9 @@ async def get_pd_card(card_id: str, request: Request):
     # Lazy: garante que existe um pd_request linkado para abrir a tela completa do PDDetail
     if not card.get("pd_request_id"):
         try:
-            await _ensure_pd_request_for_card(card, user)
+            new_req_id = await _ensure_pd_request_for_card(card, user)
+            if new_req_id:
+                card["pd_request_id"] = new_req_id
         except Exception as exc:  # pragma: no cover
             logger.warning(f"Lazy pd_request creation failed for card {card_id}: {exc}")
 
