@@ -416,10 +416,6 @@ export default function CRM3Page() {
     };
 
     const openPdCard = async (variacao) => {
-        if (variacao.pd_request_id) {
-            navigate(`/pd/${variacao.pd_request_id}`);
-            return;
-        }
         if (!variacao.pd_card_id) {
             navigate("/pd");
             return;
@@ -1047,7 +1043,7 @@ export default function CRM3Page() {
                                                         <span className="font-medium">{STAGE_LABELS[mov.para] || mov.para}</span>
                                                     </p>
                                                     <p className="text-xs text-muted-foreground">
-                                                        {mov.usuario} · {new Date(mov.data).toLocaleString("pt-BR")}
+                                                        {mov.usuario}{mov.usuario && mov.data ? ' · ' : ''}{mov.data ? new Date(mov.data).toLocaleString("pt-BR") : ''}
                                                     </p>
                                                 </div>
                                             </div>
