@@ -338,6 +338,11 @@ class InviteInput(BaseModel):
 class RoleUpdate(BaseModel):
     role: str
 
+class UpdateUserInput(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+
 # ============ AUTH ROUTES ============
 
 @router.post("/auth/register")
@@ -1296,6 +1301,69 @@ async def remove_user(user_id: str, request: Request):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Usuario nao encontrado")
     return {"message": "Usuario removido"}
+
+@router.put("/users/{user_id}")
+async def update_user(user_id: str, data: UpdateUserInput, request: Request):
+    user = await get_current_user(request)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Somente admins podem editar usuarios")
+
+    valid_roles = ("admin", "vendedor", "sales_ops", "formulador", "qa", "lider_pd", "engenharia_produto", "sucesso_cliente", "gestor")
+    updates = {}
+    if data.name:
+        updates["name"] = data.name.strip()
+    if data.email:
+        new_email = data.email.lower().strip()
+        existing = await db.users.find_one({"email": new_email, "tenant_id": user["tenant_id"]})
+        if existing and existing["id"] != user_id:
+            raise HTTPException(status_code=400, detail="Email ja cadastrado para outro usuario")
+        updates["email"] = new_email
+    if data.role:
+        if data.role not in valid_roles:
+            raise HTTPException(status_code=400, detail=f"Role invalida")
+        if user_id == user["id"]:
+            raise HTTPException(status_code=400, detail="Nao pode alterar sua propria role")
+        updates["role"] = data.role
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
+
+    result = await db.users.update_one(
+        {"id": user_id, "tenant_id": user["tenant_id"]},
+        {"$set": updates}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+
+    if pg_db._pool and "role" in updates:
+        await pg_db.execute("UPDATE users SET role=$1 WHERE id=$2 AND tenant_id=$3", updates["role"], user_id, user["tenant_id"])
+
+    return {"message": "Usuario atualizado", "user_id": user_id}
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(user_id: str, request: Request):
+    user = await get_current_user(request)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Somente admins podem redefinir senhas")
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Use 'Esqueci minha senha' para redefinir sua propria senha")
+
+    target = await db.users.find_one({"id": user_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado")
+
+    temp_password = f"Kuryos{uuid.uuid4().hex[:6]}!"
+    await db.users.update_one({"id": user_id}, {"$set": {"password_hash": hash_password(temp_password)}})
+
+    await db.email_logs.insert_one({
+        "id": new_id(), "tenant_id": user["tenant_id"],
+        "to": target["email"], "subject": "Senha redefinida pelo administrador — Kuryos",
+        "body": f"Sua senha foi redefinida pelo administrador.\nNova senha temporaria: {temp_password}\nAcesse o sistema e troque sua senha.",
+        "status": "mock_sent", "created_at": now_iso()
+    })
+
+    logger.info(f"[reset-password] admin {user['id']} redefiniu senha de {target['email']}")
+    return {"message": "Senha redefinida", "temp_password": temp_password, "email": target["email"]}
 
 # ============ FILE UPLOAD / DOWNLOAD ============
 
