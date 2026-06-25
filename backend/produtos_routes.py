@@ -39,6 +39,10 @@ def init_produtos(database, get_current_user_fn, new_id_fn, now_iso_fn):
     logger.info("Produtos module initialized")
 
 
+async def create_produtos_indexes():
+    pass  # Indexes managed via SQL migrations
+
+
 def _row(r):
     return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} if r else None
 
