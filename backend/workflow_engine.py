@@ -100,9 +100,9 @@ async def audit_log(
         """INSERT INTO audit_logs
            (id, tenant_id, user_id, user_name, action, entity_type, entity_id,
             before_data, after_data, metadata, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())""",
         entry_id, tenant_id, user_id, user_name, action, entity_type, entity_id,
-        before_data, after_data, metadata or {}, now,
+        before_data, after_data, metadata or {},
     )
     return {
         "id": entry_id, "tenant_id": tenant_id, "user_id": user_id, "user_name": user_name,
@@ -668,7 +668,7 @@ async def create_workflow_task(
             d1_notified, escalated, notification_flags, metadata,
             created_by, created_by_name, created_at, updated_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                   $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)""",
+                   $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,NOW(),NOW())""",
         task["id"], tenant_id, display_code, entity_type, entity_id, module_origin,
         title, description, category, task_type, priority, blocking,
         task["blocks_stages"], responsible_id or "", responsible_name,
@@ -676,7 +676,7 @@ async def create_workflow_task(
         None, "", None, None, "",
         None, None, "", "",
         False, False, task["notification_flags"], task_metadata,
-        created_by.get("id", ""), created_by.get("name", ""), now, now,
+        created_by.get("id", ""), created_by.get("name", ""),
     )
 
     if responsible_id:
@@ -788,7 +788,7 @@ async def complete_task(*, tenant_id: str, task_id: str, user: dict, comment: st
         """UPDATE workflow_tasks SET
            status='concluida',
            decision=$1, decision_comment=$2, decision_at=$3, decision_by=$4, decision_by_name=$5,
-           completed_at=$6, completed_by=$7, completed_by_name=$8, updated_at=$6, completion_comment=$9,
+           completed_at=$6, completed_by=$7, completed_by_name=$8, updated_at=NOW(), completion_comment=$9,
            notification_flags = notification_flags || jsonb_build_object('completed_at', $6)
            WHERE id=$10 AND tenant_id=$11""",
         task.get("decision"), task.get("decision_comment", ""), task.get("decision_at"),
@@ -848,7 +848,7 @@ async def decide_task(
            decision=$1, decision_comment=$2, decision_at=$3,
            decision_by=$4, decision_by_name=$5,
            completed_at=$3, completed_by=$4, completed_by_name=$5,
-           completion_comment=$2, updated_at=$3,
+           completion_comment=$2, updated_at=NOW(),
            notification_flags = notification_flags || jsonb_build_object('completed_at', $3)
            WHERE id=$6 AND tenant_id=$7""",
         decision, comment, now,
@@ -1267,9 +1267,9 @@ async def create_user_notification(
         """INSERT INTO notifications
            (id, tenant_id, user_id, type, title, body, entity_type, entity_id,
             metadata, read, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,$10)""",
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,NOW())""",
         notif_id, tenant_id, user_id, notif_type, title, message,
-        entity_type or None, entity_id or None, metadata or {}, now,
+        entity_type or None, entity_id or None, metadata or {},
     )
     return {
         "id": notif_id, "tenant_id": tenant_id, "user_id": user_id,
@@ -1322,9 +1322,9 @@ async def _sync_pd_document_version_status(task: dict):
         await pg_db.execute(
             """UPDATE pd_document_versions
                SET status='reprovado', active_for_operation=FALSE, approved_at=NULL,
-                   updated_at=$1, approval_summary=$2
-               WHERE id=$3""",
-            now, summary, version_id,
+                   updated_at=NOW(), approval_summary=$1
+               WHERE id=$2""",
+            summary, version_id,
         )
         return
 
@@ -1332,9 +1332,9 @@ async def _sync_pd_document_version_status(task: dict):
     if pending:
         await pg_db.execute(
             """UPDATE pd_document_versions
-               SET status='em_revisao', updated_at=$1, approval_summary=$2
-               WHERE id=$3""",
-            now, summary, version_id,
+               SET status='em_revisao', updated_at=NOW(), approval_summary=$1
+               WHERE id=$2""",
+            summary, version_id,
         )
         return
 
@@ -1343,15 +1343,15 @@ async def _sync_pd_document_version_status(task: dict):
 
     await pg_db.execute(
         """UPDATE pd_document_versions
-           SET status='substituido', active_for_operation=FALSE, updated_at=$1
-           WHERE tenant_id=$2 AND pd_request_id=$3 AND doc_type=$4 AND id<>$5 AND status='aprovado'""",
-        now, doc_version["tenant_id"], doc_version["pd_request_id"], doc_version["doc_type"], version_id,
+           SET status='substituido', active_for_operation=FALSE, updated_at=NOW()
+           WHERE tenant_id=$1 AND pd_request_id=$2 AND doc_type=$3 AND id<>$4 AND status='aprovado'""",
+        doc_version["tenant_id"], doc_version["pd_request_id"], doc_version["doc_type"], version_id,
     )
     await pg_db.execute(
         """UPDATE pd_document_versions
-           SET status='aprovado', active_for_operation=TRUE, approved_at=$1, updated_at=$1, approval_summary=$2
-           WHERE id=$3""",
-        now, summary, version_id,
+           SET status='aprovado', active_for_operation=TRUE, approved_at=NOW(), updated_at=NOW(), approval_summary=$1
+           WHERE id=$2""",
+        summary, version_id,
     )
 
 
