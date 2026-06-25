@@ -1577,8 +1577,8 @@ async def update_client(client_id: str, data: ClientUpdate, request: Request):
         if field in update_fields or field == "cnpj_normalized":
             update_fields[field] = payload[field]
 
-    update_fields["updated_at"] = _now_iso()
     set_parts = [f"{k}=${i+1}" for i, k in enumerate(update_fields.keys())]
+    set_parts.append("updated_at=NOW()")
     params = list(update_fields.values())
     params.extend([client_id, user["tenant_id"]])
     rows = await pg_db.fetch_all(
@@ -1684,7 +1684,6 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
 
     update_data = {
         "stage": new_stage,
-        "updated_at": now,
     }
 
     if new_stage == "cliente_perdido" and data.motivo_perda:
@@ -1702,7 +1701,9 @@ async def move_client(client_id: str, data: ClientMove, request: Request):
     if is_regression and data.justificativa:
         movement["justificativa"] = data.justificativa.strip()
 
+    # updated_at uses NOW() directly — asyncpg requires datetime objects for TIMESTAMPTZ, not ISO strings
     set_parts = [f"{k}=${i+1}" for i, k in enumerate(update_data.keys())]
+    set_parts.append("updated_at=NOW()")
     set_parts.append(f"historico_movimentacoes = historico_movimentacoes || jsonb_build_array(${len(update_data)+1}::jsonb)")
     params = list(update_data.values()) + [movement, client_id]
     await pg_db.execute(
@@ -2030,10 +2031,9 @@ async def update_project(project_id: str, data: ProjectUpdate, request: Request)
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
-    update_fields["updated_at"] = _now_iso()
     fields = list(update_fields.keys())
     params: list = [update_fields[k] for k in fields]
-    set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields))
+    set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields)) + ", updated_at=NOW()"
     params.extend([project_id, user["tenant_id"]])
     matched = await pg_db.fetch_val(
         f"UPDATE crm_projects SET {set_clause} WHERE id=${len(params)-1} AND tenant_id=${len(params)} RETURNING id",
@@ -2106,9 +2106,10 @@ async def move_project(project_id: str, data: ProjectMove, request: Request):
     if new_stage == "projeto_arquivado":
         update_fields["motivo_arquivamento"] = clean_text(data.motivo_arquivamento or "")
 
-    set_parts = ["stage=$1", "updated_at=$2",
-                 "historico_movimentacoes = historico_movimentacoes || jsonb_build_array($3::jsonb)"]
-    params: list = [new_stage, now, json.dumps(movement)]
+    set_parts = ["stage=$1",
+                 "updated_at=NOW()",
+                 "historico_movimentacoes = historico_movimentacoes || jsonb_build_array($2::jsonb)"]
+    params: list = [new_stage, json.dumps(movement)]
     for k, v in update_fields.items():
         if k not in ("stage", "updated_at"):
             params.append(v); set_parts.append(f"{k}=${len(params)}")
@@ -2447,10 +2448,9 @@ async def batch_create_samples_v2(data: SampleBatchCreateV2, request: Request):
         }
         patch = {k: v for k, v in data.projeto_updates.items() if k in _ALLOWED_PROJETO_FIELDS}
         if patch:
-            patch["updated_at"] = _now_iso()
             fields = list(patch.keys())
             p2: list = [patch[k] for k in fields]
-            set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields))
+            set_clause = ", ".join(f"{k}=${i+1}" for i, k in enumerate(fields)) + ", updated_at=NOW()"
             p2.extend([data.projeto_id, user["tenant_id"]])
             await pg_db.execute(
                 f"UPDATE crm_projects SET {set_clause} WHERE id=${len(p2)-1} AND tenant_id=${len(p2)}",
@@ -3180,7 +3180,6 @@ async def move_sample(sample_id: str, data: SampleMove, request: Request):
     now = _now_iso()
     update_data = {
         "stage": new_stage,
-        "updated_at": now,
         "aprovacao_interna": sample.get("aprovacao_interna", False),
         "aprovacao_externa": sample.get("aprovacao_externa", False),
     }
@@ -3211,7 +3210,7 @@ async def move_sample(sample_id: str, data: SampleMove, request: Request):
         update_data["motivo_retrabalho"] = data.motivo_retrabalho
 
     movement = push_ops["historico_movimentacoes"]
-    set_parts = ["historico_movimentacoes = historico_movimentacoes || jsonb_build_array($1::jsonb)"]
+    set_parts = ["historico_movimentacoes = historico_movimentacoes || jsonb_build_array($1::jsonb)", "updated_at=NOW()"]
     params: list = [json.dumps(movement)]
     for k, v in update_data.items():
         params.append(v); set_parts.append(f"{k}=${len(params)}")
@@ -4418,8 +4417,8 @@ async def _create_sku_from_sample(sample: dict, user: dict) -> dict:
     # R23: freeze cli4 after first SKU
     if client and not client.get("cli4_congelado"):
         await pg_db.execute(
-            "UPDATE crm_clients SET cli4_congelado=TRUE, updated_at=$1 WHERE id=$2 AND tenant_id=$3",
-            now, sample["cliente_id"], tenant_id
+            "UPDATE crm_clients SET cli4_congelado=TRUE, updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+            sample["cliente_id"], tenant_id
         )
 
     logger.info(f"Auto-created SKU {codigo} from sample {sample['id']}")
@@ -4511,11 +4510,10 @@ async def update_sku(sku_id: str, data: SKUUpdate, request: Request):
     if not scalar_fields and not anvisa_patch:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
-    now = _now_iso()
-    scalar_fields["updated_at"] = now
     fields = list(scalar_fields.keys())
     params: list = [scalar_fields[k] for k in fields]
     set_parts = [f"{k}=${i+1}" for i, k in enumerate(fields)]
+    set_parts.append("updated_at=NOW()")
     if anvisa_patch:
         params.append(json.dumps(anvisa_patch)); set_parts.append(f"anvisa = anvisa || ${len(params)}::jsonb")
     params.extend([sku_id, user["tenant_id"]])
@@ -4877,14 +4875,14 @@ async def move_pd_card(card_id: str, data: PDCardMove, request: Request):
     hist_mv = {"de": old_status, "para": new_status, "data": now,
                "usuario": user["name"], "usuario_id": user["id"], "observacao": data.observacao}
     await pg_db.execute(
-        """UPDATE pd_cards SET status_pd=$1, updated_at=$2,
+        """UPDATE pd_cards SET status_pd=$1, updated_at=NOW(),
            extra = jsonb_set(
                extra,
                '{historico_movimentacoes}',
-               COALESCE(extra->'historico_movimentacoes','[]'::jsonb) || jsonb_build_array($3::jsonb)
+               COALESCE(extra->'historico_movimentacoes','[]'::jsonb) || jsonb_build_array($2::jsonb)
            )
-           WHERE id=$4 AND tenant_id=$5""",
-        new_status, now, json.dumps(hist_mv), card_id, user["tenant_id"]
+           WHERE id=$3 AND tenant_id=$4""",
+        new_status, json.dumps(hist_mv), card_id, user["tenant_id"]
     )
 
     # ERP v3.0: trigger tasks (CQ approval, lab tests)
