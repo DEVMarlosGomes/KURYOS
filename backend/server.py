@@ -358,10 +358,13 @@ async def register(input_data: RegisterInput, response: Response):
     # ── Criar tenant ────────────────────────────────────────────────────────
     await db.tenants.insert_one({"id": tenant_id, "name": input_data.org_name, "created_at": now_iso()})
     if pg_db._pool:
-        await pg_db.execute(
-            "INSERT INTO tenants(id, name, created_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-            tenant_id, input_data.org_name, now_iso()
-        )
+        try:
+            await pg_db.execute(
+                "INSERT INTO tenants(id, name, created_at) VALUES($1,$2,NOW()) ON CONFLICT DO NOTHING",
+                tenant_id, input_data.org_name,
+            )
+        except Exception as _e:
+            logger.warning(f"PG tenants insert failed (non-fatal): {_e}")
 
     # ── Criar usuário no Supabase Auth (se disponível) ──────────────────────
     supabase_user = None
@@ -382,10 +385,13 @@ async def register(input_data: RegisterInput, response: Response):
 
     # ── Criar usuário na tabela PostgreSQL ───────────────────────────────────
     if pg_db._pool:
-        await pg_db.execute(
-            "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
-            user_id, tenant_id, email, input_data.name, "admin", now_iso()
-        )
+        try:
+            await pg_db.execute(
+                "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT DO NOTHING",
+                user_id, tenant_id, email, input_data.name, "admin",
+            )
+        except Exception as _e:
+            logger.warning(f"PG users insert failed (non-fatal): {_e}")
 
     await seed_default_pipeline(tenant_id)
 
@@ -1246,10 +1252,13 @@ async def invite_user(data: InviteInput, request: Request):
 
     # ── Registrar na tabela PostgreSQL ───────────────────────────────────────
     if pg_db._pool:
-        await pg_db.execute(
-            "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
-            invited_id, user["tenant_id"], email, data.name, data.role, now_iso()
-        )
+        try:
+            await pg_db.execute(
+                "INSERT INTO users(id,tenant_id,email,name,role,created_at) VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT DO NOTHING",
+                invited_id, user["tenant_id"], email, data.name, data.role,
+            )
+        except Exception as _e:
+            logger.warning(f"PG users invite insert failed (non-fatal): {_e}")
 
     # Mock email with temp password
     await db.email_logs.insert_one({
