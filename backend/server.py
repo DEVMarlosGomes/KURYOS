@@ -225,7 +225,7 @@ ws_manager = ConnectionManager()
 # ============ LOCAL FILE STORAGE ============
 
 APP_NAME = "kuryos-crm"
-UPLOAD_DIR = Path("/app/uploads")
+UPLOAD_DIR = BASE_DIR / "uploads"
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
     file_path = UPLOAD_DIR / path
@@ -2275,7 +2275,5 @@ else:
     )
 
 # Mount static files for uploads
-from pathlib import Path as PathLib
-upload_dir = PathLib("/app/uploads")
-upload_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="/app/uploads"), name="uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
