@@ -86,7 +86,7 @@ export default function EstoquePage() {
     const loadDashboard = useCallback(async () => {
         try {
             const { data } = await api.get("/estoque/dashboard");
-            setDashboard(data);
+            setDashboard(data?.setores ? data : null);
         } catch (e) {
             toast.error(formatApiError(e));
         }
@@ -98,7 +98,7 @@ export default function EstoquePage() {
             const params = { setor: setorAtivo };
             if (search) params.search = search;
             const { data } = await api.get("/estoque/items", { params });
-            setItems(data);
+            setItems(Array.isArray(data) ? data : []);
         } catch (e) {
             toast.error(formatApiError(e));
         } finally {
@@ -537,7 +537,7 @@ function NewItemDialog({ open, onOpenChange, setor, onCreated }) {
         // Pre-carrega MPs homologadas do tipo correspondente
         if (setor !== "FABRICA" && setor !== "DEVOLUCAO" && setorCfg?.tipoMP) {
             api.get("/pd/homologacao/mps", { params: { tipo_mp: setorCfg.tipoMP, status: "homologada" } })
-                .then(({ data }) => setMps(data))
+                .then(({ data }) => setMps(Array.isArray(data) ? data : []))
                 .catch(() => {});
         }
     }, [open, setor, setorCfg?.tipoMP]);

@@ -196,6 +196,112 @@ def _decorate_oc(oc: dict) -> dict:
     return out
 
 
+@compras_router.get("/dashboard")
+async def compras_dashboard(request: Request):
+    """KPIs e alertas agregados para o Dashboard de Compras."""
+    user = await get_current_user(request)
+    require_roles(user, _CMP_READ)
+    tid = user["tenant_id"]
+
+    hoje_d = datetime.now(timezone.utc).date()
+    em_7d = hoje_d + timedelta(days=7)
+    ha_2d = datetime.now(timezone.utc) - timedelta(days=2)
+    em_30d = hoje_d + timedelta(days=30)
+    hoje_s = hoje_d.isoformat()
+    em_7d_s = em_7d.isoformat()
+    em_30d_s = em_30d.isoformat()
+
+    statuses_ativos = ["emitida", "confirmada", "parcialmente_recebida"]
+    pos_rows = await pg_db.fetch_all(
+        """SELECT id, numero_po, status, fornecedor_id, fornecedor_nome,
+                  data_entrega_confirmada, data_entrega_solicitada,
+                  valor_total_po, emitido_em
+           FROM compras_pos
+           WHERE tenant_id=$1 AND status = ANY($2::text[])
+           ORDER BY data_entrega_confirmada NULLS LAST""",
+        tid, statuses_ativos
+    )
+
+    def _dc(v):
+        if v is None:
+            return None
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+
+    def _ser(rows):
+        return [{k: _dc(v) if hasattr(v, "isoformat") else v for k, v in r.items()} for r in rows]
+
+    def _dt_str(v):
+        if v is None:
+            return ""
+        return _dc(v)[:10]  # just YYYY-MM-DD for comparison
+
+    pos_aguardando = [p for p in pos_rows
+                      if p.get("status") == "emitida" and p.get("emitido_em")
+                      and (p["emitido_em"] if p["emitido_em"].tzinfo else
+                           p["emitido_em"].replace(tzinfo=timezone.utc)) < ha_2d]
+
+    pos_proximas_7d = [p for p in pos_rows
+                       if p.get("data_entrega_confirmada")
+                       and hoje_s <= _dt_str(p["data_entrega_confirmada"]) <= em_7d_s]
+
+    pos_atrasadas = [p for p in pos_rows
+                     if p.get("data_entrega_confirmada")
+                     and _dt_str(p["data_entrega_confirmada"]) < hoje_s]
+
+    itens_urgentes = await pg_db.fetch_all(
+        """SELECT id, item_nome, quantidade, data_necessidade
+           FROM compras_demandas
+           WHERE tenant_id=$1 AND status='pendente'
+             AND data_necessidade IS NOT NULL AND data_necessidade < $2
+           ORDER BY data_necessidade LIMIT 20""",
+        tid, hoje_d
+    )
+
+    suspensos = await pg_db.fetch_all(
+        "SELECT id, codigo_interno, razao_social, homologacao FROM compras_fornecedores WHERE tenant_id=$1 AND status='suspenso' ORDER BY razao_social LIMIT 20",
+        tid
+    )
+
+    hom_vencendo = await pg_db.fetch_all(
+        """SELECT id, codigo_interno, razao_social, homologacao
+           FROM compras_fornecedores
+           WHERE tenant_id=$1 AND status='homologado'
+             AND (homologacao->>'proxima_reavaliacao') IS NOT NULL
+             AND (homologacao->>'proxima_reavaliacao') <= $2""",
+        tid, em_30d_s
+    )
+
+    abaixo_minimo = await pg_db.fetch_all(
+        "SELECT id, nome, codigo_interno, unidade, estoque_minimo FROM compras_itens WHERE tenant_id=$1 AND ativo=true AND estoque_minimo > 0 ORDER BY nome LIMIT 50",
+        tid
+    )
+
+    valor_aberto = sum(float(p.get("valor_total_po") or 0) for p in pos_rows)
+
+    return {
+        "visao_operacional": {
+            "pos_aguardando_confirmacao": _ser(pos_aguardando),
+            "pos_entrega_proximos_7_dias": _ser(pos_proximas_7d),
+            "pos_atrasadas": _ser(pos_atrasadas),
+            "itens_urgentes_mrp": _ser(itens_urgentes),
+        },
+        "visao_fornecedores": {
+            "suspensos_por_rncs": _ser(suspensos),
+            "homologacao_vencendo_30_dias": _ser(hom_vencendo),
+        },
+        "visao_estoque_reposicao": {
+            "abaixo_minimo_sem_po": _ser(abaixo_minimo),
+        },
+        "visao_financeira": {
+            "valor_em_aberto": float(valor_aberto),
+            "pos_aguardando_pagamento": _ser([p for p in pos_rows if p.get("status") == "confirmada"]),
+        },
+        "estoque_projetado_resumo": {"ruptura": 0, "critico": 0, "atencao": 0, "ok": 0},
+    }
+
+
 @compras_router.get("/boms")
 async def list_boms_for_compras(request: Request, kickoff_id: Optional[str] = None):
     user = await get_current_user(request)
