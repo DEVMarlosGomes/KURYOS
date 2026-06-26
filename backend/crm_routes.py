@@ -2810,7 +2810,7 @@ async def _ensure_pd_request_for_card(card: dict, user: dict) -> str:
         """INSERT INTO pd_requests
            (id, tenant_id, client_card_id, client_name, project_name, technical_name,
             commercial_name, internal_code, request_type, category, description,
-            references, restrictions, volume, packaging, priority, deadline, status,
+            "references", restrictions, volume, packaging, priority, deadline, status,
             is_internal_research, kickoff_completed, created_by, created_by_name,
             created_at, updated_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW())""",
